@@ -7,7 +7,7 @@ function schema). Add new tools here as the agent grows.
 
 from tools.search import web_search
 from tools.document import read_document
-from tools.file import read_file
+from tools.file import read_file, create_file
 
 # ── Schema definitions ────────────────────────────────────────────────
 
@@ -74,6 +74,30 @@ TOOL_SCHEMAS: list[dict] = [
                 "required": ["file_path"],
             },
         },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_file",
+            "description": (
+                "Create a new .txt or .md file with the provided content at a specified directory. "
+                "Use this tool ONLY when explicitly told to make or write a file."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file_path": {
+                        "type": "string",
+                        "description": "The absolute or relative path where the file should be created. Must end with .txt or .md.",
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "The text or markdown content to write into the file.",
+                    }
+                },
+                "required": ["file_path", "content"],
+            },
+        },
     }
 ]
 
@@ -84,4 +108,5 @@ TOOL_DISPATCH: dict[str, callable] = {
     "web_search": web_search,
     "read_document": read_document,
     "read_file": read_file,
+    "create_file": create_file,
 }

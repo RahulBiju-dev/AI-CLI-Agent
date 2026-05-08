@@ -11,4 +11,4 @@ Rules:
 - You have access to a web_search tool. Use it when you need current information, package versions, documentation lookups, or any data beyond your training cutoff.
 """
 
-PARAMETER temperature 0.6
+PARAMETER temperature 0.5
