@@ -7,6 +7,7 @@ function schema). Add new tools here as the agent grows.
 
 from tools.search import web_search
 from tools.document import read_document
+from tools.file import read_file
 
 # ── Schema definitions ────────────────────────────────────────────────
 
@@ -52,6 +53,27 @@ TOOL_SCHEMAS: list[dict] = [
                 "required": ["file_path"],
             },
         },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": (
+                "Read the contents of a text file from the local filesystem. "
+                "Use this tool when the user asks you to view, read, or analyze "
+                "code or text files on their computer."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file_path": {
+                        "type": "string",
+                        "description": "The absolute or relative path to the file to read.",
+                    }
+                },
+                "required": ["file_path"],
+            },
+        },
     }
 ]
 
@@ -61,4 +83,5 @@ TOOL_SCHEMAS: list[dict] = [
 TOOL_DISPATCH: dict[str, callable] = {
     "web_search": web_search,
     "read_document": read_document,
+    "read_file": read_file,
 }

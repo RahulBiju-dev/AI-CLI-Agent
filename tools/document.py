@@ -31,14 +31,25 @@ def read_document(file_path: str) -> str:
                     extracted = page.extract_text()
                     if extracted:
                         text += extracted + "\n"
-            return json.dumps({"text": text.strip()})
+                    if len(text) > 15000:
+                        break
+            
+            text = text.strip()
+            if len(text) > 15000:
+                text = text[:15000] + f"\n\n...[Document truncated due to size limit. Showing first 15000 characters.]"
+
+            return json.dumps({"text": text})
 
         elif ext == ".docx":
             import docx
 
             doc = docx.Document(file_path)
             text = "\n".join([para.text for para in doc.paragraphs])
-            return json.dumps({"text": text.strip()})
+            text = text.strip()
+            if len(text) > 15000:
+                text = text[:15000] + f"\n\n...[Document truncated due to size limit. Showing first 15000 characters.]"
+
+            return json.dumps({"text": text})
 
         else:
             return json.dumps(
