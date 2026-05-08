@@ -6,6 +6,7 @@ function schema). Add new tools here as the agent grows.
 """
 
 from tools.search import web_search
+from tools.document import read_document
 
 # ── Schema definitions ────────────────────────────────────────────────
 
@@ -30,6 +31,27 @@ TOOL_SCHEMAS: list[dict] = [
                 "required": ["query"],
             },
         },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_document",
+            "description": (
+                "Extract and read text from a PDF or Word document (.docx). "
+                "Use this tool when the user asks you to read, summarize, or analyze "
+                "a local document file."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file_path": {
+                        "type": "string",
+                        "description": "The absolute or relative path to the PDF or Word document file.",
+                    }
+                },
+                "required": ["file_path"],
+            },
+        },
     }
 ]
 
@@ -38,4 +60,5 @@ TOOL_SCHEMAS: list[dict] = [
 
 TOOL_DISPATCH: dict[str, callable] = {
     "web_search": web_search,
+    "read_document": read_document,
 }
