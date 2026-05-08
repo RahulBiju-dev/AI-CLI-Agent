@@ -20,6 +20,12 @@ from tools.registry import TOOL_DISPATCH, TOOL_SCHEMAS
 
 MODEL_NAME = "gemma-agent"
 
+# Parameters that accept float values via /set parameter
+_FLOAT_PARAMS = {"temperature", "top_p", "top_k", "repeat_penalty", "presence_penalty", "frequency_penalty", "min_p", "tfs_z"}
+# Parameters that accept integer values via /set parameter
+_INT_PARAMS = {"num_ctx", "num_predict", "repeat_last_n", "seed", "num_gpu", "num_thread", "num_keep"}
+_ALL_PARAMS = _FLOAT_PARAMS | _INT_PARAMS
+
 # ANSI escape helpers
 _BOLD = "\033[1m"
 _DIM = "\033[2m"
@@ -84,6 +90,8 @@ def _stream_thinking_response(
     model: str,
     messages: list[dict],
     tools: list[dict] | None = None,
+    options: dict | None = None,
+    verbose: bool = False,
 ) -> dict:
     """Stream a response, showing thinking progress and the final answer.
 
@@ -91,19 +99,25 @@ def _stream_thinking_response(
     for appending to history.
     """
     spinner = _Spinner("Thinking").start()
+    t_start = time.monotonic()
 
     thinking_buf = ""
     content_buf = ""
     in_thinking = False
     thinking_displayed = False
 
-    stream = ollama.chat(
-        model=model,
-        messages=messages,
-        tools=tools,
-        stream=True,
-        think=True,
-    )
+    kwargs: dict = {
+        "model": model,
+        "messages": messages,
+        "stream": True,
+        "think": True,
+    }
+    if tools:
+        kwargs["tools"] = tools
+    if options:
+        kwargs["options"] = options
+
+    stream = ollama.chat(**kwargs)
 
     for chunk in stream:
         msg = chunk.message
@@ -176,6 +190,18 @@ def _stream_thinking_response(
     if content_buf:
         print("\n")  # final newlines after streamed answer
 
+    # Verbose stats
+    if verbose:
+        elapsed = time.monotonic() - t_start
+        t_tokens = len(thinking_buf.split()) if thinking_buf else 0
+        c_tokens = len(content_buf.split()) if content_buf else 0
+        total = t_tokens + c_tokens
+        tps = total / elapsed if elapsed > 0 else 0
+        print(
+            f"{_DIM}  ⏱  {elapsed:.1f}s  ·  ~{total} tokens  ·  ~{tps:.1f} tok/s{_RESET}\n",
+            file=sys.stderr,
+        )
+
     # Build the full message for history
     assistant_msg = {"role": "assistant", "content": content_buf}
     if thinking_buf:
@@ -209,30 +235,134 @@ def _process_tool_calls(tool_calls: list[dict]) -> list[dict]:
 
 _COMMANDS_HELP = f"""
 {_CYAN}{_BOLD}Available commands:{_RESET}
-  {_GREEN}/help{_RESET}    — Show this help message
-  {_GREEN}/clear{_RESET}   — Clear conversation history
-  {_GREEN}/model{_RESET}   — Show current model info
-  {_GREEN}/quit{_RESET}    — Exit the agent  {_DIM}(also /exit, /q){_RESET}
+  {_GREEN}/help{_RESET}                          — Show this help message
+  {_GREEN}/clear{_RESET}                         — Clear conversation history
+  {_GREEN}/set parameter <name> <val>{_RESET}    — Set a model parameter  {_DIM}(e.g. temperature 0.7){_RESET}
+  {_GREEN}/set system "<prompt>"{_RESET}         — Set the system prompt for this session
+  {_GREEN}/set verbose{_RESET}                   — Show generation stats after each response
+  {_GREEN}/set quiet{_RESET}                     — Hide generation stats  {_DIM}(default){_RESET}
+  {_GREEN}/set wordwrap{_RESET}                  — Enable word wrapping  {_DIM}(default){_RESET}
+  {_GREEN}/set nowordwrap{_RESET}                — Disable word wrapping
+  {_GREEN}/show parameters{_RESET}               — Show current session parameters
+  {_GREEN}/show system{_RESET}                   — Show the active system prompt
+  {_GREEN}/show model{_RESET}                    — Show model info
+  {_GREEN}/quit{_RESET}                          — Exit the agent  {_DIM}(also /exit, /q){_RESET}
 """
 
 
-def _handle_command(cmd: str, history: list[dict]) -> bool | None:
-    """Handle a slash command. Returns True if handled, None to quit."""
-    cmd_lower = cmd.lower().strip()
+def _handle_set(args: str, session: dict, history: list[dict]) -> None:
+    """Handle /set sub-commands."""
+    parts = args.strip().split(None, 1)
+    if not parts:
+        print(f"{_RED}Usage: /set <subcommand> [args]{_RESET}  {_DIM}(type /help for details){_RESET}\n")
+        return
 
-    if cmd_lower in ("/quit", "/exit", "/q"):
-        return None  # Signal to quit
+    sub = parts[0].lower()
+    rest = parts[1] if len(parts) > 1 else ""
 
-    if cmd_lower == "/help":
-        print(_COMMANDS_HELP)
-        return True
+    # ── /set verbose / /set quiet ─────────────────────────────────────
+    if sub == "verbose":
+        session["verbose"] = True
+        print(f"{_CYAN}{_BOLD}✓  Verbose mode enabled — stats shown after each response.{_RESET}\n")
+        return
+    if sub == "quiet":
+        session["verbose"] = False
+        print(f"{_CYAN}{_BOLD}✓  Quiet mode enabled.{_RESET}\n")
+        return
 
-    if cmd_lower == "/clear":
-        history.clear()
-        print(f"{_CYAN}{_BOLD}✓  Conversation history cleared.{_RESET}\n")
-        return True
+    # ── /set wordwrap / /set nowordwrap ───────────────────────────────
+    if sub == "wordwrap":
+        session["wordwrap"] = True
+        print(f"{_CYAN}{_BOLD}✓  Word wrapping enabled.{_RESET}\n")
+        return
+    if sub == "nowordwrap":
+        session["wordwrap"] = False
+        print(f"{_CYAN}{_BOLD}✓  Word wrapping disabled.{_RESET}\n")
+        return
 
-    if cmd_lower == "/model":
+    # ── /set system "<prompt>" ────────────────────────────────────────
+    if sub == "system":
+        # Strip surrounding quotes if present
+        prompt = rest.strip().strip('"').strip("'")
+        if not prompt:
+            print(f"{_RED}Usage: /set system \"Your system prompt here\"{_RESET}\n")
+            return
+        # Update or insert system message at the start of history
+        if history and history[0].get("role") == "system":
+            history[0]["content"] = prompt
+        else:
+            history.insert(0, {"role": "system", "content": prompt})
+        session["system"] = prompt
+        # Truncate display for confirmation
+        display = prompt if len(prompt) <= 80 else prompt[:77] + "…"
+        print(f"{_CYAN}{_BOLD}✓  System prompt set:{_RESET} {_DIM}{display}{_RESET}\n")
+        return
+
+    # ── /set parameter <name> <value> ─────────────────────────────────
+    if sub == "parameter":
+        param_parts = rest.strip().split(None, 1)
+        if len(param_parts) != 2:
+            print(f"{_RED}Usage: /set parameter <name> <value>{_RESET}")
+            print(f"{_DIM}  Available: {', '.join(sorted(_ALL_PARAMS))}{_RESET}\n")
+            return
+
+        name, raw_val = param_parts[0].lower(), param_parts[1]
+
+        if name not in _ALL_PARAMS:
+            print(f"{_RED}Unknown parameter: {name}{_RESET}")
+            print(f"{_DIM}  Available: {', '.join(sorted(_ALL_PARAMS))}{_RESET}\n")
+            return
+
+        try:
+            value = float(raw_val) if name in _FLOAT_PARAMS else int(raw_val)
+        except ValueError:
+            expected = "float" if name in _FLOAT_PARAMS else "integer"
+            print(f"{_RED}Invalid value for {name}: expected {expected}, got '{raw_val}'{_RESET}\n")
+            return
+
+        session["options"][name] = value
+        print(f"{_CYAN}{_BOLD}✓  {name} = {value}{_RESET}\n")
+        return
+
+    print(f"{_RED}Unknown /set subcommand: {sub}{_RESET}  {_DIM}(try: parameter, system, verbose, quiet, wordwrap, nowordwrap){_RESET}\n")
+
+
+def _handle_show(args: str, session: dict, history: list[dict]) -> None:
+    """Handle /show sub-commands."""
+    sub = args.strip().lower() or "parameters"
+
+    if sub == "parameters":
+        opts = session.get("options", {})
+        if not opts:
+            print(f"{_DIM}  No custom parameters set (using model defaults).{_RESET}\n")
+        else:
+            print(f"\n{_CYAN}{_BOLD}Session parameters:{_RESET}")
+            for k, v in sorted(opts.items()):
+                print(f"  {_GREEN}{k}{_RESET} = {v}")
+            print()
+        # Also show flags
+        flags = []
+        if session.get("verbose"):
+            flags.append("verbose")
+        if not session.get("wordwrap", True):
+            flags.append("nowordwrap")
+        if flags:
+            print(f"{_DIM}  Flags: {', '.join(flags)}{_RESET}\n")
+        return
+
+    if sub == "system":
+        prompt = session.get("system", "")
+        if not prompt:
+            # Check if history has one from the Modelfile
+            if history and history[0].get("role") == "system":
+                prompt = history[0]["content"]
+        if prompt:
+            print(f"\n{_CYAN}{_BOLD}System prompt:{_RESET}\n{_DIM}{prompt}{_RESET}\n")
+        else:
+            print(f"{_DIM}  No system prompt set (using Modelfile default).{_RESET}\n")
+        return
+
+    if sub in ("model", "info"):
         try:
             info = ollama.show(MODEL_NAME)
             model_info = getattr(info, "modelinfo", None) or {}
@@ -243,10 +373,39 @@ def _handle_command(cmd: str, history: list[dict]) -> bool | None:
             print(f"{_CYAN}{_BOLD}Params:{_RESET} {params}\n")
         except Exception:
             print(f"\n{_CYAN}{_BOLD}Model:{_RESET}  {MODEL_NAME}\n")
+        return
+
+    print(f"{_RED}Unknown /show subcommand: {sub}{_RESET}  {_DIM}(try: parameters, system, model){_RESET}\n")
+
+
+def _handle_command(cmd: str, session: dict, history: list[dict]) -> bool | None:
+    """Handle a slash command. Returns True if handled, None to quit."""
+    parts = cmd.strip().split(None, 1)
+    base = parts[0].lower()
+    rest = parts[1] if len(parts) > 1 else ""
+
+    if base in ("/quit", "/exit", "/q"):
+        return None  # Signal to quit
+
+    if base in ("/help", "/?"):
+        print(_COMMANDS_HELP)
+        return True
+
+    if base == "/clear":
+        history.clear()
+        print(f"{_CYAN}{_BOLD}✓  Conversation history cleared.{_RESET}\n")
+        return True
+
+    if base == "/set":
+        _handle_set(rest, session, history)
+        return True
+
+    if base == "/show":
+        _handle_show(rest, session, history)
         return True
 
     # Unknown command
-    print(f"{_RED}Unknown command: {cmd}{_RESET}  {_DIM}(type /help for available commands){_RESET}\n")
+    print(f"{_RED}Unknown command: {base}{_RESET}  {_DIM}(type /help for available commands){_RESET}\n")
     return True
 
 
@@ -255,6 +414,12 @@ def _handle_command(cmd: str, history: list[dict]) -> bool | None:
 def run() -> None:
     """Run the interactive agent loop."""
     history: list[dict] = []
+    session: dict = {
+        "options": {},       # Runtime model parameters (temperature, etc.)
+        "verbose": False,    # Show generation stats
+        "wordwrap": True,    # Word wrapping (reserved for future use)
+        "system": "",        # Custom system prompt override
+    }
 
     print(f"\n{_CYAN}{_BOLD}╭───────────────────────────────────────╮{_RESET}")
     print(f"{_CYAN}{_BOLD}│   Gemma CLI Agent  ·  type /help      │{_RESET}")
@@ -272,7 +437,7 @@ def run() -> None:
 
         # ── Handle slash commands ─────────────────────────────────────
         if user_input.startswith("/"):
-            result = _handle_command(user_input, history)
+            result = _handle_command(user_input, session, history)
             if result is None:
                 break  # /quit
             continue  # Command was handled, skip LLM call
@@ -284,6 +449,8 @@ def run() -> None:
             model=MODEL_NAME,
             messages=history,
             tools=TOOL_SCHEMAS,
+            options=session["options"] or None,
+            verbose=session["verbose"],
         )
         history.append(assistant_msg)
 
@@ -297,5 +464,7 @@ def run() -> None:
                 model=MODEL_NAME,
                 messages=history,
                 tools=TOOL_SCHEMAS,
+                options=session["options"] or None,
+                verbose=session["verbose"],
             )
             history.append(assistant_msg)
