@@ -6,11 +6,14 @@ intercepts any tool calls, executes them, feeds results back, and
 streams the final synthesized answer with visible thinking status.
 """
 
+import glob
 import json
+import os
 import sys
 import threading
 import time
 import itertools
+from datetime import datetime, timezone
 
 import ollama
 from rich.console import Console
@@ -22,6 +25,7 @@ from tools.registry import TOOL_DISPATCH, TOOL_SCHEMAS
 # ── Configuration ─────────────────────────────────────────────────────
 
 MODEL_NAME = "gemma-agent"
+_SESSIONS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "sessions")
 
 # Parameters that accept float values via /set parameter
 _FLOAT_PARAMS = {"temperature", "top_p", "top_k", "repeat_penalty", "presence_penalty", "frequency_penalty", "min_p", "tfs_z"}
@@ -98,6 +102,8 @@ def _stream_thinking_response(
     tools: list[dict] | None = None,
     options: dict | None = None,
     verbose: bool = False,
+    think: bool = True,
+    fmt: str | None = None,
 ) -> dict:
     """Stream a response, showing thinking progress and the final answer.
 
@@ -116,8 +122,10 @@ def _stream_thinking_response(
         "model": model,
         "messages": messages,
         "stream": True,
-        "think": True,
+        "think": think,
     }
+    if fmt:
+        kwargs["format"] = fmt
     if tools:
         kwargs["tools"] = tools
     if options:
@@ -274,12 +282,20 @@ _COMMANDS_HELP = f"""
 {_CYAN}{_BOLD}Available commands:{_RESET}
   {_GREEN}/help{_RESET}                          — Show this help message
   {_GREEN}/clear{_RESET}                         — Clear conversation history
+  {_GREEN}/save [name]{_RESET}                   — Save current session  {_DIM}(optional name){_RESET}
+  {_GREEN}/load [name|index]{_RESET}             — Load a saved session  {_DIM}(lists sessions if no arg){_RESET}
   {_GREEN}/set parameter <name> <val>{_RESET}    — Set a model parameter  {_DIM}(e.g. temperature 0.7){_RESET}
   {_GREEN}/set system "<prompt>"{_RESET}         — Set the system prompt for this session
-  {_GREEN}/set verbose{_RESET}                   — Show generation stats after each response
-  {_GREEN}/set quiet{_RESET}                     — Hide generation stats  {_DIM}(default){_RESET}
+  {_GREEN}/set history{_RESET}                   — Enable conversation history  {_DIM}(default){_RESET}
+  {_GREEN}/set nohistory{_RESET}                 — Disable history  {_DIM}(each turn is standalone){_RESET}
   {_GREEN}/set wordwrap{_RESET}                  — Enable word wrapping  {_DIM}(default){_RESET}
   {_GREEN}/set nowordwrap{_RESET}                — Disable word wrapping
+  {_GREEN}/set format json{_RESET}               — Force JSON output from the model
+  {_GREEN}/set noformat{_RESET}                  — Disable forced output format  {_DIM}(default){_RESET}
+  {_GREEN}/set verbose{_RESET}                   — Show generation stats after each response
+  {_GREEN}/set quiet{_RESET}                     — Hide generation stats  {_DIM}(default){_RESET}
+  {_GREEN}/set think{_RESET}                     — Enable model thinking/reasoning  {_DIM}(default){_RESET}
+  {_GREEN}/set nothink{_RESET}                   — Disable model thinking
   {_GREEN}/show parameters{_RESET}               — Show current session parameters
   {_GREEN}/show system{_RESET}                   — Show the active system prompt
   {_GREEN}/show model{_RESET}                    — Show model info
@@ -315,6 +331,40 @@ def _handle_set(args: str, session: dict, history: list[dict]) -> None:
     if sub == "nowordwrap":
         session["wordwrap"] = False
         print(f"{_CYAN}{_BOLD}✓  Word wrapping disabled.{_RESET}\n")
+        return
+
+    # ── /set history / /set nohistory ─────────────────────────────────
+    if sub == "history":
+        session["history"] = True
+        print(f"{_CYAN}{_BOLD}✓  Conversation history enabled.{_RESET}\n")
+        return
+    if sub == "nohistory":
+        session["history"] = False
+        print(f"{_CYAN}{_BOLD}✓  History disabled — each turn is now standalone.{_RESET}\n")
+        return
+
+    # ── /set format json / /set noformat ──────────────────────────────
+    if sub == "format":
+        fmt = rest.strip().lower()
+        if fmt == "json":
+            session["format"] = "json"
+            print(f"{_CYAN}{_BOLD}✓  JSON output mode enabled.{_RESET}\n")
+        else:
+            print(f"{_RED}Unsupported format: {fmt}{_RESET}  {_DIM}(supported: json){_RESET}\n")
+        return
+    if sub == "noformat":
+        session["format"] = ""
+        print(f"{_CYAN}{_BOLD}✓  Output formatting reset to default.{_RESET}\n")
+        return
+
+    # ── /set think / /set nothink ─────────────────────────────────────
+    if sub == "think":
+        session["think"] = True
+        print(f"{_CYAN}{_BOLD}✓  Thinking/reasoning enabled.{_RESET}\n")
+        return
+    if sub == "nothink":
+        session["think"] = False
+        print(f"{_CYAN}{_BOLD}✓  Thinking disabled — model will respond directly.{_RESET}\n")
         return
 
     # ── /set system "<prompt>" ────────────────────────────────────────
@@ -361,7 +411,7 @@ def _handle_set(args: str, session: dict, history: list[dict]) -> None:
         print(f"{_CYAN}{_BOLD}✓  {name} = {value}{_RESET}\n")
         return
 
-    print(f"{_RED}Unknown /set subcommand: {sub}{_RESET}  {_DIM}(try: parameter, system, verbose, quiet, wordwrap, nowordwrap){_RESET}\n")
+    print(f"{_RED}Unknown /set subcommand: {sub}{_RESET}  {_DIM}(try: parameter, system, verbose, quiet, wordwrap, nowordwrap, history, nohistory, format, noformat, think, nothink){_RESET}\n")
 
 
 def _handle_show(args: str, session: dict, history: list[dict]) -> None:
@@ -383,6 +433,12 @@ def _handle_show(args: str, session: dict, history: list[dict]) -> None:
             flags.append("verbose")
         if not session.get("wordwrap", True):
             flags.append("nowordwrap")
+        if not session.get("history", True):
+            flags.append("nohistory")
+        if session.get("format"):
+            flags.append(f"format={session['format']}")
+        if not session.get("think", True):
+            flags.append("nothink")
         if flags:
             print(f"{_DIM}  Flags: {', '.join(flags)}{_RESET}\n")
         return
@@ -415,6 +471,133 @@ def _handle_show(args: str, session: dict, history: list[dict]) -> None:
     print(f"{_RED}Unknown /show subcommand: {sub}{_RESET}  {_DIM}(try: parameters, system, model){_RESET}\n")
 
 
+def _list_saved_sessions() -> list[str]:
+    """Return a sorted list of session file paths (newest first)."""
+    if not os.path.isdir(_SESSIONS_DIR):
+        return []
+    files = glob.glob(os.path.join(_SESSIONS_DIR, "*.json"))
+    files.sort(key=os.path.getmtime, reverse=True)
+    return files
+
+
+def _handle_save(args: str, session: dict, history: list[dict]) -> None:
+    """Handle /save [name] — persist current session to a JSON file."""
+    os.makedirs(_SESSIONS_DIR, exist_ok=True)
+
+    name = args.strip()
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    if name:
+        # Sanitize the name: replace spaces with underscores, strip non-alphanumerics
+        safe_name = "".join(c if c.isalnum() or c in ("_", "-") else "_" for c in name)
+        filename = f"{safe_name}_{timestamp}.json"
+    else:
+        filename = f"session_{timestamp}.json"
+
+    filepath = os.path.join(_SESSIONS_DIR, filename)
+
+    payload = {
+        "saved_at": datetime.now(timezone.utc).isoformat(),
+        "model": MODEL_NAME,
+        "session": {
+            "options": session.get("options", {}),
+            "verbose": session.get("verbose", False),
+            "wordwrap": session.get("wordwrap", True),
+            "system": session.get("system", ""),
+            "history": session.get("history", True),
+            "format": session.get("format", ""),
+            "think": session.get("think", True),
+        },
+        "history": history,
+    }
+
+    try:
+        with open(filepath, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, ensure_ascii=False)
+        display_name = os.path.basename(filepath)
+        msg_count = sum(1 for m in history if m.get("role") == "user")
+        print(f"{_CYAN}{_BOLD}✓  Session saved:{_RESET} {_DIM}{display_name}{_RESET}  ({msg_count} user message{'s' if msg_count != 1 else ''})\n")
+    except OSError as exc:
+        print(f"{_RED}Failed to save session: {exc}{_RESET}\n")
+
+
+def _handle_load(args: str, session: dict, history: list[dict]) -> None:
+    """Handle /load [name|index] — load a previously saved session."""
+    saved = _list_saved_sessions()
+    arg = args.strip()
+
+    # No argument: list available sessions
+    if not arg:
+        if not saved:
+            print(f"{_DIM}  No saved sessions found.{_RESET}\n")
+            return
+        print(f"\n{_CYAN}{_BOLD}Saved sessions:{_RESET}")
+        for i, fp in enumerate(saved, 1):
+            name = os.path.basename(fp).replace(".json", "")
+            mtime = datetime.fromtimestamp(os.path.getmtime(fp)).strftime("%Y-%m-%d %H:%M")
+            # Peek at message count
+            try:
+                with open(fp, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                msg_count = sum(1 for m in data.get("history", []) if m.get("role") == "user")
+                info = f"{msg_count} msg{'s' if msg_count != 1 else ''}"
+            except Exception:
+                info = "?"
+            print(f"  {_GREEN}{i}.{_RESET} {name}  {_DIM}({mtime} · {info}){_RESET}")
+        print(f"\n{_DIM}  Use /load <number> or /load <name> to restore.{_RESET}\n")
+        return
+
+    # Try as index first
+    target_path: str | None = None
+    try:
+        idx = int(arg)
+        if 1 <= idx <= len(saved):
+            target_path = saved[idx - 1]
+    except ValueError:
+        pass
+
+    # Try as name substring match
+    if target_path is None:
+        matches = [fp for fp in saved if arg.lower() in os.path.basename(fp).lower()]
+        if len(matches) == 1:
+            target_path = matches[0]
+        elif len(matches) > 1:
+            print(f"{_YELLOW}Multiple sessions match '{arg}':{_RESET}")
+            for fp in matches:
+                print(f"  {_DIM}{os.path.basename(fp)}{_RESET}")
+            print(f"{_DIM}  Be more specific or use /load to list with indices.{_RESET}\n")
+            return
+
+    if target_path is None:
+        print(f"{_RED}No session found matching '{arg}'.{_RESET}  {_DIM}(type /load to list available sessions){_RESET}\n")
+        return
+
+    # Load the session
+    try:
+        with open(target_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"{_RED}Failed to load session: {exc}{_RESET}\n")
+        return
+
+    # Restore history
+    history.clear()
+    history.extend(data.get("history", []))
+
+    # Restore session parameters
+    saved_session = data.get("session", {})
+    session["options"] = saved_session.get("options", {})
+    session["verbose"] = saved_session.get("verbose", False)
+    session["wordwrap"] = saved_session.get("wordwrap", True)
+    session["system"] = saved_session.get("system", "")
+    session["history"] = saved_session.get("history", True)
+    session["format"] = saved_session.get("format", "")
+    session["think"] = saved_session.get("think", True)
+
+    display_name = os.path.basename(target_path).replace(".json", "")
+    msg_count = sum(1 for m in history if m.get("role") == "user")
+    print(f"{_CYAN}{_BOLD}✓  Session loaded:{_RESET} {_DIM}{display_name}{_RESET}  ({msg_count} user message{'s' if msg_count != 1 else ''})\n")
+
+
 def _handle_command(cmd: str, session: dict, history: list[dict]) -> bool | None:
     """Handle a slash command. Returns True if handled, None to quit."""
     parts = cmd.strip().split(None, 1)
@@ -441,6 +624,14 @@ def _handle_command(cmd: str, session: dict, history: list[dict]) -> bool | None
         _handle_show(rest, session, history)
         return True
 
+    if base == "/save":
+        _handle_save(rest, session, history)
+        return True
+
+    if base == "/load":
+        _handle_load(rest, session, history)
+        return True
+
     # Unknown command
     print(f"{_RED}Unknown command: {base}{_RESET}  {_DIM}(type /help for available commands){_RESET}\n")
     return True
@@ -456,6 +647,9 @@ def run() -> None:
         "verbose": False,    # Show generation stats
         "wordwrap": True,    # Word wrapping (reserved for future use)
         "system": "",        # Custom system prompt override
+        "history": True,     # Whether to keep conversation history across turns
+        "format": "",        # Output format ("" = default, "json" = JSON mode)
+        "think": True,       # Whether to enable model thinking/reasoning
     }
 
     print(f"\n{_CYAN}{_BOLD}╭───────────────────────────────────────╮{_RESET}")
@@ -479,29 +673,49 @@ def run() -> None:
                 break  # /quit
             continue  # Command was handled, skip LLM call
 
-        history.append({"role": "user", "content": user_input})
+        # When history is disabled, send only the current message (+ system if set)
+        if session["history"]:
+            history.append({"role": "user", "content": user_input})
+            messages_to_send = history
+        else:
+            messages_to_send = []
+            if history and history[0].get("role") == "system":
+                messages_to_send.append(history[0])
+            messages_to_send.append({"role": "user", "content": user_input})
 
         # ── LLM call with streaming + thinking ────────────────────────
         assistant_msg = _stream_thinking_response(
             model=MODEL_NAME,
-            messages=history,
+            messages=messages_to_send,
             tools=TOOL_SCHEMAS,
             options=session["options"] or None,
             verbose=session["verbose"],
+            think=session["think"],
+            fmt=session["format"] or None,
         )
-        history.append(assistant_msg)
+
+        if session["history"]:
+            history.append(assistant_msg)
 
         # ── Tool-call loop (iterative, in case of chained calls) ──────
         while assistant_msg.get("tool_calls"):
             tool_results = _process_tool_calls(assistant_msg["tool_calls"])
-            history.extend(tool_results)
+            if session["history"]:
+                history.extend(tool_results)
+                messages_to_send = history
+            else:
+                messages_to_send.append(assistant_msg)
+                messages_to_send.extend(tool_results)
 
             # Follow-up call after tool results — also streamed
             assistant_msg = _stream_thinking_response(
                 model=MODEL_NAME,
-                messages=history,
+                messages=messages_to_send,
                 tools=TOOL_SCHEMAS,
                 options=session["options"] or None,
                 verbose=session["verbose"],
+                think=session["think"],
+                fmt=session["format"] or None,
             )
-            history.append(assistant_msg)
+            if session["history"]:
+                history.append(assistant_msg)

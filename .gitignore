@@ -217,6 +217,9 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
+# Saved sessions
+sessions/
+
 #Agents
 AGENTS.md
 .agents/
