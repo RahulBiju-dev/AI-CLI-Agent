@@ -13,6 +13,9 @@ import time
 import itertools
 
 import ollama
+from rich.console import Console
+from rich.markdown import Markdown
+from rich.live import Live
 
 from tools.registry import TOOL_DISPATCH, TOOL_SCHEMAS
 
@@ -37,6 +40,9 @@ _RED = "\033[31m"
 _MAGENTA = "\033[35m"
 _RESET = "\033[0m"
 _CLEAR_LINE = "\033[2K\r"
+
+# Initialize Rich console
+_console = Console()
 
 
 # ── Helpers ───────────────────────────────────────────────────────────
@@ -119,63 +125,81 @@ def _stream_thinking_response(
 
     stream = ollama.chat(**kwargs)
 
-    for chunk in stream:
-        msg = chunk.message
+    live = None
+    try:
+        for chunk in stream:
+            msg = chunk.message
 
-        # ── Tool calls come through as non-streamed chunks ────────
-        if msg.tool_calls:
-            spinner.stop()
-            # Build the assistant message with any accumulated content
-            assistant_msg = {"role": "assistant", "content": content_buf}
-            if thinking_buf:
-                assistant_msg["thinking"] = thinking_buf
-            assistant_msg["tool_calls"] = [
-                {"function": {"name": tc.function.name, "arguments": tc.function.arguments}}
-                for tc in msg.tool_calls
-            ]
-            return assistant_msg
-
-        # ── Thinking tokens ───────────────────────────────────────
-        thinking_chunk = getattr(msg, "thinking", None) or ""
-        if thinking_chunk:
-            if not in_thinking:
-                in_thinking = True
+            # ── Tool calls come through as non-streamed chunks ────────
+            if msg.tool_calls:
                 spinner.stop()
-                # Print thinking header
+                # Build the assistant message with any accumulated content
+                assistant_msg = {"role": "assistant", "content": content_buf}
+                if thinking_buf:
+                    assistant_msg["thinking"] = thinking_buf
+                assistant_msg["tool_calls"] = [
+                    {"function": {"name": tc.function.name, "arguments": tc.function.arguments}}
+                    for tc in msg.tool_calls
+                ]
+                return assistant_msg
+
+            # ── Thinking tokens ───────────────────────────────────────
+            thinking_chunk = getattr(msg, "thinking", None) or ""
+            if thinking_chunk:
+                if not in_thinking:
+                    in_thinking = True
+                    spinner.stop()
+                    # Print thinking header
+                    print(
+                        f"\n{_MAGENTA}{_DIM}┌─ thinking ─────────────────────────────{_RESET}",
+                        file=sys.stderr,
+                    )
+                    thinking_displayed = True
+
+                thinking_buf += thinking_chunk
+                # Print thinking content in dim magenta
                 print(
-                    f"\n{_MAGENTA}{_DIM}┌─ thinking ─────────────────────────────{_RESET}",
+                    f"{_MAGENTA}{_DIM}{thinking_chunk}{_RESET}",
+                    end="",
                     file=sys.stderr,
+                    flush=True,
                 )
-                thinking_displayed = True
+                continue
 
-            thinking_buf += thinking_chunk
-            # Print thinking content in dim magenta
-            print(
-                f"{_MAGENTA}{_DIM}{thinking_chunk}{_RESET}",
-                end="",
-                file=sys.stderr,
-                flush=True,
-            )
-            continue
+            # ── Content tokens ────────────────────────────────────────
+            content_chunk = msg.content or ""
+            if content_chunk:
+                if in_thinking:
+                    # Transition from thinking to answering
+                    in_thinking = False
+                    print(
+                        f"\n{_MAGENTA}{_DIM}└────────────────────────────────────────{_RESET}\n",
+                        file=sys.stderr,
+                    )
+                    spinner.stop()
+                elif spinner._thread and not spinner._stop_event.is_set():
+                    spinner.stop()
+                    if not thinking_displayed:
+                        print()  # newline before answer
 
-        # ── Content tokens ────────────────────────────────────────
-        content_chunk = msg.content or ""
-        if content_chunk:
-            if in_thinking:
-                # Transition from thinking to answering
-                in_thinking = False
-                print(
-                    f"\n{_MAGENTA}{_DIM}└────────────────────────────────────────{_RESET}\n",
-                    file=sys.stderr,
-                )
-                spinner.stop()
-            elif spinner._thread and not spinner._stop_event.is_set():
-                spinner.stop()
-                if not thinking_displayed:
-                    print()  # newline before answer
+                content_buf += content_chunk
 
-            content_buf += content_chunk
-            print(f"{_BOLD}{content_chunk}{_RESET}", end="", flush=True)
+                # Initialize Live display on the first content chunk
+                if live is None:
+                    live = Live(
+                        Markdown(content_buf),
+                        console=_console,
+                        auto_refresh=False,
+                        vertical_overflow="visible",
+                    )
+                    live.start()
+
+                # Update Markdown rendering in real-time
+                live.update(Markdown(content_buf), refresh=True)
+
+    finally:
+        if live:
+            live.stop()
 
     # End of stream
     spinner.stop()
@@ -188,7 +212,7 @@ def _stream_thinking_response(
         )
 
     if content_buf:
-        print("\n")  # final newlines after streamed answer
+        print()  # final newline after streamed answer
 
     # Verbose stats
     if verbose:
