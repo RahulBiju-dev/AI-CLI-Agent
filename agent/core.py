@@ -266,6 +266,10 @@ def _process_tool_calls(tool_calls: list[dict]) -> list[dict]:
                 _print_status("📂", f"Reading file: {_DIM}{fn_args.get('file_path', '')}{_RESET}", _YELLOW)
                 result = handler(**fn_args)
                 _print_status("✓", "File read — synthesizing answer…", _GREEN)
+            elif fn_name == "spotify_play":
+                _print_status("🎵", f"Opening Spotify: {_DIM}{fn_args.get('query', '')}{_RESET}", _YELLOW)
+                result = handler(**fn_args)
+                _print_status("✓", "Spotify action complete — synthesizing answer…", _GREEN)
             else:
                 _print_status("⚙️", f"Executing {fn_name}…", _YELLOW)
                 result = handler(**fn_args)

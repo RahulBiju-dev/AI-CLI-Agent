@@ -8,6 +8,7 @@ function schema). Add new tools here as the agent grows.
 from tools.search import web_search
 from tools.document import read_document
 from tools.file import read_file, create_file
+from tools.spotify import spotify_play
 
 # ── Schema definitions ────────────────────────────────────────────────
 
@@ -98,6 +99,40 @@ TOOL_SCHEMAS: list[dict] = [
                 "required": ["file_path", "content"],
             },
         },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "spotify_play",
+            "description": (
+                "Open Spotify and play a specific song, album, playlist, or artist. "
+                "Use this tool when the user asks you to play music on Spotify. "
+                "You can provide a Spotify URI, a Spotify URL, or a natural language "
+                "search query like 'Bohemian Rhapsody by Queen'."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": (
+                            "A Spotify URI (spotify:track:...), a Spotify URL "
+                            "(https://open.spotify.com/...), or a search query "
+                            "describing the song, album, playlist, or artist to play."
+                        ),
+                    },
+                    "content_type": {
+                        "type": "string",
+                        "description": (
+                            "The type of content to search for. "
+                            "One of: track, album, playlist, artist. Defaults to track."
+                        ),
+                        "enum": ["track", "album", "playlist", "artist"],
+                    }
+                },
+                "required": ["query"],
+            },
+        },
     }
 ]
 
@@ -109,4 +144,5 @@ TOOL_DISPATCH: dict[str, callable] = {
     "read_document": read_document,
     "read_file": read_file,
     "create_file": create_file,
+    "spotify_play": spotify_play,
 }
