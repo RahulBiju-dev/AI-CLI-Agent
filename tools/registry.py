@@ -9,6 +9,7 @@ from tools.search import web_search
 from tools.document import read_document
 from tools.file import read_file, create_file
 from tools.spotify import spotify_play
+from tools.browser import open_browser
 
 # ── Schema definitions ────────────────────────────────────────────────
 
@@ -125,6 +126,27 @@ TOOL_SCHEMAS: list[dict] = [
                 "required": ["query"],
             },
         },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "open_browser",
+            "description": (
+                "Open the user's default web browser to a specific website or search query. "
+                "Use this tool when the user asks to open a website, search for something in the browser, "
+                "or watch a video."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "The URL to open (e.g. 'youtube.com') or a search term (e.g. 'cute cats').",
+                    }
+                },
+                "required": ["query"],
+            },
+        },
     }
 ]
 
@@ -137,4 +159,5 @@ TOOL_DISPATCH: dict[str, callable] = {
     "read_file": read_file,
     "create_file": create_file,
     "spotify_play": spotify_play,
+    "open_browser": open_browser,
 }
