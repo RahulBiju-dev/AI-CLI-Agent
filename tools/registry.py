@@ -80,7 +80,7 @@ TOOL_SCHEMAS: list[dict] = [
         "function": {
             "name": "create_file",
             "description": (
-                "Create a new .txt or .md file with the provided content at a specified directory. "
+                "Create a new file with the provided content at a specified directory. "
                 "Use this tool ONLY when explicitly told to make or write a file."
             ),
             "parameters": {
@@ -88,11 +88,11 @@ TOOL_SCHEMAS: list[dict] = [
                 "properties": {
                     "file_path": {
                         "type": "string",
-                        "description": "The absolute or relative path where the file should be created. Must end with .txt or .md.",
+                        "description": "The absolute or relative path where the file should be created.",
                     },
                     "content": {
                         "type": "string",
-                        "description": "The text or markdown content to write into the file.",
+                        "description": "The text content to write into the file.",
                     }
                 },
                 "required": ["file_path", "content"],

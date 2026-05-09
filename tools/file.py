@@ -28,18 +28,15 @@ def read_file(file_path: str) -> str:
 
 
 def create_file(file_path: str, content: str) -> str:
-    """Create a new .txt or .md file with the given content.
+    """Create a new file with the given content.
 
     Args:
-        file_path: The absolute or relative path where the file should be created. Must end in .txt or .md.
+        file_path: The absolute or relative path where the file should be created.
         content: The text content to write to the file.
 
     Returns:
         A JSON string indicating success or failure.
     """
-    if not (file_path.endswith(".txt") or file_path.endswith(".md")):
-        return json.dumps({"error": "Only .txt and .md files are supported."})
-
     try:
         # Create directories if they don't exist
         dir_name = os.path.dirname(os.path.abspath(file_path))
