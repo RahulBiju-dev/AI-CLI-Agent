@@ -10,7 +10,7 @@ A modular, tool-capable local AI agent built with Python and Ollama. This agent 
   - 📄 **Document Reader**: Extract text from PDF (`pypdf`) and Word documents (`python-docx`).
   - 📂 **File Reader**: Read contents of local text files.
   - 📝 **File Creator**: Create files and write content directly to the local filesystem.
-  - 🎵 **Spotify Control**: Open Spotify and play specific songs, albums, playlists, or artists — by name or Spotify URI/URL.
+  - 🎵 **Spotify Control**: Open Spotify and play specific songs — by name or Spotify URI/URL.
 - **Rich Terminal Interface**: Renders markdown output beautifully in the terminal using the `rich` library.
 - **Thought Process Visibility**: Streams the agent's internal reasoning/thinking before providing the final answer.
 - **Session Management**: Slash commands allow saving and loading conversations (`/save`, `/load`).

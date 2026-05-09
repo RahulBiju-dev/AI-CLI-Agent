@@ -105,8 +105,8 @@ TOOL_SCHEMAS: list[dict] = [
         "function": {
             "name": "spotify_play",
             "description": (
-                "Open Spotify and play a specific song, album, playlist, or artist. "
-                "Use this tool when the user asks you to play music on Spotify. "
+                "Open Spotify and play a specific song. "
+                "Use this tool when the user asks you to play a song on Spotify. "
                 "You can provide a Spotify URI, a Spotify URL, or a natural language "
                 "search query like 'Bohemian Rhapsody by Queen'."
             ),
@@ -117,17 +117,9 @@ TOOL_SCHEMAS: list[dict] = [
                         "type": "string",
                         "description": (
                             "A Spotify URI (spotify:track:...), a Spotify URL "
-                            "(https://open.spotify.com/...), or a search query "
-                            "describing the song, album, playlist, or artist to play."
+                            "(https://open.spotify.com/track/...), or a search query "
+                            "describing the song to play (e.g. 'Bohemian Rhapsody Queen')."
                         ),
-                    },
-                    "content_type": {
-                        "type": "string",
-                        "description": (
-                            "The type of content to search for. "
-                            "One of: track, album, playlist, artist. Defaults to track."
-                        ),
-                        "enum": ["track", "album", "playlist", "artist"],
                     }
                 },
                 "required": ["query"],

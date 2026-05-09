@@ -1,13 +1,12 @@
 """
 tools/spotify.py — Spotify desktop control via D-Bus (MPRIS2).
 
-Allows the agent to launch Spotify, play specific songs/albums/playlists,
-and control playback on the local Linux desktop.
+Allows the agent to launch Spotify and play specific songs
+on the local Linux desktop.
 
 Requirements:
     - Spotify installed (Flatpak, Snap, or native)
     - dbus-python (system package, usually pre-installed on Fedora/GNOME)
-    - xdg-open available (standard on Linux desktops)
 """
 
 import json
@@ -133,7 +132,7 @@ def _get_spotify_properties():
         return None
 
 
-# ── URI resolution ────────────────────────────────────────────────────
+# ── URI helpers ───────────────────────────────────────────────────────
 
 def _is_spotify_uri(text: str) -> bool:
     """Check if the text is a Spotify URI or URL."""
@@ -160,52 +159,40 @@ def _url_to_uri(url: str) -> str:
 
 
 def _search_spotify_uri(query: str) -> str | None:
-    """Use a web search to find a Spotify URI for a given query.
+    """Search DuckDuckGo to find a Spotify track URI for a given query.
 
-    Searches DuckDuckGo for the query on open.spotify.com and extracts
-    the first Spotify URL found.
+    Queries ddgs directly to access the href field from results,
+    which contains the actual Spotify URL.
     """
-    from tools.search import web_search
+    from ddgs import DDGS
 
-    search_query = f"site:open.spotify.com {query}"
-    results_json = web_search(search_query)
-
+    search_query = f"site:open.spotify.com/track {query}"
     try:
-        results = json.loads(results_json)
-    except json.JSONDecodeError:
+        with DDGS() as ddgs:
+            results = list(ddgs.text(search_query, max_results=3))
+    except Exception:
         return None
 
-    if isinstance(results, dict) and "error" in results:
-        return None
-
-    # Look through results for a Spotify URL
-    for result in results:
-        snippet = result.get("snippet", "") + " " + result.get("title", "")
-        urls = re.findall(
-            r"https?://open\.spotify\.com/(track|album|playlist|artist)/[a-zA-Z0-9]+",
-            snippet,
+    for r in results:
+        href = r.get("href", "")
+        match = re.match(
+            r"https?://open\.spotify\.com/track/([a-zA-Z0-9]+)",
+            href,
         )
-        if urls:
-            full_url = re.search(
-                r"https?://open\.spotify\.com/(track|album|playlist|artist)/[a-zA-Z0-9]+",
-                snippet,
-            )
-            if full_url:
-                return _url_to_uri(full_url.group(0))
+        if match:
+            return f"spotify:track:{match.group(1)}"
 
     return None
 
 
 # ── Public tool function ──────────────────────────────────────────────
 
-def spotify_play(query: str, content_type: str = "track") -> str:
-    """Open Spotify and play a song, album, or playlist.
+def spotify_play(query: str) -> str:
+    """Open Spotify and play a specific song.
 
     Args:
         query: A Spotify URI, Spotify URL, or a search query
-               (e.g. "Bohemian Rhapsody Queen", "Chill Vibes playlist").
-        content_type: One of "track", "album", "playlist", or "artist".
-                      Helps refine search when query is not a URI/URL.
+               (e.g. "Bohemian Rhapsody Queen").
 
     Returns:
         A JSON string indicating success or failure.
@@ -219,24 +206,14 @@ def spotify_play(query: str, content_type: str = "track") -> str:
 
         # Step 2: Resolve the URI
         if _is_spotify_uri(query):
-            # Direct URI or URL provided
             uri = _url_to_uri(query) if query.startswith("http") else query
         else:
-            # Search for the content
-            search_suffix = {
-                "track": "",
-                "album": " album",
-                "playlist": " playlist",
-                "artist": " artist",
-            }
-            refined_query = query + search_suffix.get(content_type, "")
-            uri = _search_spotify_uri(refined_query)
-
+            uri = _search_spotify_uri(query)
             if not uri:
                 # Fallback: open Spotify's own search
                 uri = f"spotify:search:{query.replace(' ', '%20')}"
 
-        # Step 3: Play the content via D-Bus OpenUri
+        # Step 3: Play via D-Bus OpenUri
         player = _get_spotify_dbus()
         if player:
             try:
@@ -268,20 +245,11 @@ def spotify_play(query: str, content_type: str = "track") -> str:
                     "message": f"Opened Spotify with URI: {uri}",
                     "uri": uri,
                 })
-            except Exception as dbus_err:
-                # D-Bus failed — fall back to xdg-open
+            except Exception:
                 pass
 
-        # Fallback: use xdg-open
-        subprocess.Popen(
-            ["xdg-open", uri],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
         return json.dumps({
-            "success": True,
-            "message": f"Opened Spotify with URI: {uri}",
-            "uri": uri,
+            "error": "Could not connect to Spotify via D-Bus. Is Spotify running?"
         })
 
     except Exception as exc:
