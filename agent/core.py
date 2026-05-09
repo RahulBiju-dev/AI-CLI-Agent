@@ -9,6 +9,23 @@ streams the final synthesized answer with visible thinking status.
 import glob
 import json
 import os
+import re
+from agent.terminal import (
+    _console,
+    _print_status,
+    _Spinner,
+    _render_terminal_markdown,
+    _BOLD,
+    _DIM,
+    _CYAN,
+    _YELLOW,
+    _GREEN,
+    _RED,
+    _MAGENTA,
+    _RESET,
+    _CLEAR_LINE,
+)
+
 import sys
 import threading
 import time
@@ -16,7 +33,6 @@ import itertools
 from datetime import datetime, timezone
 
 import ollama
-from rich.console import Console
 from rich.markdown import Markdown
 from rich.live import Live
 
@@ -32,69 +48,8 @@ _FLOAT_PARAMS = {"temperature", "top_p", "top_k", "repeat_penalty", "presence_pe
 # Parameters that accept integer values via /set parameter
 _INT_PARAMS = {"num_ctx", "num_predict", "repeat_last_n", "seed", "num_gpu", "num_thread", "num_keep"}
 _ALL_PARAMS = _FLOAT_PARAMS | _INT_PARAMS
-
-# ANSI escape helpers
-_BOLD = "\033[1m"
-_DIM = "\033[2m"
-_ITALIC = "\033[3m"
-_CYAN = "\033[36m"
-_YELLOW = "\033[33m"
-_GREEN = "\033[32m"
-_RED = "\033[31m"
-_MAGENTA = "\033[35m"
-_RESET = "\033[0m"
-_CLEAR_LINE = "\033[2K\r"
-
-# Initialize Rich console
-_console = Console()
-
-
-# ── Helpers ───────────────────────────────────────────────────────────
-
-def _print_status(icon: str, message: str, color: str = _CYAN) -> None:
-    """Print a formatted status line to stderr so it doesn't mix with piped output."""
-    print(f"{color}{_BOLD}{icon}  {message}{_RESET}", file=sys.stderr)
-
-
-class _Spinner:
-    """Animated spinner that shows a message while the model is working."""
-
-    _FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
-
-    def __init__(self, message: str = "Thinking", color: str = _MAGENTA) -> None:
-        self._message = message
-        self._color = color
-        self._stop_event = threading.Event()
-        self._thread: threading.Thread | None = None
-
-    def _animate(self) -> None:
-        for frame in itertools.cycle(self._FRAMES):
-            if self._stop_event.is_set():
-                break
-            print(
-                f"{_CLEAR_LINE}{self._color}{_BOLD}{frame}  {self._message}…{_RESET}",
-                end="",
-                file=sys.stderr,
-                flush=True,
-            )
-            time.sleep(0.08)
-        # Clear the spinner line when done
-        print(_CLEAR_LINE, end="", file=sys.stderr, flush=True)
-
-    def start(self) -> "_Spinner":
-        self._thread = threading.Thread(target=self._animate, daemon=True)
-        self._thread.start()
-        return self
-
-    def update(self, message: str) -> None:
-        """Update the spinner message in-place."""
-        self._message = message
-
-    def stop(self) -> None:
-        self._stop_event.set()
-        if self._thread:
-            self._thread.join()
-
+# terminal helpers (spinner, renderer, ANSI constants) are imported
+# from agent.terminal to keep terminal logic modular.
 
 def _stream_thinking_response(
     model: str,
@@ -195,7 +150,7 @@ def _stream_thinking_response(
                 # Initialize Live display on the first content chunk
                 if live is None:
                     live = Live(
-                        Markdown(content_buf),
+                        Markdown(_render_terminal_markdown(content_buf)),
                         console=_console,
                         auto_refresh=False,
                         vertical_overflow="visible",
@@ -203,7 +158,7 @@ def _stream_thinking_response(
                     live.start()
 
                 # Update Markdown rendering in real-time
-                live.update(Markdown(content_buf), refresh=True)
+                live.update(Markdown(_render_terminal_markdown(content_buf)), refresh=True)
 
     finally:
         if live:
