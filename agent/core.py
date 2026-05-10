@@ -153,16 +153,28 @@ def _stream_thinking_response(
                         Markdown(_render_terminal_markdown(content_buf)),
                         console=_console,
                         auto_refresh=False,
-                        vertical_overflow="visible",
+                        screen=True,
                     )
                     live.start()
 
+                # Auto-scroll logic: keep the output size within the terminal bounds
+                max_lines = max(5, _console.height - 6)
+                lines = content_buf.split("\n")
+                if len(lines) > max_lines:
+                    display_buf = "...\n" + "\n".join(lines[-max_lines+1:])
+                else:
+                    display_buf = content_buf
+
                 # Update Markdown rendering in real-time
-                live.update(Markdown(_render_terminal_markdown(content_buf)), refresh=True)
+                live.update(Markdown(_render_terminal_markdown(display_buf)), refresh=True)
 
     finally:
         if live:
             live.stop()
+            # Print the final complete markdown to the terminal so it remains in the scrollback buffer.
+            # Using screen=True during streaming prevents the scrolling terminal duplication bug entirely.
+            if content_buf:
+                _console.print(Markdown(_render_terminal_markdown(content_buf)))
 
     # End of stream
     spinner.stop()
