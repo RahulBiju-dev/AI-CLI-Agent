@@ -25,8 +25,8 @@ _MAGENTA = "\033[35m"
 _RESET = "\033[0m"
 _CLEAR_LINE = "\033[2K\r"
 
-# Shared console
-_console = Console()
+# Shared console (write to stderr so Live and spinner use the same stream)
+_console = Console(stderr=True)
 
 
 def _print_status(icon: str, message: str, color: str = _CYAN) -> None:
