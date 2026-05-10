@@ -8,6 +8,7 @@ function schema). Add new tools here as the agent grows.
 from tools.search import web_search
 from tools.document import read_document
 from tools.file import read_file, create_file
+from tools.code import view_code
 from tools.spotify import spotify_play
 from tools.browser import open_browser
 
@@ -147,6 +148,36 @@ TOOL_SCHEMAS: list[dict] = [
                 "required": ["query"],
             },
         },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "view_code",
+            "description": (
+                "View and read source code files in all common programming languages (Python, JavaScript, C++, Rust, Go, Java, C#, Ruby, PHP, Swift, Kotlin, R, Scala, Lisp, Haskell, Erlang, Elixir, Julia, Perl, Lua, Shell, PowerShell, Groovy, Dart, Fortran, Pascal, Assembly, and many more). "
+                "Displays code with line numbers and supports viewing specific line ranges. "
+                "Can also scan folders for files with a specific extension. "
+                "Use this tool when the user asks to view, read, analyze, or answer questions about source code files."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file_path": {
+                        "type": "string",
+                        "description": "The absolute or relative path to a source code file or folder.",
+                    },
+                    "lines": {
+                        "type": "string",
+                        "description": "Optional line range to view for a single file (e.g., '1-50' or '10-20'). If not provided, shows entire file.",
+                    },
+                    "extension": {
+                        "type": "string",
+                        "description": "When file_path is a folder, scan for files with this extension (e.g., '.py', '.js', '.cpp'). Without this, a folder path will return an error.",
+                    }
+                },
+                "required": ["file_path"],
+            },
+        },
     }
 ]
 
@@ -158,6 +189,7 @@ TOOL_DISPATCH: dict[str, callable] = {
     "read_document": read_document,
     "read_file": read_file,
     "create_file": create_file,
+    "view_code": view_code,
     "spotify_play": spotify_play,
     "open_browser": open_browser,
 }
