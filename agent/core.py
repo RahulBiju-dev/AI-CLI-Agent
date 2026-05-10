@@ -157,8 +157,16 @@ def _stream_thinking_response(
                     )
                     live.start()
 
+                # Auto-scroll logic: keep the output size within the terminal bounds
+                max_lines = max(5, _console.height - 6)
+                lines = content_buf.split("\n")
+                if len(lines) > max_lines:
+                    display_buf = "...\n" + "\n".join(lines[-max_lines+1:])
+                else:
+                    display_buf = content_buf
+
                 # Update Markdown rendering in real-time
-                live.update(Markdown(_render_terminal_markdown(content_buf)), refresh=True)
+                live.update(Markdown(_render_terminal_markdown(display_buf)), refresh=True)
 
     finally:
         if live:
