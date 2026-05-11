@@ -11,6 +11,8 @@ from tools.file import read_file, create_file
 from tools.code import view_code
 from tools.spotify import spotify_play
 from tools.browser import open_browser
+from tools.vault_indexer import index_vault
+from tools.vault_search import search_vault
 
 # ── Schema definitions ────────────────────────────────────────────────
 
@@ -41,9 +43,10 @@ TOOL_SCHEMAS: list[dict] = [
         "function": {
             "name": "read_document",
             "description": (
-                "Extract and read text from a PDF or Word document (.docx). "
+                "Extract and read text from a PDF or Word document (.docx) with page, chunk, and query controls. "
                 "Use this tool when the user asks you to read, summarize, or analyze "
-                "a local document file."
+                "a local document file. For large documents, first call it with only file_path for a preview, "
+                "then use pages, query, or chunk to retrieve the exact relevant parts."
             ),
             "parameters": {
                 "type": "object",
@@ -51,7 +54,27 @@ TOOL_SCHEMAS: list[dict] = [
                     "file_path": {
                         "type": "string",
                         "description": "The absolute or relative path to the PDF or Word document file.",
-                    }
+                    },
+                    "pages": {
+                        "type": "string",
+                        "description": "Optional PDF page selection using 1-based pages/ranges, e.g. '1-3,8'.",
+                    },
+                    "query": {
+                        "type": "string",
+                        "description": "Optional search query to return relevant snippets instead of a full text preview.",
+                    },
+                    "chunk": {
+                        "type": "integer",
+                        "description": "Optional 0-based chunk number for large extracted document text.",
+                    },
+                    "chunk_size": {
+                        "type": "integer",
+                        "description": "Optional approximate characters per chunk. Defaults to 12000.",
+                    },
+                    "max_chars": {
+                        "type": "integer",
+                        "description": "Optional maximum characters returned in text fields. Defaults to 14000.",
+                    },
                 },
                 "required": ["file_path"],
             },
@@ -62,9 +85,9 @@ TOOL_SCHEMAS: list[dict] = [
         "function": {
             "name": "read_file",
             "description": (
-                "Read the contents of a text file from the local filesystem. "
+                "Read the contents of a text file from the local filesystem with line range, chunk, and query controls. "
                 "Use this tool when the user asks you to view, read, or analyze "
-                "code or text files on their computer."
+                "text files on their computer. For large files, use query to find relevant lines or lines/chunk to read a bounded section."
             ),
             "parameters": {
                 "type": "object",
@@ -72,7 +95,27 @@ TOOL_SCHEMAS: list[dict] = [
                     "file_path": {
                         "type": "string",
                         "description": "The absolute or relative path to the file to read.",
-                    }
+                    },
+                    "lines": {
+                        "type": "string",
+                        "description": "Optional line range to read, e.g. '20-80' or '42'.",
+                    },
+                    "query": {
+                        "type": "string",
+                        "description": "Optional text search query to return matching snippets and line numbers.",
+                    },
+                    "chunk": {
+                        "type": "integer",
+                        "description": "Optional 0-based chunk number for large files.",
+                    },
+                    "chunk_size": {
+                        "type": "integer",
+                        "description": "Optional approximate characters per chunk. Defaults to 12000.",
+                    },
+                    "max_chars": {
+                        "type": "integer",
+                        "description": "Optional maximum characters returned in text fields. Defaults to 14000.",
+                    },
                 },
                 "required": ["file_path"],
             },
@@ -181,6 +224,46 @@ TOOL_SCHEMAS: list[dict] = [
     }
 ]
 
+# Add RAG tooling: index the vault and search it
+TOOL_SCHEMAS.extend([
+    {
+        "type": "function",
+        "function": {
+            "name": "index_vault",
+            "description": "Index a folder or a single local file into the persistent ChromaDB vault using Ollama embeddings. Use this before vault_search for large files or document collections.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "vault_path": {"type": "string", "description": "Path to vault folder (or parent folder of file)."},
+                    "collection": {"type": "string", "description": "ChromaDB collection name (optional)."},
+                    "file_path": {"type": "string", "description": "Optional: specific file to index."},
+                    "chunk_size": {"type": "integer", "description": "Optional chunk size for indexing. Defaults to 1800 characters."},
+                    "chunk_overlap": {"type": "integer", "description": "Optional overlap between chunks. Defaults to 250 characters."}
+                },
+                "required": ["vault_path"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "vault_search",
+            "description": "Search the indexed vault for relevant chunks and return compact snippets, source paths, chunk indexes, and character offsets.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "collection": {"type": "string"},
+                    "top_k": {"type": "integer", "description": "Optional number of chunks to return. Defaults to 6."},
+                    "max_chars": {"type": "integer", "description": "Optional maximum characters in the combined context. Defaults to 7000."},
+                    "source": {"type": "string", "description": "Optional source or source_path value from a previous search result to restrict search."}
+                },
+                "required": ["query"]
+            }
+        }
+    },
+])
+
 # ── Dispatch map ──────────────────────────────────────────────────────
 # Maps function names to their Python callables.
 
@@ -193,3 +276,9 @@ TOOL_DISPATCH: dict[str, callable] = {
     "spotify_play": spotify_play,
     "open_browser": open_browser,
 }
+
+# Dispatch RAG tools
+TOOL_DISPATCH.update({
+    "index_vault": index_vault,
+    "vault_search": search_vault,
+})
