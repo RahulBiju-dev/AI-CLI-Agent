@@ -644,6 +644,38 @@ def run() -> None:
                 break  # /quit
             continue  # Command was handled, skip LLM call
 
+        # ── Auto-index large or binary files when user inputs a local file path ─
+        pre_tool_message = None
+        try:
+            if os.path.exists(user_input) and os.path.isfile(user_input):
+                size = os.path.getsize(user_input)
+                ext = os.path.splitext(user_input)[1].lower()
+                # Threshold in bytes for auto-indexing (tunable)
+                INDEX_THRESHOLD = 200_000
+                if size > INDEX_THRESHOLD or ext in (".pdf", ".docx"):
+                    _print_status("🔧", f"Large/binary file detected — indexing: {_DIM}{user_input}{_RESET}", _YELLOW)
+                    handler = TOOL_DISPATCH.get("index_vault")
+                    if handler:
+                        try:
+                            res = handler(vault_path=os.path.dirname(user_input) or ".", file_path=user_input, collection="vault")
+                            # Ensure we push a tool-style message into history so the model knows indexing occurred
+                            if isinstance(res, str):
+                                tool_content = res
+                            else:
+                                import json as _json
+                                tool_content = _json.dumps(res)
+                            tool_msg = {"role": "tool", "content": tool_content}
+                            if session["history"]:
+                                history.append(tool_msg)
+                            else:
+                                pre_tool_message = tool_msg
+                            _print_status("✓", "Indexing complete.", _GREEN)
+                        except Exception as e:
+                            _print_status("⚠", f"Indexing failed: {e}", _RED)
+        except Exception:
+            # Best-effort; don't let indexing errors stop the agent
+            pass
+
         # When history is disabled, send only the current message (+ system if set)
         if session["history"]:
             history.append({"role": "user", "content": user_input})
@@ -652,6 +684,10 @@ def run() -> None:
             messages_to_send = []
             if history and history[0].get("role") == "system":
                 messages_to_send.append(history[0])
+            # If we have a pre-tool message (index result) and history is disabled,
+            # insert it before the user message so the model sees it in the same turn.
+            if pre_tool_message:
+                messages_to_send.append(pre_tool_message)
             messages_to_send.append({"role": "user", "content": user_input})
 
         # ── LLM call with streaming + thinking ────────────────────────

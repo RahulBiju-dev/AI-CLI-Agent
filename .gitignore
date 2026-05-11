@@ -223,3 +223,9 @@ sessions/
 #Agents
 AGENTS.md
 .agents/
+
+#Dev Docs
+updates.md
+
+#Runtime files
+.chroma/
