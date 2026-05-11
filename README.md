@@ -1,4 +1,4 @@
-# Gemma CLI Agent
+# AI CLI Agent
 
 A modular, tool-capable local AI agent built with Python and Ollama. This agent runs directly in your terminal, providing a rich, interactive chat experience with support for web search, document reading, local file manipulation, browser control, Spotify playback, and session persistence.
 
