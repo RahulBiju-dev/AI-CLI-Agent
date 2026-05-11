@@ -7,7 +7,7 @@ import os
 from typing import Any, Dict, List
 
 from tools.vault_embeddings import DEFAULT_EMBED_MODEL, embed_query
-from tools.vault_indexer import CHROMA_DIR, get_chroma_client
+from tools.vault_indexer import CHROMA_DIR, get_chroma_client, sanitize_collection_name
 
 DEFAULT_TOP_K = 6
 DEFAULT_MAX_CHARS = 7000
@@ -48,17 +48,48 @@ def _query_collection(
         ) from exc
 
     emb = _embed_query(query, model=model)
+    fetch_k = top_k
     where = None
     if source:
-        where = {"source_path": source} if os.path.isabs(source) else {"source": source}
+        if os.path.isabs(source):
+            where = {"source_path": source}
+        else:
+            fetch_k = max(top_k * 10, 50)
+
     kwargs = {
         "query_embeddings": [emb],
-        "n_results": top_k,
+        "n_results": fetch_k,
         "include": ["documents", "metadatas", "distances"],
     }
     if where:
         kwargs["where"] = where
-    return collection.query(**kwargs)
+        
+    results = collection.query(**kwargs)
+    
+    if source and not os.path.isabs(source):
+        source_lower = source.lower()
+        docs = results.get("documents", [[]])[0]
+        metas = results.get("metadatas", [[]])[0]
+        dists = results.get("distances", [[]])[0]
+
+        f_docs, f_metas, f_dists = [], [], []
+        for d, m, dist in zip(docs, metas, dists):
+            m_source = str(m.get("source", "")).lower()
+            m_file = str(m.get("filename", "")).lower()
+            if source_lower in m_source or source_lower in m_file:
+                f_docs.append(d)
+                f_metas.append(m)
+                f_dists.append(dist)
+                if len(f_docs) >= top_k:
+                    break
+                    
+        results = {
+            "documents": [f_docs],
+            "metadatas": [f_metas],
+            "distances": [f_dists]
+        }
+        
+    return results
 
 
 def _flatten_results(results: Dict[str, Any], max_chars: int) -> tuple[list[dict], str]:
@@ -115,6 +146,9 @@ def search_vault(
     """Search the indexed vault and return compact JSON for the agent."""
     if collection:
         collection_name = collection
+        
+    collection_name = sanitize_collection_name(collection_name)
+    
     if not query or not query.strip():
         return _json({"error": "query is required"})
 

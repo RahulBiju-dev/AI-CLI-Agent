@@ -41,6 +41,27 @@ def _positive_int(value: int | str | None, default: int, minimum: int = 0, maxim
     return parsed
 
 
+def sanitize_collection_name(name: str) -> str:
+    """Sanitize the collection name to meet ChromaDB requirements.
+    Expected a name containing 3-63 characters from [a-zA-Z0-9._-],
+    starting and ending with an alphanumeric character.
+    """
+    if not name:
+        return "vault"
+    # Replace invalid chars with underscores
+    name = re.sub(r'[^a-zA-Z0-9._-]', '_', name)
+    # Strip leading/trailing non-alphanumeric chars
+    name = re.sub(r'^[^a-zA-Z0-9]+', '', name)
+    name = re.sub(r'[^a-zA-Z0-9]+$', '', name)
+    
+    if not name:
+        return "vault"
+    if len(name) < 3:
+        name = name.ljust(3, '0')
+        
+    return name[:63]
+
+
 def get_chroma_client(path: str | None = None):
     """Return a persistent Chroma client shared by index and search tools."""
     persist_directory = path or CHROMA_DIR
@@ -171,6 +192,8 @@ def index_vault(
     """
     if collection:
         collection_name = collection
+        
+    collection_name = sanitize_collection_name(collection_name)
 
     if not vault_path:
         vault_path = os.path.dirname(file_path) if file_path else "."
