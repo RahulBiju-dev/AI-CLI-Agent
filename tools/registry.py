@@ -234,13 +234,11 @@ TOOL_SCHEMAS.extend([
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "vault_path": {"type": "string", "description": "Path to vault folder (or parent folder of file)."},
                     "collection": {"type": "string", "description": "ChromaDB collection name (optional)."},
                     "file_path": {"type": "string", "description": "Optional: specific file to index."},
                     "chunk_size": {"type": "integer", "description": "Optional chunk size for indexing. Defaults to 1800 characters."},
                     "chunk_overlap": {"type": "integer", "description": "Optional overlap between chunks. Defaults to 250 characters."}
-                },
-                "required": ["vault_path"]
+                }
             }
         }
     },

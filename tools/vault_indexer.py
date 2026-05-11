@@ -24,6 +24,7 @@ DEFAULT_CHUNK_SIZE = 1800
 DEFAULT_CHUNK_OVERLAP = 250
 DEFAULT_BATCH_SIZE = 16
 CHROMA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".chroma")
+VAULTS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "vaults")
 
 
 def _json(data: dict) -> str:
@@ -177,7 +178,7 @@ def _delete_existing_source(collection, source: str) -> None:
 
 
 def index_vault(
-    vault_path: str,
+    vault_path: Optional[str] = None,
     collection_name: str = "vault",
     chunk_size: int = DEFAULT_CHUNK_SIZE,
     chunk_overlap: int = DEFAULT_CHUNK_OVERLAP,
@@ -196,7 +197,7 @@ def index_vault(
     collection_name = sanitize_collection_name(collection_name)
 
     if not vault_path:
-        vault_path = os.path.dirname(file_path) if file_path else "."
+        vault_path = os.path.dirname(file_path) if file_path else VAULTS_DIR
     vault_path = os.path.abspath(vault_path)
     if not os.path.exists(vault_path):
         return _json({"error": f"vault path not found: {vault_path}"})
@@ -288,7 +289,7 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="Index a local vault into ChromaDB using Ollama embeddings.")
-    parser.add_argument("vault_path")
+    parser.add_argument("--vault-path", default=None)
     parser.add_argument("--collection", default="vault")
     parser.add_argument("--file-path")
     parser.add_argument("--chunk-size", type=int, default=DEFAULT_CHUNK_SIZE)
@@ -298,7 +299,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     print(index_vault(
-        args.vault_path,
+        vault_path=args.vault_path,
         collection_name=args.collection,
         file_path=args.file_path,
         chunk_size=args.chunk_size,
