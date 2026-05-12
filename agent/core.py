@@ -10,6 +10,7 @@ import glob
 import json
 import os
 import re
+import shlex
 from agent.terminal import (
     _console,
     _print_status,
@@ -328,7 +329,19 @@ _COMMANDS_HELP = f"""
   {_GREEN}/show parameters{_RESET}               — Show current session parameters
   {_GREEN}/show system{_RESET}                   — Show the active system prompt
   {_GREEN}/show model{_RESET}                    — Show model info
+  {_GREEN}/vault add <path>{_RESET}               — Add a file or folder to the searchable vault
+  {_GREEN}/vault search <query>{_RESET}           — Search the indexed vault
+  {_GREEN}/vault delete <source>{_RESET}          — Delete indexed vault chunks by source/path
   {_GREEN}/quit{_RESET}                          — Exit the agent  {_DIM}(also /exit, /q){_RESET}
+"""
+
+_VAULT_HELP = f"""
+{_CYAN}{_BOLD}Vault commands:{_RESET}
+  {_GREEN}/vault add <path> [--collection name]{_RESET}        — Index a file or folder
+  {_GREEN}/vault search <query> [--top-k n]{_RESET}            — Search indexed content
+  {_GREEN}/vault search <query> [--source path]{_RESET}        — Restrict search to a source
+  {_GREEN}/vault delete <source> [--collection name]{_RESET}   — Remove indexed chunks
+  {_GREEN}/vault delete --all [--collection name]{_RESET}      — Delete a collection
 """
 
 
@@ -627,6 +640,190 @@ def _handle_load(args: str, session: dict, history: list[dict]) -> None:
     print(f"{_CYAN}{_BOLD}✓  Session loaded:{_RESET} {_DIM}{display_name}{_RESET}  ({msg_count} user message{'s' if msg_count != 1 else ''})\n")
 
 
+def _extract_option(tokens: list[str], names: tuple[str, ...], default: str | None = None) -> str | None:
+    """Remove and return a string option from a shlex token list."""
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        for name in names:
+            if token == name:
+                if index + 1 >= len(tokens):
+                    return default
+                value = tokens[index + 1]
+                del tokens[index:index + 2]
+                return value
+            if token.startswith(f"{name}="):
+                value = token.split("=", 1)[1]
+                del tokens[index]
+                return value
+        index += 1
+    return default
+
+
+def _extract_flag(tokens: list[str], names: tuple[str, ...]) -> bool:
+    """Remove and return whether any boolean flag exists in a shlex token list."""
+    for index, token in enumerate(tokens):
+        if token in names:
+            del tokens[index]
+            return True
+    return False
+
+
+def _call_tool_json(tool_name: str, **kwargs) -> dict:
+    handler = TOOL_DISPATCH.get(tool_name)
+    if handler is None:
+        return {"error": f"Tool not found: {tool_name}"}
+    try:
+        result = handler(**kwargs)
+    except Exception as exc:
+        return {"error": str(exc)}
+    if isinstance(result, str):
+        try:
+            return json.loads(result)
+        except json.JSONDecodeError:
+            return {"result": result}
+    if isinstance(result, dict):
+        return result
+    return {"result": result}
+
+
+def _format_match_snippet(text: str | None, max_chars: int = 260) -> str:
+    snippet = re.sub(r"\s+", " ", (text or "")).strip()
+    if len(snippet) > max_chars:
+        snippet = snippet[:max_chars - 3].rstrip() + "..."
+    return snippet
+
+
+def _handle_vault(args: str) -> None:
+    """Handle /vault sub-commands."""
+    try:
+        parts = shlex.split(args)
+    except ValueError as exc:
+        print(f"{_RED}Invalid /vault command: {exc}{_RESET}\n")
+        return
+
+    if not parts or parts[0].lower() in ("help", "-h", "--help"):
+        print(_VAULT_HELP)
+        return
+
+    sub = parts[0].lower()
+    tokens = parts[1:]
+    collection = _extract_option(tokens, ("--collection", "-c"), "vault") or "vault"
+
+    if sub in ("add", "index"):
+        if not tokens:
+            print(f"{_RED}Usage: /vault add <file-or-folder> [--collection name]{_RESET}\n")
+            return
+
+        target = " ".join(tokens)
+        if not os.path.exists(target):
+            print(f"{_RED}Vault path not found: {target}{_RESET}\n")
+            return
+
+        _print_status("🔧", f"Indexing vault content: {_DIM}{target}{_RESET}", _YELLOW)
+        if os.path.isdir(target):
+            data = _call_tool_json("index_vault", vault_path=target, collection=collection)
+        else:
+            data = _call_tool_json(
+                "index_vault",
+                vault_path=os.path.dirname(target) or ".",
+                file_path=target,
+                collection=collection,
+            )
+
+        if "error" in data:
+            print(f"{_RED}Vault add failed: {data['error']}{_RESET}\n")
+            return
+
+        indexed_files = data.get("indexed_files", 0)
+        indexed_chunks = data.get("indexed_chunks", 0)
+        skipped_count = data.get("skipped_count", 0)
+        print(
+            f"{_CYAN}{_BOLD}✓  Vault indexed:{_RESET} "
+            f"{indexed_files} file{'s' if indexed_files != 1 else ''}, "
+            f"{indexed_chunks} chunk{'s' if indexed_chunks != 1 else ''} "
+            f"{_DIM}(collection: {data.get('collection', collection)}){_RESET}"
+        )
+        if skipped_count:
+            print(f"{_YELLOW}  Skipped {skipped_count} file{'s' if skipped_count != 1 else ''}.{_RESET}")
+        print()
+        return
+
+    if sub in ("search", "find"):
+        top_k_raw = _extract_option(tokens, ("--top-k", "-k"), None)
+        source = _extract_option(tokens, ("--source", "-s"), None)
+        query = " ".join(tokens).strip()
+        if not query:
+            print(f"{_RED}Usage: /vault search <query> [--collection name] [--top-k n] [--source path]{_RESET}\n")
+            return
+        try:
+            top_k = int(top_k_raw) if top_k_raw is not None else 6
+        except ValueError:
+            print(f"{_RED}Invalid --top-k value: {top_k_raw}{_RESET}\n")
+            return
+
+        _print_status("🔍", f"Searching vault: {_DIM}{query}{_RESET}", _YELLOW)
+        data = _call_tool_json("vault_search", query=query, collection=collection, top_k=top_k, source=source)
+
+        if "error" in data:
+            print(f"{_RED}Vault search failed: {data['error']}{_RESET}\n")
+            return
+
+        matches = data.get("matches", [])
+        print(
+            f"\n{_CYAN}{_BOLD}Vault search:{_RESET} "
+            f"{len(matches)} match{'es' if len(matches) != 1 else ''} "
+            f"{_DIM}(collection: {data.get('collection', collection)}){_RESET}"
+        )
+        for match in matches:
+            source_name = match.get("source") or match.get("filename") or "unknown"
+            chunk = match.get("chunk_index", "?")
+            distance = match.get("distance")
+            distance_text = f" · distance {distance:.4f}" if isinstance(distance, (int, float)) else ""
+            print(f"  {_GREEN}{match.get('rank', '?')}.{_RESET} {source_name}  {_DIM}(chunk {chunk}{distance_text}){_RESET}")
+            snippet = _format_match_snippet(match.get("text"))
+            if snippet:
+                print(f"     {_DIM}{snippet}{_RESET}")
+        print()
+        return
+
+    if sub in ("delete", "remove", "rm"):
+        delete_collection = _extract_flag(tokens, ("--all", "--collection-all"))
+        source = " ".join(tokens).strip()
+        if not delete_collection and not source:
+            print(f"{_RED}Usage: /vault delete <source> [--collection name]{_RESET}\n")
+            return
+
+        _print_status("🗑", "Deleting vault index entries…", _YELLOW)
+        data = _call_tool_json(
+            "delete_vault_item",
+            source=source or None,
+            collection=collection,
+            delete_collection=delete_collection,
+        )
+
+        if "error" in data:
+            print(f"{_RED}Vault delete failed: {data['error']}{_RESET}\n")
+            return
+
+        if data.get("deleted_collection"):
+            print(f"{_CYAN}{_BOLD}✓  Vault collection deleted:{_RESET} {_DIM}{collection}{_RESET}\n")
+            return
+
+        deleted_chunks = data.get("deleted_chunks", 0)
+        if deleted_chunks:
+            print(
+                f"{_CYAN}{_BOLD}✓  Vault entries deleted:{_RESET} "
+                f"{deleted_chunks} chunk{'s' if deleted_chunks != 1 else ''} "
+                f"{_DIM}(collection: {data.get('collection', collection)}){_RESET}\n"
+            )
+        else:
+            print(f"{_YELLOW}No indexed chunks matched:{_RESET} {_DIM}{source}{_RESET}\n")
+        return
+
+    print(f"{_RED}Unknown /vault subcommand: {sub}{_RESET}  {_DIM}(try: add, search, delete){_RESET}\n")
+
+
 def _handle_command(cmd: str, session: dict, history: list[dict]) -> bool | None:
     """Handle a slash command. Returns True if handled, None to quit."""
     parts = cmd.strip().split(None, 1)
@@ -659,6 +856,10 @@ def _handle_command(cmd: str, session: dict, history: list[dict]) -> bool | None
 
     if base == "/load":
         _handle_load(rest, session, history)
+        return True
+
+    if base == "/vault":
+        _handle_vault(rest)
         return True
 
     # Unknown command

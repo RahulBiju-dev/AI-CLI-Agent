@@ -11,7 +11,7 @@ from tools.file import read_file, create_file
 from tools.code import view_code
 from tools.spotify import spotify_play
 from tools.browser import open_browser
-from tools.vault_indexer import index_vault
+from tools.vault_indexer import delete_vault_item, index_vault
 from tools.vault_search import search_vault
 
 # ── Schema definitions ────────────────────────────────────────────────
@@ -238,6 +238,24 @@ TOOL_SCHEMAS.extend([
             }
         }
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "delete_vault_item",
+            "description": (
+                "Delete indexed chunks from a vault collection by source/source_path, or delete a collection. "
+                "This does not delete files from disk. Use only when explicitly asked."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "source": {"type": "string", "description": "Indexed source or file path to delete."},
+                    "collection": {"type": "string", "description": "ChromaDB collection name."},
+                    "delete_collection": {"type": "boolean", "description": "Delete the entire collection."}
+                }
+            }
+        }
+    },
 ])
 
 # ── Dispatch map ──────────────────────────────────────────────────────
@@ -257,4 +275,5 @@ TOOL_DISPATCH: dict[str, callable] = {
 TOOL_DISPATCH.update({
     "index_vault": index_vault,
     "vault_search": search_vault,
+    "delete_vault_item": delete_vault_item,
 })

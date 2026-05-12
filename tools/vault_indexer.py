@@ -285,6 +285,72 @@ def index_vault(
     })
 
 
+def delete_vault_item(
+    source: Optional[str] = None,
+    collection_name: str = "vault",
+    collection: Optional[str] = None,
+    delete_collection: bool = False,
+) -> str:
+    """Delete indexed vault chunks by source path, or delete an entire collection."""
+    if collection:
+        collection_name = collection
+
+    collection_name = sanitize_collection_name(collection_name)
+    client = get_chroma_client()
+
+    if delete_collection:
+        try:
+            client.delete_collection(name=collection_name)
+            return _json({
+                "collection": collection_name,
+                "deleted_collection": True,
+                "persist_directory": CHROMA_DIR,
+            })
+        except Exception as exc:
+            return _json({"error": str(exc), "collection": collection_name, "persist_directory": CHROMA_DIR})
+
+    if not source or not source.strip():
+        return _json({"error": "source is required unless delete_collection is true", "collection": collection_name})
+
+    raw_source = source.strip()
+    possible_sources = [raw_source]
+    if os.path.exists(raw_source):
+        possible_sources.insert(0, os.path.abspath(raw_source))
+    elif not os.path.isabs(raw_source):
+        possible_sources.append(os.path.abspath(raw_source))
+
+    try:
+        collection_obj = client.get_collection(name=collection_name)
+    except Exception as exc:
+        return _json({"error": str(exc), "collection": collection_name, "persist_directory": CHROMA_DIR})
+
+    deleted_ids: set[str] = set()
+    attempted_filters: list[dict] = []
+
+    for candidate in dict.fromkeys(possible_sources):
+        filters = [{"source": candidate}, {"source_path": candidate}]
+        for where in filters:
+            attempted_filters.append(where)
+            try:
+                existing = collection_obj.get(where=where, include=["metadatas"])
+                ids = existing.get("ids", [])
+                if not ids:
+                    continue
+                collection_obj.delete(ids=ids)
+                deleted_ids.update(ids)
+            except Exception:
+                continue
+
+    return _json({
+        "collection": collection_name,
+        "source": raw_source,
+        "deleted_chunks": len(deleted_ids),
+        "deleted": len(deleted_ids) > 0,
+        "attempted_filters": attempted_filters,
+        "guidance": "Use /vault search to confirm the source no longer appears in results.",
+    })
+
+
 if __name__ == "__main__":
     import argparse
 
