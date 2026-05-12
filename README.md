@@ -45,11 +45,11 @@ This creates an **iterative refinement loop** where the model can chain multiple
 
 ```
 User Prompt ──→ LLM ──→ Tool Calls? ──Yes──→ Execute Tools ──→ Inject Results ──→ LLM ──┐
-                                         │                                                 │
-                                         No                                                │
-                                         │                                                 │
-                                         ▼                                                 │
-                                    Stream Answer ◀────────────────────────────────────────┘
+                              │                                                         │
+                              No                                                        │
+                              │                                                         │
+                              ▼                                                         │
+                        Stream Answer ◀────────────────────────────────────────────────┘
 ```
 
 ### Tool Calling
@@ -160,30 +160,30 @@ The agent autonomously decides when to call tools based on the user's query:
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                        main.py                              │
-│                   (entry point, model init)                  │
+│                   (entry point, model init)                 │
 └──────────────────────────┬──────────────────────────────────┘
                            │
                            ▼
 ┌──────────────────────────────────────────────────────────────┐
 │                    agent/core.py                             │
-│  ┌──────────┐  ┌──────────────┐  ┌────────────────────────┐ │
-│  │ Chat Loop │→│ Tool Dispatch │→│ Streaming + Thinking   │ │
-│  │ /commands │  │ (iterative)  │  │ History Trimming       │ │
-│  └──────────┘  └──────┬───────┘  └────────────────────────┘ │
+│  ┌──────────┐  ┌──────────────┐  ┌────────────────────────┐  │
+│  │ Chat Loop │→│ Tool Dispatch │→│ Streaming + Thinking   │  │
+│  │ /commands │  │ (iterative)  │  │ History Trimming      │  │
+│  └──────────┘  └──────┬───────┘  └────────────────────────┘  │
 │                       │                                      │
-│  ┌────────────────────┴──────────────────────────────────┐  │
-│  │                  Session Manager                       │  │
-│  │  /save, /load, /set, /show — JSON persistence         │  │
-│  └────────────────────────────────────────────────────────┘  │
-└──────────────────────────┬──────────────────────────────────┘
+│  ┌────────────────────┴──────────────────────────────────┐   │
+│  │                  Session Manager                      │   │
+│  │  /save, /load, /set, /show — JSON persistence         │   │
+│  └───────────────────────────────────────────────────────┘   │
+└──────────────────────────┬───────────────────────────────────┘
                            │
           ┌────────────────┼────────────────┐
           ▼                ▼                ▼
 ┌──────────────┐  ┌──────────────┐  ┌──────────────────────┐
-│agent/terminal│  │tools/registry│  │    Ollama Server      │
-│  Spinner     │  │  TOOL_SCHEMAS│  │ (localhost:11434)     │
+│agent/terminal│  │tools/registry│  │    Ollama Server     │
+│  Spinner     │  │  TOOL_SCHEMAS│  │ (localhost:11434)    │
 │  LaTeX math  │  │  TOOL_DISP.  │  │  gemma-agent model   │
-│  Markdown    │  │              │  │  embeddinggemma       │
+│  Markdown    │  │              │  │  embeddinggemma      │
 └──────────────┘  └──────┬───────┘  └──────────────────────┘
                          │
      ┌───────┬───────┬───┴───┬────────┬──────────┐
