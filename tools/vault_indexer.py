@@ -351,6 +351,40 @@ def delete_vault_item(
     })
 
 
+def list_vaults() -> str:
+    """List existing ChromaDB vault collections with basic index counts."""
+    client = get_chroma_client()
+    try:
+        collections = client.list_collections()
+    except Exception as exc:
+        return _json({"error": str(exc), "persist_directory": CHROMA_DIR})
+
+    vaults: list[dict] = []
+    for item in collections:
+        name = getattr(item, "name", item)
+        if not isinstance(name, str):
+            continue
+
+        chunk_count = None
+        try:
+            collection_obj = client.get_collection(name=name)
+            chunk_count = collection_obj.count()
+        except Exception:
+            pass
+
+        vaults.append({
+            "collection": name,
+            "indexed_chunks": chunk_count,
+        })
+
+    vaults.sort(key=lambda item: item["collection"].lower())
+    return _json({
+        "persist_directory": CHROMA_DIR,
+        "vault_count": len(vaults),
+        "vaults": vaults,
+    })
+
+
 if __name__ == "__main__":
     import argparse
 

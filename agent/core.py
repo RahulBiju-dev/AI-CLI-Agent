@@ -330,6 +330,7 @@ _COMMANDS_HELP = f"""
   {_GREEN}/show system{_RESET}                   — Show the active system prompt
   {_GREEN}/show model{_RESET}                    — Show model info
   {_GREEN}/vault add <path>{_RESET}               — Add a file or folder to the searchable vault
+  {_GREEN}/vault list{_RESET}                     — List indexed vault collections
   {_GREEN}/vault search <query>{_RESET}           — Search the indexed vault
   {_GREEN}/vault delete <source>{_RESET}          — Delete indexed vault chunks by source/path
   {_GREEN}/quit{_RESET}                          — Exit the agent  {_DIM}(also /exit, /q){_RESET}
@@ -337,6 +338,7 @@ _COMMANDS_HELP = f"""
 
 _VAULT_HELP = f"""
 {_CYAN}{_BOLD}Vault commands:{_RESET}
+  {_GREEN}/vault list{_RESET}                                  — List indexed vault collections
   {_GREEN}/vault add <path> [--collection name]{_RESET}        — Index a file or folder
   {_GREEN}/vault search <query> [--top-k n]{_RESET}            — Search indexed content
   {_GREEN}/vault search <query> [--source path]{_RESET}        — Restrict search to a source
@@ -710,6 +712,29 @@ def _handle_vault(args: str) -> None:
     tokens = parts[1:]
     collection = _extract_option(tokens, ("--collection", "-c"), "vault") or "vault"
 
+    if sub in ("list", "ls"):
+        data = _call_tool_json("list_vaults")
+        if "error" in data:
+            print(f"{_RED}Vault list failed: {data['error']}{_RESET}\n")
+            return
+
+        vaults = data.get("vaults", [])
+        if not vaults:
+            print(f"{_DIM}  No indexed vault collections found.{_RESET}\n")
+            return
+
+        print(f"\n{_CYAN}{_BOLD}Indexed vaults:{_RESET}")
+        for vault in vaults:
+            name = vault.get("collection", "unknown")
+            chunk_count = vault.get("indexed_chunks")
+            if isinstance(chunk_count, int):
+                count_text = f"{chunk_count} chunk{'s' if chunk_count != 1 else ''}"
+            else:
+                count_text = "chunk count unavailable"
+            print(f"  {_GREEN}{name}{_RESET}  {_DIM}({count_text}){_RESET}")
+        print()
+        return
+
     if sub in ("add", "index"):
         if not tokens:
             print(f"{_RED}Usage: /vault add <file-or-folder> [--collection name]{_RESET}\n")
@@ -821,7 +846,7 @@ def _handle_vault(args: str) -> None:
             print(f"{_YELLOW}No indexed chunks matched:{_RESET} {_DIM}{source}{_RESET}\n")
         return
 
-    print(f"{_RED}Unknown /vault subcommand: {sub}{_RESET}  {_DIM}(try: add, search, delete){_RESET}\n")
+    print(f"{_RED}Unknown /vault subcommand: {sub}{_RESET}  {_DIM}(try: list, add, search, delete){_RESET}\n")
 
 
 def _handle_command(cmd: str, session: dict, history: list[dict]) -> bool | None:

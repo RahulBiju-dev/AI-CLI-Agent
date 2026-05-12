@@ -11,7 +11,7 @@ from tools.file import read_file, create_file
 from tools.code import view_code
 from tools.spotify import spotify_play
 from tools.browser import open_browser
-from tools.vault_indexer import delete_vault_item, index_vault
+from tools.vault_indexer import delete_vault_item, index_vault, list_vaults
 from tools.vault_search import search_vault
 
 # ── Schema definitions ────────────────────────────────────────────────
@@ -256,6 +256,17 @@ TOOL_SCHEMAS.extend([
             }
         }
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_vaults",
+            "description": "List existing indexed vault collections and their chunk counts.",
+            "parameters": {
+                "type": "object",
+                "properties": {}
+            }
+        }
+    },
 ])
 
 # ── Dispatch map ──────────────────────────────────────────────────────
@@ -276,4 +287,5 @@ TOOL_DISPATCH.update({
     "index_vault": index_vault,
     "vault_search": search_vault,
     "delete_vault_item": delete_vault_item,
+    "list_vaults": list_vaults,
 })

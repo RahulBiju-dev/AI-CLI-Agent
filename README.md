@@ -300,6 +300,7 @@ The vault provides persistent semantic search over your local documents:
 
 | Command | Description |
 |---------|-------------|
+| `/vault list` | List indexed vault collections |
 | `/vault add <path>` | Index a file or folder into the vault |
 | `/vault search <query>` | Search indexed content for relevant chunks |
 | `/vault delete <source>` | Remove indexed entries by source path |
