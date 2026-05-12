@@ -22,16 +22,15 @@ TOOL_SCHEMAS: list[dict] = [
         "function": {
             "name": "web_search",
             "description": (
-                "Search the web using DuckDuckGo. Use this tool when you need "
-                "up-to-date information, current events, package versions, "
-                "documentation, or anything beyond your training data."
+                "Search the web via DuckDuckGo for current information, "
+                "events, docs, or anything beyond training data."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": "The search query to look up on the web.",
+                        "description": "The search query.",
                     }
                 },
                 "required": ["query"],
@@ -43,37 +42,35 @@ TOOL_SCHEMAS: list[dict] = [
         "function": {
             "name": "read_document",
             "description": (
-                "Extract and read text from a PDF or Word document (.docx) with page, chunk, and query controls. "
-                "Use this tool when the user asks you to read, summarize, or analyze "
-                "a local document file. For large documents, first call it with only file_path for a preview, "
-                "then use pages, query, or chunk to retrieve the exact relevant parts."
+                "Read text from a PDF or .docx file with page, chunk, and query controls. "
+                "For large docs, call with file_path only first for a preview."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "file_path": {
                         "type": "string",
-                        "description": "The absolute or relative path to the PDF or Word document file.",
+                        "description": "Path to the PDF or Word document.",
                     },
                     "pages": {
                         "type": "string",
-                        "description": "Optional PDF page selection using 1-based pages/ranges, e.g. '1-3,8'.",
+                        "description": "PDF page selection, e.g. '1-3,8'.",
                     },
                     "query": {
                         "type": "string",
-                        "description": "Optional search query to return relevant snippets instead of a full text preview.",
+                        "description": "Search query for relevant snippets.",
                     },
                     "chunk": {
                         "type": "integer",
-                        "description": "Optional 0-based chunk number for large extracted document text.",
+                        "description": "0-based chunk number for large text.",
                     },
                     "chunk_size": {
                         "type": "integer",
-                        "description": "Optional approximate characters per chunk. Defaults to 12000.",
+                        "description": "Chars per chunk (default 12000).",
                     },
                     "max_chars": {
                         "type": "integer",
-                        "description": "Optional maximum characters returned in text fields. Defaults to 14000.",
+                        "description": "Max chars returned (default 14000).",
                     },
                 },
                 "required": ["file_path"],
@@ -85,36 +82,35 @@ TOOL_SCHEMAS: list[dict] = [
         "function": {
             "name": "read_file",
             "description": (
-                "Read the contents of a text file from the local filesystem with line range, chunk, and query controls. "
-                "Use this tool when the user asks you to view, read, or analyze "
-                "text files on their computer. For large files, use query to find relevant lines or lines/chunk to read a bounded section."
+                "Read a text file with line range, chunk, and query controls. "
+                "For large files, use query to find relevant lines first."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "file_path": {
                         "type": "string",
-                        "description": "The absolute or relative path to the file to read.",
+                        "description": "Path to the file.",
                     },
                     "lines": {
                         "type": "string",
-                        "description": "Optional line range to read, e.g. '20-80' or '42'.",
+                        "description": "Line range, e.g. '20-80' or '42'.",
                     },
                     "query": {
                         "type": "string",
-                        "description": "Optional text search query to return matching snippets and line numbers.",
+                        "description": "Search query for matching snippets.",
                     },
                     "chunk": {
                         "type": "integer",
-                        "description": "Optional 0-based chunk number for large files.",
+                        "description": "0-based chunk number.",
                     },
                     "chunk_size": {
                         "type": "integer",
-                        "description": "Optional approximate characters per chunk. Defaults to 12000.",
+                        "description": "Chars per chunk (default 12000).",
                     },
                     "max_chars": {
                         "type": "integer",
-                        "description": "Optional maximum characters returned in text fields. Defaults to 14000.",
+                        "description": "Max chars returned (default 14000).",
                     },
                 },
                 "required": ["file_path"],
@@ -125,20 +121,17 @@ TOOL_SCHEMAS: list[dict] = [
         "type": "function",
         "function": {
             "name": "create_file",
-            "description": (
-                "Create a new file with the provided content at a specified directory. "
-                "Use this tool ONLY when explicitly told to make or write a file."
-            ),
+            "description": "Create a new file with content at a path. Use only when explicitly asked.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "file_path": {
                         "type": "string",
-                        "description": "The absolute or relative path where the file should be created.",
+                        "description": "Path for the new file.",
                     },
                     "content": {
                         "type": "string",
-                        "description": "The text content to write into the file.",
+                        "description": "Text content to write.",
                     }
                 },
                 "required": ["file_path", "content"],
@@ -149,22 +142,13 @@ TOOL_SCHEMAS: list[dict] = [
         "type": "function",
         "function": {
             "name": "spotify_play",
-            "description": (
-                "Open Spotify and play a specific song. "
-                "Use this tool when the user asks you to play a song on Spotify. "
-                "You can provide a Spotify URI, a Spotify URL, or a natural language "
-                "search query like 'Bohemian Rhapsody by Queen'."
-            ),
+            "description": "Play a song on Spotify. Accepts a URI, URL, or search query.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": (
-                            "A Spotify URI (spotify:track:...), a Spotify URL "
-                            "(https://open.spotify.com/track/...), or a search query "
-                            "describing the song to play (e.g. 'Bohemian Rhapsody Queen')."
-                        ),
+                        "description": "Spotify URI, URL, or search query (e.g. 'Bohemian Rhapsody Queen').",
                     }
                 },
                 "required": ["query"],
@@ -175,17 +159,13 @@ TOOL_SCHEMAS: list[dict] = [
         "type": "function",
         "function": {
             "name": "open_browser",
-            "description": (
-                "Open the user's default web browser to a specific website or search query. "
-                "Use this tool when the user asks to open a website, search for something in the browser, "
-                "or watch a video."
-            ),
+            "description": "Open the default web browser to a URL or search query.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": "The URL to open (e.g. 'youtube.com') or a search term (e.g. 'cute cats').",
+                        "description": "URL or search term to open.",
                     }
                 },
                 "required": ["query"],
@@ -197,25 +177,23 @@ TOOL_SCHEMAS: list[dict] = [
         "function": {
             "name": "view_code",
             "description": (
-                "View and read source code files in all common programming languages (Python, JavaScript, C++, Rust, Go, Java, C#, Ruby, PHP, Swift, Kotlin, R, Scala, Lisp, Haskell, Erlang, Elixir, Julia, Perl, Lua, Shell, PowerShell, Groovy, Dart, Fortran, Pascal, Assembly, and many more). "
-                "Displays code with line numbers and supports viewing specific line ranges. "
-                "Can also scan folders for files with a specific extension. "
-                "Use this tool when the user asks to view, read, analyze, or answer questions about source code files."
+                "View source code files with line numbers. Supports all common languages. "
+                "Can scan folders for files by extension."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "file_path": {
                         "type": "string",
-                        "description": "The absolute or relative path to a source code file or folder.",
+                        "description": "Path to a source file or folder.",
                     },
                     "lines": {
                         "type": "string",
-                        "description": "Optional line range to view for a single file (e.g., '1-50' or '10-20'). If not provided, shows entire file.",
+                        "description": "Line range, e.g. '1-50'.",
                     },
                     "extension": {
                         "type": "string",
-                        "description": "When file_path is a folder, scan for files with this extension (e.g., '.py', '.js', '.cpp'). Without this, a folder path will return an error.",
+                        "description": "File extension to scan for in a folder (e.g. '.py').",
                     }
                 },
                 "required": ["file_path"],
@@ -230,14 +208,14 @@ TOOL_SCHEMAS.extend([
         "type": "function",
         "function": {
             "name": "index_vault",
-            "description": "Index a folder or a single local file into the persistent ChromaDB vault using Ollama embeddings. Use this before vault_search for large files or document collections.",
+            "description": "Index a folder or file into ChromaDB vault. Use before vault_search.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "collection": {"type": "string", "description": "ChromaDB collection name (optional)."},
-                    "file_path": {"type": "string", "description": "Optional: specific file to index."},
-                    "chunk_size": {"type": "integer", "description": "Optional chunk size for indexing. Defaults to 1800 characters."},
-                    "chunk_overlap": {"type": "integer", "description": "Optional overlap between chunks. Defaults to 250 characters."}
+                    "collection": {"type": "string", "description": "ChromaDB collection name."},
+                    "file_path": {"type": "string", "description": "File to index."},
+                    "chunk_size": {"type": "integer", "description": "Chunk size (default 1800)."},
+                    "chunk_overlap": {"type": "integer", "description": "Overlap between chunks (default 250)."}
                 }
             }
         }
@@ -246,15 +224,15 @@ TOOL_SCHEMAS.extend([
         "type": "function",
         "function": {
             "name": "vault_search",
-            "description": "Search the indexed vault for relevant chunks and return compact snippets, source paths, chunk indexes, and character offsets.",
+            "description": "Search indexed vault for relevant chunks.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "query": {"type": "string"},
                     "collection": {"type": "string"},
-                    "top_k": {"type": "integer", "description": "Optional number of chunks to return. Defaults to 6."},
-                    "max_chars": {"type": "integer", "description": "Optional maximum characters in the combined context. Defaults to 7000."},
-                    "source": {"type": "string", "description": "Optional source or source_path value from a previous search result to restrict search."}
+                    "top_k": {"type": "integer", "description": "Chunks to return (default 6)."},
+                    "max_chars": {"type": "integer", "description": "Max chars in context (default 7000)."},
+                    "source": {"type": "string", "description": "Source path to restrict search."}
                 },
                 "required": ["query"]
             }

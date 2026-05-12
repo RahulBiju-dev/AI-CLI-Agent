@@ -51,6 +51,58 @@ _ALL_PARAMS = _FLOAT_PARAMS | _INT_PARAMS
 # terminal helpers (spinner, renderer, ANSI constants) are imported
 # from agent.terminal to keep terminal logic modular.
 
+# ── History management ────────────────────────────────────────────────
+# Rough token budget for conversation history.
+# Keeps prompt size bounded so tok/s stays consistent across long sessions.
+_HISTORY_TOKEN_BUDGET = 6000  # ~6k tokens ≈ leaves room for response in 8192 ctx
+
+
+def _estimate_tokens(text: str) -> int:
+    """Fast heuristic: ~1 token per 4 characters (close enough for trimming)."""
+    return len(text) // 4 + 1
+
+
+def _trim_history(messages: list[dict], budget: int = _HISTORY_TOKEN_BUDGET) -> list[dict]:
+    """Trim conversation history to fit within a token budget.
+
+    Preserves the system prompt (if any) and the most recent messages.
+    Tool messages are kept with their associated assistant message.
+    """
+    if not messages:
+        return messages
+
+    # Separate system prompt from conversation
+    system_msgs = []
+    conv_msgs = []
+    for msg in messages:
+        if msg.get("role") == "system":
+            system_msgs.append(msg)
+        else:
+            conv_msgs.append(msg)
+
+    # Calculate system prompt cost
+    system_cost = sum(_estimate_tokens(m.get("content", "")) for m in system_msgs)
+    remaining_budget = budget - system_cost
+
+    if remaining_budget <= 0:
+        # System prompt alone exceeds budget; keep it + last user message
+        return system_msgs + conv_msgs[-1:]
+
+    # Walk from newest to oldest, accumulating messages
+    kept: list[dict] = []
+    used = 0
+    for msg in reversed(conv_msgs):
+        content = msg.get("content", "")
+        thinking = msg.get("thinking", "")
+        cost = _estimate_tokens(content) + _estimate_tokens(thinking)
+        if used + cost > remaining_budget and kept:
+            break
+        kept.append(msg)
+        used += cost
+
+    kept.reverse()
+    return system_msgs + kept
+
 def _stream_thinking_response(
     model: str,
     messages: list[dict],
@@ -89,6 +141,8 @@ def _stream_thinking_response(
     stream = ollama.chat(**kwargs)
 
     live = None
+    _last_render = 0.0  # throttle Live.update() calls
+    _RENDER_INTERVAL = 0.08  # seconds between re-renders (~12 FPS)
     try:
         for chunk in stream:
             msg = chunk.message
@@ -157,16 +211,20 @@ def _stream_thinking_response(
                     )
                     live.start()
 
-                # Auto-scroll logic: keep the output size within the terminal bounds
-                max_lines = max(5, _console.height - 6)
-                lines = content_buf.split("\n")
-                if len(lines) > max_lines:
-                    display_buf = "...\n" + "\n".join(lines[-max_lines+1:])
-                else:
-                    display_buf = content_buf
+                # Throttle Markdown re-renders to reduce CPU overhead
+                now = time.monotonic()
+                if now - _last_render >= _RENDER_INTERVAL:
+                    # Auto-scroll logic: keep the output size within the terminal bounds
+                    max_lines = max(5, _console.height - 6)
+                    lines = content_buf.split("\n")
+                    if len(lines) > max_lines:
+                        display_buf = "...\n" + "\n".join(lines[-max_lines+1:])
+                    else:
+                        display_buf = content_buf
 
-                # Update Markdown rendering in real-time
-                live.update(Markdown(_render_terminal_markdown(display_buf)), refresh=True)
+                    # Update Markdown rendering in real-time
+                    live.update(Markdown(_render_terminal_markdown(display_buf)), refresh=True)
+                    _last_render = now
 
     finally:
         if live:
@@ -676,10 +734,12 @@ def run() -> None:
             # Best-effort; don't let indexing errors stop the agent
             pass
 
+        # ── Build messages to send ────────────────────────────────────
         # When history is disabled, send only the current message (+ system if set)
         if session["history"]:
             history.append({"role": "user", "content": user_input})
-            messages_to_send = history
+            # Trim history to keep prompt size bounded for consistent tok/s
+            messages_to_send = _trim_history(history)
         else:
             messages_to_send = []
             if history and history[0].get("role") == "system":

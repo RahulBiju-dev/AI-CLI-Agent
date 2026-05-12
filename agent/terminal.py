@@ -217,6 +217,9 @@ _LATEX_SYMBOLS = {
     r"\right": "",
 }
 
+# Pre-sorted symbol keys (longest first) to avoid re-sorting on every call
+_SORTED_LATEX_KEYS = sorted(_LATEX_SYMBOLS.keys(), key=lambda s: -len(s))
+
 _LATEX_SPACING = {
     r"\,": " ",
     r"\!": "",
@@ -374,9 +377,8 @@ def _render_latex_math(expr: str) -> str:
     expr = replace_frac(expr)
     expr = replace_sqrt(expr)
 
-    # Replace common LaTeX symbols
-    # Longer keys are placed first by sorting to avoid partial matches
-    for latex in sorted(_LATEX_SYMBOLS.keys(), key=lambda s: -len(s)):
+    # Replace common LaTeX symbols using pre-sorted keys
+    for latex in _SORTED_LATEX_KEYS:
         expr = expr.replace(latex, _LATEX_SYMBOLS[latex])
 
     for latex, replacement in _LATEX_SPACING.items():
@@ -410,16 +412,24 @@ def _render_latex_math(expr: str) -> str:
                 return mapped
             return f"_{inner_rendered}"
 
-        text = re.sub(r"\^(\{.*?\}|.)", sup_repl, text)
-        text = re.sub(r"_(\{.*?\}|.)", sub_repl, text)
+        text = _RE_SUP.sub(sup_repl, text)
+        text = _RE_SUB.sub(sub_repl, text)
         return text
 
     expr = replace_scripts(expr)
 
     # Strip remaining braces and collapse whitespace
     expr = expr.replace("{", "").replace("}", "")
-    expr = re.sub(r"\s+", " ", expr)
+    expr = _RE_COLLAPSE_WS.sub(" ", expr)
     return expr.strip()
+
+
+# Pre-compiled regex patterns for markdown rendering
+_RE_BLOCK_LATEX = re.compile(r"\$\$(.+?)\$\$", flags=re.DOTALL)
+_RE_INLINE_LATEX = re.compile(r"(?<!\\)\$(.+?)(?<!\\)\$")
+_RE_SUP = re.compile(r"\^(\{.*?\}|.)")
+_RE_SUB = re.compile(r"_(\{.*?\}|.)")
+_RE_COLLAPSE_WS = re.compile(r"\s+")
 
 
 def _render_terminal_markdown(text: str) -> str:
@@ -430,6 +440,6 @@ def _render_terminal_markdown(text: str) -> str:
     def replace_inline(match: re.Match[str]) -> str:
         return _render_latex_math(match.group(1))
 
-    text = re.sub(r"\$\$(.+?)\$\$", replace_block, text, flags=re.DOTALL)
-    text = re.sub(r"(?<!\\)\$(.+?)(?<!\\)\$", replace_inline, text)
+    text = _RE_BLOCK_LATEX.sub(replace_block, text)
+    text = _RE_INLINE_LATEX.sub(replace_inline, text)
     return text.replace(r"\$", "$")
