@@ -415,15 +415,19 @@ def _handle_set(args: str, session: dict, history: list[dict]) -> None:
     if sub == "system":
         # Strip surrounding quotes if present
         prompt = rest.strip().strip('"').strip("'")
-        if not prompt:
-            print(f"{_RED}Usage: /set system \"Your system prompt here\"{_RESET}\n")
+        
+        # Remove any existing system messages from history to avoid duplicates
+        history[:] = [m for m in history if m.get("role") != "system"]
+
+        if not prompt or prompt.lower() == "default":
+            session["system"] = ""
+            print(f"{_CYAN}{_BOLD}✓  System prompt reset to default.{_RESET}\n")
             return
-        # Update or insert system message at the start of history
-        if history and history[0].get("role") == "system":
-            history[0]["content"] = prompt
-        else:
-            history.insert(0, {"role": "system", "content": prompt})
+
+        # Insert new system message at the start
+        history.insert(0, {"role": "system", "content": prompt})
         session["system"] = prompt
+        
         # Truncate display for confirmation
         display = prompt if len(prompt) <= 80 else prompt[:77] + "…"
         print(f"{_CYAN}{_BOLD}✓  System prompt set:{_RESET} {_DIM}{display}{_RESET}\n")
@@ -864,7 +868,9 @@ def _handle_command(cmd: str, session: dict, history: list[dict]) -> bool | None
 
     if base == "/clear":
         history.clear()
-        print(f"{_CYAN}{_BOLD}✓  Conversation history cleared.{_RESET}\n")
+        # Also clear the custom system prompt override
+        session["system"] = ""
+        print(f"{_CYAN}{_BOLD}✓  Conversation history and system prompt cleared.{_RESET}\n")
         return True
 
     if base == "/set":
@@ -927,6 +933,14 @@ def run() -> None:
             if result is None:
                 break  # /quit
             continue  # Command was handled, skip LLM call
+
+        # ── Sync system prompt ────────────────────────────────────────
+        # Ensure the custom system prompt is present in history if set
+        if session.get("system"):
+            if not history or history[0].get("role") != "system":
+                # Remove any stray system messages elsewhere and insert at front
+                history[:] = [m for m in history if m.get("role") != "system"]
+                history.insert(0, {"role": "system", "content": session["system"]})
 
         # ── Auto-index large or binary files when user inputs a local file path ─
         pre_tool_message = None
@@ -995,7 +1009,8 @@ def run() -> None:
             tool_results = _process_tool_calls(assistant_msg["tool_calls"])
             if session["history"]:
                 history.extend(tool_results)
-                messages_to_send = history
+                # Trim history to keep follow-up requests within token budget
+                messages_to_send = _trim_history(history)
             else:
                 messages_to_send.append(assistant_msg)
                 messages_to_send.extend(tool_results)
