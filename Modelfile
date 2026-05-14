@@ -18,6 +18,6 @@ Rules:
 """
 
 PARAMETER temperature 0.5
-PARAMETER num_ctx 8192
-PARAMETER num_predict 2048
-PARAMETER num_batch 512
+PARAMETER num_ctx 16384
+PARAMETER num_predict 3072
+PARAMETER num_batch 768
