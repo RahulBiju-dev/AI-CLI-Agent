@@ -143,7 +143,7 @@ The agent autonomously decides when to call tools based on the user's query:
 | 💻 **Code Viewer** | Read source files with line numbers; scan directories by extension |
 | 📄 **Document Reader** | Extract text from PDFs (`pypdf`) and Word docs (`python-docx`) with page/chunk/query navigation |
 | 📂 **File Manager** | Read text files with line range and search controls; create new files |
-| 🎵 **Spotify** | Search and play songs, albums, or playlists via D-Bus (MPRIS2) or web URLs |
+| 🎵 **Spotify** | Search and play songs natively on Windows, macOS, and Linux |
 | 🗄️ **Vault Index** | Chunk and embed local files into ChromaDB for semantic search |
 | 🔎 **Vault Search** | Query the vault for relevant document chunks using vector similarity |
 
@@ -216,7 +216,7 @@ The agent autonomously decides when to call tools based on the user's query:
 - **Python 3.10+**
 - **Gemma 4 E4B model:** `ollama pull gemma4:e4b`
 - **Embedding model (for vault):** `ollama pull embeddinggemma`
-- **For Spotify:** Spotify desktop app + `dbus-python` (pre-installed on most GNOME/Fedora systems)
+- **For Spotify:** Spotify desktop app. On Linux, `dbus-python` is also required (pre-installed on most GNOME/Fedora systems).
 
 ---
 
@@ -392,7 +392,7 @@ AI-CLI-Agent/
 │   ├── code.py                # Source code viewer with line numbers
 │   ├── document.py            # PDF/DOCX extraction with chunking
 │   ├── file.py                # Text file read/write with search
-│   ├── spotify.py             # Spotify D-Bus/MPRIS2 control
+│   ├── spotify.py             # Spotify cross-platform desktop control
 │   ├── vault_indexer.py       # Document chunking + ChromaDB indexing
 │   ├── vault_search.py        # Vector similarity search
 │   └── vault_embeddings.py    # Ollama embedding API helpers

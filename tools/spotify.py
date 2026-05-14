@@ -1,12 +1,12 @@
 """
-tools/spotify.py — Spotify desktop control via D-Bus (MPRIS2).
+tools/spotify.py — Spotify desktop control.
 
 Allows the agent to launch Spotify and play specific songs
-on the local Linux desktop.
+on Windows, macOS, and Linux (via MPRIS2 D-Bus).
 
 Requirements:
-    - Spotify installed (Flatpak, Snap, or native)
-    - dbus-python (system package, usually pre-installed on Fedora/GNOME)
+    - Spotify installed
+    - dbus-python (Linux only, usually pre-installed on Fedora/GNOME)
 """
 
 import json
@@ -14,6 +14,7 @@ import subprocess
 import time
 import shutil
 import re
+import sys
 
 
 # ── Spotify launch helpers ────────────────────────────────────────────
@@ -52,11 +53,24 @@ def _find_spotify_command() -> list[str]:
 def _is_spotify_running() -> bool:
     """Check if Spotify is currently running."""
     try:
-        result = subprocess.run(
-            ["pgrep", "-f", "spotify"],
-            capture_output=True, text=True, timeout=5,
-        )
-        return result.returncode == 0
+        if sys.platform == "win32":
+            result = subprocess.run(
+                ["tasklist", "/FI", "IMAGENAME eq Spotify.exe", "/NH"],
+                capture_output=True, text=True, timeout=5,
+            )
+            return "Spotify.exe" in result.stdout
+        elif sys.platform == "darwin":
+            result = subprocess.run(
+                ["pgrep", "-x", "Spotify"],
+                capture_output=True, text=True, timeout=5,
+            )
+            return result.returncode == 0
+        else:
+            result = subprocess.run(
+                ["pgrep", "-f", "spotify"],
+                capture_output=True, text=True, timeout=5,
+            )
+            return result.returncode == 0
     except (FileNotFoundError, subprocess.TimeoutExpired):
         return False
 
@@ -66,22 +80,36 @@ def _launch_spotify() -> bool:
     if _is_spotify_running():
         return True
 
-    cmd = _find_spotify_command()
-    if not cmd:
-        return False
-
     try:
-        subprocess.Popen(
-            cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
-        )
-        # Wait for Spotify to start and register on D-Bus
+        if sys.platform == "win32":
+            subprocess.Popen(
+                ["cmd", "/c", "start", "spotify:"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        elif sys.platform == "darwin":
+            subprocess.Popen(
+                ["open", "-a", "Spotify"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        else:
+            cmd = _find_spotify_command()
+            if not cmd:
+                return False
+
+            subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+
+        # Wait for Spotify to start and register
         for _ in range(15):
             time.sleep(1)
             if _is_spotify_running():
-                # Give it a moment to register the MPRIS interface
+                # Give it a moment to initialize
                 time.sleep(2)
                 return True
         return False
@@ -213,44 +241,60 @@ def spotify_play(query: str) -> str:
                 # Fallback: open Spotify's own search
                 uri = f"spotify:search:{query.replace(' ', '%20')}"
 
-        # Step 3: Play via D-Bus OpenUri
-        player = _get_spotify_dbus()
-        if player:
-            try:
-                player.OpenUri(uri)
-                time.sleep(1)
+        # Step 3: Play via OS-specific mechanism
+        if sys.platform == "win32":
+            subprocess.run(["cmd", "/c", "start", uri], capture_output=True)
+            return json.dumps({
+                "success": True,
+                "message": f"Opened Spotify with URI: {uri}",
+                "uri": uri,
+            })
+        elif sys.platform == "darwin":
+            script = f'tell application "Spotify" to play track "{uri}"'
+            subprocess.run(["osascript", "-e", script], capture_output=True)
+            return json.dumps({
+                "success": True,
+                "message": f"Opened Spotify with URI: {uri}",
+                "uri": uri,
+            })
+        else:
+            player = _get_spotify_dbus()
+            if player:
+                try:
+                    player.OpenUri(uri)
+                    time.sleep(1)
 
-                # Get current track info for confirmation
-                props = _get_spotify_properties()
-                if props:
-                    metadata = props.Get(
-                        "org.mpris.MediaPlayer2.Player", "Metadata"
-                    )
-                    title = str(metadata.get("xesam:title", "Unknown"))
-                    artists = metadata.get("xesam:artist", ["Unknown"])
-                    artist = ", ".join(str(a) for a in artists)
-                    album = str(metadata.get("xesam:album", "Unknown"))
+                    # Get current track info for confirmation
+                    props = _get_spotify_properties()
+                    if props:
+                        metadata = props.Get(
+                            "org.mpris.MediaPlayer2.Player", "Metadata"
+                        )
+                        title = str(metadata.get("xesam:title", "Unknown"))
+                        artists = metadata.get("xesam:artist", ["Unknown"])
+                        artist = ", ".join(str(a) for a in artists)
+                        album = str(metadata.get("xesam:album", "Unknown"))
+
+                        return json.dumps({
+                            "success": True,
+                            "message": f"Now playing: {title} by {artist}",
+                            "track": title,
+                            "artist": artist,
+                            "album": album,
+                            "uri": uri,
+                        })
 
                     return json.dumps({
                         "success": True,
-                        "message": f"Now playing: {title} by {artist}",
-                        "track": title,
-                        "artist": artist,
-                        "album": album,
+                        "message": f"Opened Spotify with URI: {uri}",
                         "uri": uri,
                     })
+                except Exception:
+                    pass
 
-                return json.dumps({
-                    "success": True,
-                    "message": f"Opened Spotify with URI: {uri}",
-                    "uri": uri,
-                })
-            except Exception:
-                pass
-
-        return json.dumps({
-            "error": "Could not connect to Spotify via D-Bus. Is Spotify running?"
-        })
+            return json.dumps({
+                "error": "Could not connect to Spotify via D-Bus. Is Spotify running?"
+            })
 
     except Exception as exc:
         return json.dumps({"error": f"Spotify error: {str(exc)}"})

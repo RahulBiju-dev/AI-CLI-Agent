@@ -18,7 +18,7 @@ Rules:
 - If a question is ambiguous, state your assumption and proceed.
 """
 
-PARAMETER temperature 0.5
+PARAMETER temperature 0.4
 PARAMETER num_ctx 16384
 PARAMETER num_predict 3072
 PARAMETER num_batch 768
