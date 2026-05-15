@@ -227,16 +227,24 @@ The agent autonomously decides when to call tools based on the user's query:
 git clone https://github.com/RahulBiju-dev/AI-CLI-Agent.git
 cd AI-CLI-Agent
 
+# Install system dependencies (for PDF vision support)
+sudo dnf install poppler-utils -y
+
 # Install Python dependencies
 pip install -r requirements.txt
 
 # Ensure Ollama has the required models
 ollama pull gemma4:e4b
 ollama pull embeddinggemma
+ollama pull moondream
 
 # Start the agent (auto-builds the custom model on first run)
 python main.py
 ```
+
+### Multimodal Vision Capabilities
+The agent supports memory-safe multimodal vision, allowing it to read slides, diagrams, and architectures from large PDFs without RAM exhaustion.
+> **Note:** You MUST run `ollama pull moondream` in your terminal before using the agent with PDFs or images to enable this feature!
 
 ### What happens on first run
 

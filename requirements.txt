@@ -1,11 +1,9 @@
-ollama>=0.4.0
+chromadb>=0.3.25
+dbus-python
 ddgs
-rich>=13.0.0
+ollama>=0.4.0
+pdf2image
 pypdf>=5.1.0
 python-docx>=1.2.0
-dbus-python
-chromadb>=0.3.25
 requests>=2.28.0
-
-# Optional: Ollama client (if you prefer Python package over local HTTP/CLI)
-ollama>=0.0.9
+rich>=13.0.0
