@@ -7,7 +7,7 @@ import os
 from typing import Any, Dict, List
 
 from tools.vault_embeddings import DEFAULT_EMBED_MODEL, embed_query
-from tools.vault_indexer import CHROMA_DIR, get_chroma_client, sanitize_collection_name
+from tools.vault_indexer import CHROMA_DIR, get_chroma_client, resolve_vault_alias, sanitize_collection_name
 
 DEFAULT_TOP_K = 6
 DEFAULT_MAX_CHARS = 7000
@@ -146,8 +146,9 @@ def search_vault(
     """Search the indexed vault and return compact JSON for the agent."""
     if collection:
         collection_name = collection
-        
-    collection_name = sanitize_collection_name(collection_name)
+
+    # Resolve human-friendly aliases first, then sanitize as fallback
+    collection_name = resolve_vault_alias(collection_name)
     
     if not query or not query.strip():
         return _json({"error": "query is required"})

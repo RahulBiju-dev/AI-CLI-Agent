@@ -329,6 +329,8 @@ _COMMANDS_HELP = f"""
   {_GREEN}/show parameters{_RESET}               — Show current session parameters
   {_GREEN}/show system{_RESET}                   — Show the active system prompt
   {_GREEN}/show model{_RESET}                    — Show model info
+  {_GREEN}/vault alias <name> <coll>{_RESET}     — Register a friendly alias for a collection
+  {_GREEN}/vault aliases{_RESET}                  — List registered vault aliases
   {_GREEN}/vault add <path>{_RESET}               — Add a file or folder to the searchable vault
   {_GREEN}/vault list{_RESET}                     — List indexed vault collections
   {_GREEN}/vault search <query>{_RESET}           — Search the indexed vault
@@ -339,6 +341,8 @@ _COMMANDS_HELP = f"""
 _VAULT_HELP = f"""
 {_CYAN}{_BOLD}Vault commands:{_RESET}
   {_GREEN}/vault list{_RESET}                                  — List indexed vault collections
+  {_GREEN}/vault aliases{_RESET}                               — List registered vault aliases
+  {_GREEN}/vault alias <name> <coll>{_RESET}                  — Register a friendly alias for a collection
   {_GREEN}/vault add <path> [--collection name]{_RESET}        — Index a file or folder
   {_GREEN}/vault search <query> [--top-k n]{_RESET}            — Search indexed content
   {_GREEN}/vault search <query> [--source path]{_RESET}        — Restrict search to a source
@@ -714,7 +718,10 @@ def _handle_vault(args: str) -> None:
 
     sub = parts[0].lower()
     tokens = parts[1:]
-    collection = _extract_option(tokens, ("--collection", "-c"), "vault") or "vault"
+    collection_raw = _extract_option(tokens, ("--collection", "-c"), "vault") or "vault"
+    
+    from tools.vault_indexer import resolve_vault_alias
+    collection = resolve_vault_alias(collection_raw)
 
     if sub in ("list", "ls"):
         data = _call_tool_json("list_vaults")
@@ -737,6 +744,34 @@ def _handle_vault(args: str) -> None:
                 count_text = "chunk count unavailable"
             print(f"  {_GREEN}{name}{_RESET}  {_DIM}({count_text}){_RESET}")
         print()
+        return
+
+    if sub in ("alias", "register"):
+        if len(tokens) < 2:
+            print(f"{_RED}Usage: /vault alias <human-name> <collection-name>{_RESET}\n")
+            return
+        alias_name = tokens[0]
+        coll_name = tokens[1]
+        from tools.vault_indexer import register_vault_alias
+        register_vault_alias(alias_name, coll_name)
+        print(f"{_CYAN}{_BOLD}✓  Vault alias registered:{_RESET} {_GREEN}{alias_name}{_RESET} -> {_DIM}{coll_name}{_RESET}\n")
+        return
+
+    if sub in ("aliases", "list-aliases"):
+        from tools.vault_indexer import list_vault_aliases
+        try:
+            import json as _json
+            data = _json.loads(list_vault_aliases())
+            aliases = data.get("aliases", [])
+            if not aliases:
+                print(f"{_DIM}  No vault aliases registered.{_RESET}\n")
+                return
+            print(f"\n{_CYAN}{_BOLD}Vault aliases:{_RESET}")
+            for entry in aliases:
+                print(f"  {_GREEN}{entry['alias']}{_RESET} -> {_DIM}{entry['collection']}{_RESET}")
+            print()
+        except Exception as e:
+            print(f"{_RED}Failed to list aliases: {e}{_RESET}\n")
         return
 
     if sub in ("add", "index"):
@@ -955,7 +990,7 @@ def run() -> None:
                     handler = TOOL_DISPATCH.get("index_vault")
                     if handler:
                         try:
-                            res = handler(vault_path=os.path.dirname(user_input) or ".", file_path=user_input, collection="vault")
+                            res = handler(vault_path=os.path.dirname(user_input) or ".", file_path=user_input)
                             # Ensure we push a tool-style message into history so the model knows indexing occurred
                             if isinstance(res, str):
                                 tool_content = res

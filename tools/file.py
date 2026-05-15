@@ -233,21 +233,61 @@ def read_file(
 def create_file(file_path: str, content: str) -> str:
     """Create a new file with the given content.
 
+    The file is written into the project's ``vaults/`` directory so that it
+    is automatically available for semantic search.  A dedicated ChromaDB
+    collection is created for the file and a human-friendly alias is
+    registered so the user can reference the vault by name later.
+
     Args:
         file_path: The absolute or relative path where the file should be created.
+                   The basename is used to place the file inside ``vaults/``.
         content: The text content to write to the file.
 
     Returns:
         A JSON string indicating success or failure.
     """
-    try:
-        dir_name = os.path.dirname(os.path.abspath(file_path))
-        if dir_name:
-            os.makedirs(dir_name, exist_ok=True)
+    from tools.vault_indexer import (
+        VAULTS_DIR,
+        index_vault,
+        register_vault_alias,
+        sanitize_collection_name,
+    )
 
-        with open(file_path, "w", encoding="utf-8") as f:
+    try:
+        # Resolve the target inside the vaults directory
+        basename = os.path.basename(file_path)
+        vault_file_path = os.path.join(VAULTS_DIR, basename)
+        os.makedirs(VAULTS_DIR, exist_ok=True)
+
+        with open(vault_file_path, "w", encoding="utf-8") as f:
             f.write(content)
 
-        return _json({"success": True, "message": f"Successfully created file at {file_path}"})
+        # Derive a collection name from the filename (without extension)
+        stem = os.path.splitext(basename)[0]
+        collection_name = sanitize_collection_name(stem)
+
+        # Index the file into its own vault collection
+        index_result = index_vault(
+            vault_path=VAULTS_DIR,
+            file_path=vault_file_path,
+            collection=collection_name,
+        )
+
+        # Register a friendly alias (the original stem, spaces and all)
+        register_vault_alias(
+            alias=stem,
+            collection_name=collection_name,
+            file_path=vault_file_path,
+        )
+
+        return _json({
+            "success": True,
+            "message": f"Created and indexed file at {vault_file_path}",
+            "vault_path": vault_file_path,
+            "collection": collection_name,
+            "alias": stem,
+            "index_result": json.loads(index_result) if isinstance(index_result, str) else index_result,
+            "hint": f"Use vault_search with collection='{collection_name}' or reference the alias '{stem}' to search this file.",
+        })
     except Exception as exc:
         return _json({"error": f"Error creating file: {exc}"})

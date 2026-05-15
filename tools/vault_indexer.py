@@ -144,17 +144,14 @@ def _read_text_for_index(path: str) -> tuple[str, dict]:
     ext = os.path.splitext(path)[1].lower()
     if ext == ".pdf":
         try:
-            try:
-                import PyPDF2
-            except ImportError:
-                import pypdf as PyPDF2
+            import pypdf
             from pdf2image import convert_from_path
             import tempfile
             from tools.vision_describer import describe_image
             
             text_stream = []
             with open(path, "rb") as f:
-                reader = PyPDF2.PdfReader(f)
+                reader = pypdf.PdfReader(f)
                 total_pages = len(reader.pages)
                 
             chunk_size = 10
@@ -164,7 +161,7 @@ def _read_text_for_index(path: str) -> tuple[str, dict]:
                 
                 # Extract regular text using PyPDF2
                 with open(path, "rb") as f:
-                    reader = PyPDF2.PdfReader(f)
+                    reader = pypdf.PdfReader(f)
                     for page_num in range(first_page - 1, last_page):
                         try:
                             page_text = reader.pages[page_num].extract_text()
@@ -245,7 +242,13 @@ def index_vault(
     """
     if collection:
         collection_name = collection
-        
+    elif collection_name == "vault":
+        # Auto-derive a meaningful name instead of the generic "vault"
+        if file_path:
+            collection_name = os.path.splitext(os.path.basename(file_path))[0]
+        elif vault_path:
+            collection_name = os.path.basename(os.path.abspath(vault_path))
+
     collection_name = sanitize_collection_name(collection_name)
 
     if not vault_path:
@@ -324,6 +327,15 @@ def index_vault(
     if docs:
         indexed_chunks += _flush_batch(collection_obj, ids, docs, metadatas, model=model)
 
+    # Auto-register an alias when a single file was indexed
+    if file_path and indexed_files == 1:
+        stem = os.path.splitext(os.path.basename(file_path))[0]
+        register_vault_alias(
+            alias=stem,
+            collection_name=collection_name,
+            file_path=os.path.abspath(file_path),
+        )
+
     return _json({
         "collection": collection_name,
         "persist_directory": CHROMA_DIR,
@@ -333,6 +345,7 @@ def index_vault(
         "skipped_count": len(skipped_files),
         "chunk_size": chunk_size,
         "chunk_overlap": chunk_overlap,
+        "alias": os.path.splitext(os.path.basename(file_path))[0] if file_path and indexed_files == 1 else None,
         "guidance": "Use vault_search with a focused query to retrieve relevant chunks from large indexed files.",
     })
 
@@ -434,6 +447,86 @@ def list_vaults() -> str:
         "persist_directory": CHROMA_DIR,
         "vault_count": len(vaults),
         "vaults": vaults,
+    })
+
+
+# ── Vault alias registry ──────────────────────────────────────────────
+# Maps human-friendly names (e.g. "DAA Notes") to collection names and
+# file paths so that users can reference vaults without remembering the
+# sanitized ChromaDB collection name.
+
+_ALIAS_FILE = os.path.join(VAULTS_DIR, ".vault_aliases.json")
+
+
+def _load_aliases() -> dict:
+    """Load the alias registry from disk."""
+    if os.path.isfile(_ALIAS_FILE):
+        try:
+            with open(_ALIAS_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            pass
+    return {}
+
+
+def _save_aliases(aliases: dict) -> None:
+    """Persist the alias registry to disk."""
+    os.makedirs(VAULTS_DIR, exist_ok=True)
+    with open(_ALIAS_FILE, "w", encoding="utf-8") as f:
+        json.dump(aliases, f, indent=2, ensure_ascii=False)
+
+
+def register_vault_alias(alias: str, collection_name: str, file_path: str | None = None) -> None:
+    """Register a human-friendly alias for a vault collection."""
+    aliases = _load_aliases()
+    key = alias.strip().lower()
+    aliases[key] = {
+        "alias": alias.strip(),
+        "collection": collection_name,
+        "file_path": file_path,
+    }
+    _save_aliases(aliases)
+
+
+def resolve_vault_alias(name: str) -> str:
+    """Resolve a name to a collection name.
+
+    Tries, in order:
+      1. Exact alias match (case-insensitive)
+      2. Substring alias match
+      3. Return the name itself (assumed to already be a collection name)
+    """
+    if not name:
+        return "vault"
+    aliases = _load_aliases()
+    key = name.strip().lower()
+
+    # Exact match
+    if key in aliases:
+        return aliases[key]["collection"]
+
+    # Substring match
+    for alias_key, entry in aliases.items():
+        if key in alias_key or alias_key in key:
+            return entry["collection"]
+
+    # Fall through — treat as a raw collection name
+    return sanitize_collection_name(name)
+
+
+def list_vault_aliases() -> str:
+    """Return a JSON listing of all registered vault aliases."""
+    aliases = _load_aliases()
+    entries = []
+    for _key, entry in sorted(aliases.items()):
+        entries.append({
+            "alias": entry.get("alias", _key),
+            "collection": entry.get("collection"),
+            "file_path": entry.get("file_path"),
+        })
+    return _json({
+        "alias_count": len(entries),
+        "aliases": entries,
     })
 
 
