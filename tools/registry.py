@@ -31,7 +31,17 @@ TOOL_SCHEMAS: list[dict] = [
                     "query": {
                         "type": "string",
                         "description": "The search query.",
-                    }
+                    },
+                    "difficulty": {
+                        "type": "string",
+                        "enum": ["easy", "medium", "hard"],
+                        "description": (
+                            "Search depth. 'easy' (3 results) for quick facts "
+                            "with many trusted sources; 'medium' (6 results, default) "
+                            "for general questions; 'hard' (10 results) for deep "
+                            "research or niche/complex queries."
+                        ),
+                    },
                 },
                 "required": ["query"],
             },
