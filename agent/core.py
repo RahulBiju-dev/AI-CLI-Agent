@@ -131,6 +131,7 @@ def _stream_thinking_response(
         "messages": messages,
         "stream": True,
         "think": think,
+        "keep_alive": "30m",
     }
     if fmt:
         kwargs["format"] = fmt
@@ -217,9 +218,9 @@ def _stream_thinking_response(
                 if now - _last_render >= _RENDER_INTERVAL:
                     # Auto-scroll logic: keep the output size within the terminal bounds
                     max_lines = max(5, _console.height - 6)
-                    lines = content_buf.split("\n")
+                    lines = content_buf.rsplit("\n", max_lines)
                     if len(lines) > max_lines:
-                        display_buf = "...\n" + "\n".join(lines[-max_lines+1:])
+                        display_buf = "...\n" + "\n".join(lines[-max_lines:])
                     else:
                         display_buf = content_buf
 

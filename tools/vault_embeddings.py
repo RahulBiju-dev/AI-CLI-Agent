@@ -12,6 +12,9 @@ OLLAMA_EMBED_URLS = (
     "http://127.0.0.1:11434/embed",
 )
 
+# Persistent session for connection pooling
+_SESSION = requests.Session()
+
 
 def _as_plain_data(response: Any) -> Any:
     """Convert Ollama client response objects into plain Python data."""
@@ -66,7 +69,7 @@ def embed_texts(texts: Sequence[str], model: str = DEFAULT_EMBED_MODEL, timeout:
 
     for url in OLLAMA_EMBED_URLS:
         try:
-            resp = requests.post(url, json=payload, timeout=timeout)
+            resp = _SESSION.post(url, json=payload, timeout=timeout)
             resp.raise_for_status()
             return _validate_embedding_count(normalize_embeddings(resp.json()), len(inputs))
         except Exception as exc:

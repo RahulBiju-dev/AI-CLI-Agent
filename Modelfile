@@ -21,4 +21,5 @@ Rules:
 PARAMETER temperature 0.4
 PARAMETER num_ctx 10240
 PARAMETER num_predict 2560
-PARAMETER num_batch 640
+PARAMETER num_batch 1024
+PARAMETER num_thread 8

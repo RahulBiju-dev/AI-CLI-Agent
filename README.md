@@ -321,7 +321,16 @@ The vault provides persistent semantic search over your local documents:
 | `/vault search <query> --source file.md` | Restrict search to a specific source |
 | `/vault delete --all` | Delete an entire collection |
 
-**Auto-indexing:** When you paste a file path as input and the file is large (>200KB) or binary (PDF/DOCX), the agent automatically indexes it into the vault before processing.
+**Auto-indexing:** When you paste a file path as input and the file is large (>200KB) or binary (PDF/DOCX), the agent automatically indexes it into its own vault collection before processing. The collection name is derived from the filename (e.g., `DAA_Notes.pdf` → collection `DAA_Notes`).
+
+**Auto-naming:** When no collection name is specified, the vault automatically derives one from the filename or folder name instead of dumping everything into a generic bucket. This means each document gets its own isolated, searchable collection:
+
+| Input | Auto-derived collection |
+|-------|------------------------|
+| `DAA_Notes.pdf` | `DAA_Notes` |
+| `Compression Notes.pdf` | `Compression_Notes` |
+| `physics_notes.md` | `physics_notes` |
+| Folder `/docs/` | `docs` |
 
 **Auto-vaulting on file creation:** Every file created with the `create_file` tool is automatically saved into the `vaults/` directory, indexed into its own ChromaDB collection, and registered with a human-friendly alias. This means you can immediately search any file the agent creates for you without manually indexing it.
 

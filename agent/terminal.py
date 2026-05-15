@@ -397,38 +397,53 @@ def _render_latex_math(expr: str) -> str:
     def replace_frac(text: str) -> str:
         output = []
         index = 0
-        while index < len(text):
-            if text.startswith(r"\frac", index):
-                numerator = _extract_braced(text, index + 5)
-                if numerator is not None:
-                    denominator = _extract_braced(text, numerator[1])
-                    if denominator is not None:
-                        rendered_num = _render_latex_math(numerator[0])
-                        rendered_den = _render_latex_math(denominator[0])
-                        if rendered_num.isdigit() and rendered_den.isdigit():
-                            output.append(_UNICODE_FRACTIONS.get((rendered_num, rendered_den), f"{rendered_num}/{rendered_den}"))
-                        else:
-                            output.append(f"({rendered_num})/({rendered_den})")
-                        index = denominator[1]
-                        continue
-            output.append(text[index])
-            index += 1
+        while True:
+            pos = text.find(r"\frac", index)
+            if pos == -1:
+                output.append(text[index:])
+                break
+            
+            output.append(text[index:pos])
+            numerator = _extract_braced(text, pos + 5)
+            if numerator is not None:
+                denominator = _extract_braced(text, numerator[1])
+                if denominator is not None:
+                    rendered_num = _render_latex_math(numerator[0])
+                    rendered_den = _render_latex_math(denominator[0])
+                    if rendered_num.isdigit() and rendered_den.isdigit():
+                        output.append(_UNICODE_FRACTIONS.get((rendered_num, rendered_den), f"{rendered_num}/{rendered_den}"))
+                    else:
+                        output.append(f"({rendered_num})/({rendered_den})")
+                    index = denominator[1]
+                    continue
+            
+            # If extraction failed, just append the string and move on
+            output.append(r"\frac")
+            index = pos + 5
+            
         return "".join(output)
 
     # Handle \sqrt{...}
     def replace_sqrt(text: str) -> str:
         output = []
         index = 0
-        while index < len(text):
-            if text.startswith(r"\sqrt", index):
-                radicand = _extract_braced(text, index + 5)
-                if radicand is not None:
-                    rendered = _render_latex_math(radicand[0])
-                    output.append(f"√({rendered})")
-                    index = radicand[1]
-                    continue
-            output.append(text[index])
-            index += 1
+        while True:
+            pos = text.find(r"\sqrt", index)
+            if pos == -1:
+                output.append(text[index:])
+                break
+            
+            output.append(text[index:pos])
+            radicand = _extract_braced(text, pos + 5)
+            if radicand is not None:
+                rendered = _render_latex_math(radicand[0])
+                output.append(f"√({rendered})")
+                index = radicand[1]
+                continue
+                
+            output.append(r"\sqrt")
+            index = pos + 5
+            
         return "".join(output)
 
     expr = replace_frac(expr)
