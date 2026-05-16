@@ -27,6 +27,7 @@ from agent.terminal import (
     _CLEAR_LINE,
 )
 
+import signal
 import sys
 import threading
 import time
@@ -61,6 +62,13 @@ _HISTORY_TOKEN_BUDGET = 6000  # ~6k tokens ≈ leaves room for response in 8192 
 def _estimate_tokens(text: str) -> int:
     """Fast heuristic: ~1 token per 4 characters (close enough for trimming)."""
     return len(text) // 4 + 1
+
+
+_interrupted = False
+
+def _sigquit_handler(signum, frame):
+    global _interrupted
+    _interrupted = True
 
 
 def _trim_history(messages: list[dict], budget: int = _HISTORY_TOKEN_BUDGET) -> list[dict]:
@@ -145,8 +153,24 @@ def _stream_thinking_response(
     live = None
     _last_render = 0.0  # throttle Live.update() calls
     _RENDER_INTERVAL = 0.08  # seconds between re-renders (~12 FPS)
+
+    global _interrupted
+    _interrupted = False
+    old_handler = signal.signal(signal.SIGQUIT, _sigquit_handler)
+
     try:
         for chunk in stream:
+            if _interrupted:
+                spinner.stop()
+                if in_thinking:
+                    in_thinking = False
+                    print(
+                        f"\n{_MAGENTA}{_DIM}└─ [Interrupted] ────────────────────────{_RESET}\n",
+                        file=sys.stderr,
+                    )
+                print(f"\n{_YELLOW}⚠ Generation interrupted by user (Ctrl+\\).{_RESET}\n", file=sys.stderr)
+                break
+            
             msg = chunk.message
 
             # ── Tool calls come through as non-streamed chunks ────────
@@ -229,6 +253,7 @@ def _stream_thinking_response(
                     _last_render = now
 
     finally:
+        signal.signal(signal.SIGQUIT, old_handler)
         if live:
             live.stop()
             # Print the final complete markdown to the terminal so it remains in the scrollback buffer.
