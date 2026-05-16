@@ -13,6 +13,7 @@ from tools.spotify import spotify_play
 from tools.browser import open_browser
 from tools.vault_indexer import delete_vault_item, index_vault, list_vault_aliases, list_vaults
 from tools.vault_search import search_vault
+from tools.obsi_vault_writer import create_structured_note
 
 # ── Schema definitions ────────────────────────────────────────────────
 
@@ -288,6 +289,36 @@ TOOL_SCHEMAS.extend([
             }
         }
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_structured_note",
+            "description": "Create an autonomous Obsidian note structured for graph view, including YAML tags, internal links, and versioned filenames.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string", "description": "The title of the note."},
+                    "content": {"type": "string", "description": "The main markdown content of the note."},
+                    "incoming_links": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional list of incoming WikiLink note titles."
+                    },
+                    "outgoing_links": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional list of outgoing WikiLink note titles to include in a Related Concepts section."
+                    },
+                    "tags": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional list of tags for the YAML frontmatter."
+                    }
+                },
+                "required": ["title", "content"]
+            }
+        }
+    },
 ])
 
 # ── Dispatch map ──────────────────────────────────────────────────────
@@ -310,4 +341,5 @@ TOOL_DISPATCH.update({
     "delete_vault_item": delete_vault_item,
     "list_vaults": list_vaults,
     "list_vault_aliases": list_vault_aliases,
+    "create_structured_note": create_structured_note,
 })
