@@ -357,6 +357,7 @@ _COMMANDS_HELP = f"""
   {_GREEN}/show model{_RESET}                    — Show model info
   {_GREEN}/vault alias <name> <coll>{_RESET}     — Register a friendly alias for a collection
   {_GREEN}/vault aliases{_RESET}                  — List registered vault aliases
+  {_GREEN}/vault rename <old> <new>{_RESET}       — Rename a vault collection
   {_GREEN}/vault add <path>{_RESET}               — Add a file or folder to the searchable vault
   {_GREEN}/vault list{_RESET}                     — List indexed vault collections
   {_GREEN}/vault search <query>{_RESET}           — Search the indexed vault
@@ -369,6 +370,7 @@ _VAULT_HELP = f"""
   {_GREEN}/vault list{_RESET}                                  — List indexed vault collections
   {_GREEN}/vault aliases{_RESET}                               — List registered vault aliases
   {_GREEN}/vault alias <name> <coll>{_RESET}                  — Register a friendly alias for a collection
+  {_GREEN}/vault rename <old> <new>{_RESET}                   — Rename a vault collection
   {_GREEN}/vault add <path> [--collection name]{_RESET}        — Index a file or folder
   {_GREEN}/vault search <query> [--top-k n]{_RESET}            — Search indexed content
   {_GREEN}/vault search <query> [--source path]{_RESET}        — Restrict search to a source
@@ -800,6 +802,27 @@ def _handle_vault(args: str) -> None:
             print(f"{_RED}Failed to list aliases: {e}{_RESET}\n")
         return
 
+    if sub in ("rename", "mv"):
+        if len(tokens) < 2:
+            print(f"{_RED}Usage: /vault rename <old-name> <new-name>{_RESET}\n")
+            return
+        old_name = tokens[0]
+        new_name = tokens[1]
+        from tools.vault_indexer import rename_vault
+        try:
+            import json as _json
+            data = _json.loads(rename_vault(old_name, new_name))
+            if data.get("error"):
+                print(f"{_RED}✗  {data['error']}{_RESET}\n")
+            else:
+                print(f"{_CYAN}{_BOLD}✓  Vault renamed:{_RESET} {_DIM}{data['old_collection']}{_RESET} -> {_GREEN}{data['new_collection']}{_RESET}  ({data.get('chunks_moved', 0)} chunks moved)")
+                if data.get("updated_aliases"):
+                    print(f"  {_DIM}Updated aliases: {', '.join(data['updated_aliases'])}{_RESET}")
+                print()
+        except Exception as e:
+            print(f"{_RED}Failed to rename vault: {e}{_RESET}\n")
+        return
+
     if sub in ("add", "index"):
         if not tokens:
             print(f"{_RED}Usage: /vault add <file-or-folder> [--collection name]{_RESET}\n")
@@ -911,7 +934,7 @@ def _handle_vault(args: str) -> None:
             print(f"{_YELLOW}No indexed chunks matched:{_RESET} {_DIM}{source}{_RESET}\n")
         return
 
-    print(f"{_RED}Unknown /vault subcommand: {sub}{_RESET}  {_DIM}(try: list, add, search, delete){_RESET}\n")
+    print(f"{_RED}Unknown /vault subcommand: {sub}{_RESET}  {_DIM}(try: list, aliases, rename, add, search, delete){_RESET}\n")
 
 
 def _handle_command(cmd: str, session: dict, history: list[dict]) -> bool | None:

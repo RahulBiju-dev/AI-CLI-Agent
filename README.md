@@ -154,6 +154,7 @@ The agent autonomously decides when to call tools based on the user's query:
 - **LaTeX math rendering** — Greek letters, fractions (`\frac`), roots (`\sqrt`), super/subscripts, arrays, and 120+ symbol mappings converted to Unicode for terminal display
 - **Animated spinner** during model loading and thinking phases
 - **Session persistence** — save and restore full conversation state including history, parameters, and system prompts
+- **Graceful Interrupts** — use `Ctrl+\` to safely stop the model's generation midway while preserving the partial response in your conversation context (leaving `Ctrl+C` free to exit the application).
 
 ---
 
@@ -313,6 +314,7 @@ The vault provides persistent semantic search over your local documents:
 | `/vault list` | List indexed vault collections |
 | `/vault aliases` | List registered vault aliases |
 | `/vault alias <name> <coll>` | Register a friendly alias for a collection |
+| `/vault rename <old> <new>` | Rename a vault collection (also `/vault mv`) |
 | `/vault add <path>` | Index a file or folder into the vault |
 | `/vault search <query>` | Search indexed content for relevant chunks |
 | `/vault delete <source>` | Remove indexed entries by source path |
