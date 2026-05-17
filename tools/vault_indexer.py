@@ -142,6 +142,55 @@ def _strip_frontmatter(text: str) -> str:
 
 def _read_text_for_index(path: str) -> tuple[str, dict]:
     ext = os.path.splitext(path)[1].lower()
+    if ext == ".pdf":
+        try:
+            import pypdf
+            from pdf2image import convert_from_path
+            import tempfile
+            from tools.vision_describer import describe_image
+            
+            text_stream = []
+            with open(path, "rb") as f:
+                reader = pypdf.PdfReader(f)
+                total_pages = len(reader.pages)
+                
+            chunk_size = 10
+            for i in range(0, total_pages, chunk_size):
+                first_page = i + 1
+                last_page = min(i + chunk_size, total_pages)
+                
+                # Extract regular text using PyPDF2
+                with open(path, "rb") as f:
+                    reader = pypdf.PdfReader(f)
+                    for page_num in range(first_page - 1, last_page):
+                        try:
+                            page_text = reader.pages[page_num].extract_text()
+                            if page_text:
+                                text_stream.append(f"--- Page {page_num + 1} Text ---\n{page_text.strip()}\n")
+                        except Exception:
+                            pass
+                            
+                # Extract multimodal vision text
+                try:
+                    images = convert_from_path(path, first_page=first_page, last_page=last_page)
+                    for img_idx, img in enumerate(images):
+                        page_num = first_page + img_idx
+                        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as temp_img:
+                            temp_img_path = temp_img.name
+                            img.save(temp_img_path, "PNG")
+                        try:
+                            desc = describe_image(temp_img_path)
+                            text_stream.append(f"--- Page {page_num} Visual Description ---\n{desc}\n")
+                        finally:
+                            os.remove(temp_img_path)
+                except Exception as e:
+                    text_stream.append(f"Error processing visual descriptions for pages {first_page}-{last_page}: {e}")
+                    
+            text = "\n".join(text_stream)
+            return text, {"document_type": "pdf", "char_count": len(text)}
+        except Exception as e:
+            return f"Error reading PDF: {e}", {"document_type": "pdf", "char_count": 0}
+            
     if ext in {".pdf", ".docx"}:
         return extract_document_text(path)
 
@@ -193,7 +242,13 @@ def index_vault(
     """
     if collection:
         collection_name = collection
-        
+    elif collection_name == "vault":
+        # Auto-derive a meaningful name instead of the generic "vault"
+        if file_path:
+            collection_name = os.path.splitext(os.path.basename(file_path))[0]
+        elif vault_path:
+            collection_name = os.path.basename(os.path.abspath(vault_path))
+
     collection_name = sanitize_collection_name(collection_name)
 
     if not vault_path:
@@ -272,6 +327,15 @@ def index_vault(
     if docs:
         indexed_chunks += _flush_batch(collection_obj, ids, docs, metadatas, model=model)
 
+    # Auto-register an alias when a single file was indexed
+    if file_path and indexed_files == 1:
+        stem = os.path.splitext(os.path.basename(file_path))[0]
+        register_vault_alias(
+            alias=stem,
+            collection_name=collection_name,
+            file_path=os.path.abspath(file_path),
+        )
+
     return _json({
         "collection": collection_name,
         "persist_directory": CHROMA_DIR,
@@ -281,6 +345,7 @@ def index_vault(
         "skipped_count": len(skipped_files),
         "chunk_size": chunk_size,
         "chunk_overlap": chunk_overlap,
+        "alias": os.path.splitext(os.path.basename(file_path))[0] if file_path and indexed_files == 1 else None,
         "guidance": "Use vault_search with a focused query to retrieve relevant chunks from large indexed files.",
     })
 
@@ -382,6 +447,153 @@ def list_vaults() -> str:
         "persist_directory": CHROMA_DIR,
         "vault_count": len(vaults),
         "vaults": vaults,
+    })
+
+
+# ── Vault alias registry ──────────────────────────────────────────────
+# Maps human-friendly names (e.g. "DAA Notes") to collection names and
+# file paths so that users can reference vaults without remembering the
+# sanitized ChromaDB collection name.
+
+_ALIAS_FILE = os.path.join(VAULTS_DIR, ".vault_aliases.json")
+
+
+def _load_aliases() -> dict:
+    """Load the alias registry from disk."""
+    if os.path.isfile(_ALIAS_FILE):
+        try:
+            with open(_ALIAS_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            pass
+    return {}
+
+
+def _save_aliases(aliases: dict) -> None:
+    """Persist the alias registry to disk."""
+    os.makedirs(VAULTS_DIR, exist_ok=True)
+    with open(_ALIAS_FILE, "w", encoding="utf-8") as f:
+        json.dump(aliases, f, indent=2, ensure_ascii=False)
+
+
+def register_vault_alias(alias: str, collection_name: str, file_path: str | None = None) -> None:
+    """Register a human-friendly alias for a vault collection."""
+    aliases = _load_aliases()
+    key = alias.strip().lower()
+    aliases[key] = {
+        "alias": alias.strip(),
+        "collection": collection_name,
+        "file_path": file_path,
+    }
+    _save_aliases(aliases)
+
+
+def resolve_vault_alias(name: str) -> str:
+    """Resolve a name to a collection name.
+
+    Tries, in order:
+      1. Exact alias match (case-insensitive)
+      2. Substring alias match
+      3. Return the name itself (assumed to already be a collection name)
+    """
+    if not name:
+        return "vault"
+    aliases = _load_aliases()
+    key = name.strip().lower()
+
+    # Exact match
+    if key in aliases:
+        return aliases[key]["collection"]
+
+    # Substring match
+    for alias_key, entry in aliases.items():
+        if key in alias_key or alias_key in key:
+            return entry["collection"]
+
+    # Fall through — treat as a raw collection name
+    return sanitize_collection_name(name)
+
+
+def list_vault_aliases() -> str:
+    """Return a JSON listing of all registered vault aliases."""
+    aliases = _load_aliases()
+    entries = []
+    for _key, entry in sorted(aliases.items()):
+        entries.append({
+            "alias": entry.get("alias", _key),
+            "collection": entry.get("collection"),
+            "file_path": entry.get("file_path"),
+        })
+    return _json({
+        "alias_count": len(entries),
+        "aliases": entries,
+    })
+
+
+def rename_vault(old_name: str, new_name: str) -> str:
+    """Rename a vault collection and update any aliases that reference it.
+
+    Copies all documents, embeddings, and metadata from the old collection
+    into a new one, deletes the old collection, and updates the alias
+    registry so existing aliases point to the new name.
+
+    Returns a JSON string with the result.
+    """
+    old_collection = sanitize_collection_name(old_name)
+    new_collection = sanitize_collection_name(new_name)
+
+    if old_collection == new_collection:
+        return _json({"error": "Old and new names resolve to the same collection name.",
+                       "old": old_collection, "new": new_collection})
+
+    client = get_chroma_client()
+
+    # Verify old collection exists
+    try:
+        old_coll = client.get_collection(name=old_collection)
+    except Exception:
+        return _json({"error": f"Collection '{old_collection}' not found.",
+                       "persist_directory": CHROMA_DIR})
+
+    count = old_coll.count()
+    if count == 0:
+        # Empty collection — just delete and create the new one
+        client.delete_collection(name=old_collection)
+        client.get_or_create_collection(name=new_collection)
+    else:
+        # Fetch all data from the old collection
+        data = old_coll.get(include=["documents", "metadatas", "embeddings"])
+        ids = data.get("ids", [])
+        docs = data.get("documents", [])
+        metadatas = data.get("metadatas", [])
+        embeddings = data.get("embeddings", [])
+
+        # Create the new collection and upsert everything
+        new_coll = client.get_or_create_collection(name=new_collection)
+        new_coll.upsert(ids=ids, documents=docs, metadatas=metadatas, embeddings=embeddings)
+
+        # Delete the old collection
+        client.delete_collection(name=old_collection)
+
+    # Update aliases that referenced the old collection
+    aliases = _load_aliases()
+    updated_aliases = []
+    for key, entry in aliases.items():
+        if entry.get("collection") == old_collection:
+            entry["collection"] = new_collection
+            updated_aliases.append(entry.get("alias", key))
+    if updated_aliases:
+        _save_aliases(aliases)
+
+    # Register the new name as an alias too
+    register_vault_alias(new_name, new_collection)
+
+    return _json({
+        "renamed": True,
+        "old_collection": old_collection,
+        "new_collection": new_collection,
+        "chunks_moved": count,
+        "updated_aliases": updated_aliases,
     })
 
 

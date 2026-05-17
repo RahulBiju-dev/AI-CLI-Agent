@@ -27,6 +27,7 @@ from agent.terminal import (
     _CLEAR_LINE,
 )
 
+import signal
 import sys
 import threading
 import time
@@ -61,6 +62,13 @@ _HISTORY_TOKEN_BUDGET = 6000  # ~6k tokens ≈ leaves room for response in 8192 
 def _estimate_tokens(text: str) -> int:
     """Fast heuristic: ~1 token per 4 characters (close enough for trimming)."""
     return len(text) // 4 + 1
+
+
+_interrupted = False
+
+def _sigquit_handler(signum, frame):
+    global _interrupted
+    _interrupted = True
 
 
 def _trim_history(messages: list[dict], budget: int = _HISTORY_TOKEN_BUDGET) -> list[dict]:
@@ -131,6 +139,7 @@ def _stream_thinking_response(
         "messages": messages,
         "stream": True,
         "think": think,
+        "keep_alive": "30m",
     }
     if fmt:
         kwargs["format"] = fmt
@@ -144,8 +153,24 @@ def _stream_thinking_response(
     live = None
     _last_render = 0.0  # throttle Live.update() calls
     _RENDER_INTERVAL = 0.08  # seconds between re-renders (~12 FPS)
+
+    global _interrupted
+    _interrupted = False
+    old_handler = signal.signal(signal.SIGQUIT, _sigquit_handler)
+
     try:
         for chunk in stream:
+            if _interrupted:
+                spinner.stop()
+                if in_thinking:
+                    in_thinking = False
+                    print(
+                        f"\n{_MAGENTA}{_DIM}└─ [Interrupted] ────────────────────────{_RESET}\n",
+                        file=sys.stderr,
+                    )
+                print(f"\n{_YELLOW}⚠ Generation interrupted by user (Ctrl+\\).{_RESET}\n", file=sys.stderr)
+                break
+            
             msg = chunk.message
 
             # ── Tool calls come through as non-streamed chunks ────────
@@ -217,9 +242,9 @@ def _stream_thinking_response(
                 if now - _last_render >= _RENDER_INTERVAL:
                     # Auto-scroll logic: keep the output size within the terminal bounds
                     max_lines = max(5, _console.height - 6)
-                    lines = content_buf.split("\n")
+                    lines = content_buf.rsplit("\n", max_lines)
                     if len(lines) > max_lines:
-                        display_buf = "...\n" + "\n".join(lines[-max_lines+1:])
+                        display_buf = "...\n" + "\n".join(lines[-max_lines:])
                     else:
                         display_buf = content_buf
 
@@ -228,6 +253,7 @@ def _stream_thinking_response(
                     _last_render = now
 
     finally:
+        signal.signal(signal.SIGQUIT, old_handler)
         if live:
             live.stop()
             # Print the final complete markdown to the terminal so it remains in the scrollback buffer.
@@ -329,6 +355,9 @@ _COMMANDS_HELP = f"""
   {_GREEN}/show parameters{_RESET}               — Show current session parameters
   {_GREEN}/show system{_RESET}                   — Show the active system prompt
   {_GREEN}/show model{_RESET}                    — Show model info
+  {_GREEN}/vault alias <name> <coll>{_RESET}     — Register a friendly alias for a collection
+  {_GREEN}/vault aliases{_RESET}                  — List registered vault aliases
+  {_GREEN}/vault rename <old> <new>{_RESET}       — Rename a vault collection
   {_GREEN}/vault add <path>{_RESET}               — Add a file or folder to the searchable vault
   {_GREEN}/vault list{_RESET}                     — List indexed vault collections
   {_GREEN}/vault search <query>{_RESET}           — Search the indexed vault
@@ -339,6 +368,9 @@ _COMMANDS_HELP = f"""
 _VAULT_HELP = f"""
 {_CYAN}{_BOLD}Vault commands:{_RESET}
   {_GREEN}/vault list{_RESET}                                  — List indexed vault collections
+  {_GREEN}/vault aliases{_RESET}                               — List registered vault aliases
+  {_GREEN}/vault alias <name> <coll>{_RESET}                  — Register a friendly alias for a collection
+  {_GREEN}/vault rename <old> <new>{_RESET}                   — Rename a vault collection
   {_GREEN}/vault add <path> [--collection name]{_RESET}        — Index a file or folder
   {_GREEN}/vault search <query> [--top-k n]{_RESET}            — Search indexed content
   {_GREEN}/vault search <query> [--source path]{_RESET}        — Restrict search to a source
@@ -714,7 +746,10 @@ def _handle_vault(args: str) -> None:
 
     sub = parts[0].lower()
     tokens = parts[1:]
-    collection = _extract_option(tokens, ("--collection", "-c"), "vault") or "vault"
+    collection_raw = _extract_option(tokens, ("--collection", "-c"), "vault") or "vault"
+    
+    from tools.vault_indexer import resolve_vault_alias
+    collection = resolve_vault_alias(collection_raw)
 
     if sub in ("list", "ls"):
         data = _call_tool_json("list_vaults")
@@ -737,6 +772,55 @@ def _handle_vault(args: str) -> None:
                 count_text = "chunk count unavailable"
             print(f"  {_GREEN}{name}{_RESET}  {_DIM}({count_text}){_RESET}")
         print()
+        return
+
+    if sub in ("alias", "register"):
+        if len(tokens) < 2:
+            print(f"{_RED}Usage: /vault alias <human-name> <collection-name>{_RESET}\n")
+            return
+        alias_name = tokens[0]
+        coll_name = tokens[1]
+        from tools.vault_indexer import register_vault_alias
+        register_vault_alias(alias_name, coll_name)
+        print(f"{_CYAN}{_BOLD}✓  Vault alias registered:{_RESET} {_GREEN}{alias_name}{_RESET} -> {_DIM}{coll_name}{_RESET}\n")
+        return
+
+    if sub in ("aliases", "list-aliases"):
+        from tools.vault_indexer import list_vault_aliases
+        try:
+            import json as _json
+            data = _json.loads(list_vault_aliases())
+            aliases = data.get("aliases", [])
+            if not aliases:
+                print(f"{_DIM}  No vault aliases registered.{_RESET}\n")
+                return
+            print(f"\n{_CYAN}{_BOLD}Vault aliases:{_RESET}")
+            for entry in aliases:
+                print(f"  {_GREEN}{entry['alias']}{_RESET} -> {_DIM}{entry['collection']}{_RESET}")
+            print()
+        except Exception as e:
+            print(f"{_RED}Failed to list aliases: {e}{_RESET}\n")
+        return
+
+    if sub in ("rename", "mv"):
+        if len(tokens) < 2:
+            print(f"{_RED}Usage: /vault rename <old-name> <new-name>{_RESET}\n")
+            return
+        old_name = tokens[0]
+        new_name = tokens[1]
+        from tools.vault_indexer import rename_vault
+        try:
+            import json as _json
+            data = _json.loads(rename_vault(old_name, new_name))
+            if data.get("error"):
+                print(f"{_RED}✗  {data['error']}{_RESET}\n")
+            else:
+                print(f"{_CYAN}{_BOLD}✓  Vault renamed:{_RESET} {_DIM}{data['old_collection']}{_RESET} -> {_GREEN}{data['new_collection']}{_RESET}  ({data.get('chunks_moved', 0)} chunks moved)")
+                if data.get("updated_aliases"):
+                    print(f"  {_DIM}Updated aliases: {', '.join(data['updated_aliases'])}{_RESET}")
+                print()
+        except Exception as e:
+            print(f"{_RED}Failed to rename vault: {e}{_RESET}\n")
         return
 
     if sub in ("add", "index"):
@@ -850,7 +934,7 @@ def _handle_vault(args: str) -> None:
             print(f"{_YELLOW}No indexed chunks matched:{_RESET} {_DIM}{source}{_RESET}\n")
         return
 
-    print(f"{_RED}Unknown /vault subcommand: {sub}{_RESET}  {_DIM}(try: list, add, search, delete){_RESET}\n")
+    print(f"{_RED}Unknown /vault subcommand: {sub}{_RESET}  {_DIM}(try: list, aliases, rename, add, search, delete){_RESET}\n")
 
 
 def _handle_command(cmd: str, session: dict, history: list[dict]) -> bool | None:
@@ -958,7 +1042,7 @@ def run() -> None:
                     handler = TOOL_DISPATCH.get("index_vault")
                     if handler:
                         try:
-                            res = handler(vault_path=os.path.dirname(user_input) or ".", file_path=user_input, collection="vault")
+                            res = handler(vault_path=os.path.dirname(user_input) or ".", file_path=user_input)
                             # Ensure we push a tool-style message into history so the model knows indexing occurred
                             if isinstance(res, str):
                                 tool_content = res

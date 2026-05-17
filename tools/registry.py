@@ -11,8 +11,9 @@ from tools.file import read_file, create_file
 from tools.code import view_code
 from tools.spotify import spotify_play
 from tools.browser import open_browser
-from tools.vault_indexer import delete_vault_item, index_vault, list_vaults
+from tools.vault_indexer import delete_vault_item, index_vault, list_vault_aliases, list_vaults
 from tools.vault_search import search_vault
+from tools.obsi_vault_writer import create_structured_note
 
 # ── Schema definitions ────────────────────────────────────────────────
 
@@ -31,7 +32,17 @@ TOOL_SCHEMAS: list[dict] = [
                     "query": {
                         "type": "string",
                         "description": "The search query.",
-                    }
+                    },
+                    "difficulty": {
+                        "type": "string",
+                        "enum": ["easy", "medium", "hard"],
+                        "description": (
+                            "Search depth. 'easy' (3 results) for quick facts "
+                            "with many trusted sources; 'medium' (6 results, default) "
+                            "for general questions; 'hard' (10 results) for deep "
+                            "research or niche/complex queries."
+                        ),
+                    },
                 },
                 "required": ["query"],
             },
@@ -267,6 +278,47 @@ TOOL_SCHEMAS.extend([
             }
         }
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_vault_aliases",
+            "description": "List all registered vault aliases — friendly names that map to indexed collections. Use this when the user wants to know what vaults are available or what name to use for vault_search.",
+            "parameters": {
+                "type": "object",
+                "properties": {}
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_structured_note",
+            "description": "Create an autonomous Obsidian note structured for graph view, including YAML tags, internal links, and versioned filenames.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string", "description": "The title of the note."},
+                    "content": {"type": "string", "description": "The main markdown content of the note."},
+                    "incoming_links": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional list of incoming WikiLink note titles."
+                    },
+                    "outgoing_links": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional list of outgoing WikiLink note titles to include in a Related Concepts section."
+                    },
+                    "tags": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional list of tags for the YAML frontmatter."
+                    }
+                },
+                "required": ["title", "content"]
+            }
+        }
+    },
 ])
 
 # ── Dispatch map ──────────────────────────────────────────────────────
@@ -288,4 +340,6 @@ TOOL_DISPATCH.update({
     "vault_search": search_vault,
     "delete_vault_item": delete_vault_item,
     "list_vaults": list_vaults,
+    "list_vault_aliases": list_vault_aliases,
+    "create_structured_note": create_structured_note,
 })

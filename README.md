@@ -142,16 +142,19 @@ The agent autonomously decides when to call tools based on the user's query:
 | 🌐 **Browser** | Open URLs or search queries in the system's default browser |
 | 💻 **Code Viewer** | Read source files with line numbers; scan directories by extension |
 | 📄 **Document Reader** | Extract text from PDFs (`pypdf`) and Word docs (`python-docx`) with page/chunk/query navigation |
-| 📂 **File Manager** | Read text files with line range and search controls; create new files |
+| 📂 **File Manager** | Read text files with line range and search controls; create new files (auto-vaulted) |
 | 🎵 **Spotify** | Search and play songs natively on Windows, macOS, and Linux |
-| 🗄️ **Vault Index** | Chunk and embed local files into ChromaDB for semantic search |
-| 🔎 **Vault Search** | Query the vault for relevant document chunks using vector similarity |
+| 👁️ **Vision Describer** | Describes images, diagrams, and slides using the local `moondream` vision model |
+| 🗄️ **Vault Index** | Chunk and embed local files into ChromaDB for semantic search; auto-registers aliases |
+| 🔎 **Vault Search** | Query the vault using vector similarity; resolves friendly aliases automatically |
+| 🏷️ **Vault Aliases** | List registered human-friendly names that map to vault collections |
 
 ### Terminal Interface
 - **Rich Markdown streaming** via `rich.Live` with automatic scroll management
 - **LaTeX math rendering** — Greek letters, fractions (`\frac`), roots (`\sqrt`), super/subscripts, arrays, and 120+ symbol mappings converted to Unicode for terminal display
 - **Animated spinner** during model loading and thinking phases
 - **Session persistence** — save and restore full conversation state including history, parameters, and system prompts
+- **Graceful Interrupts** — use `Ctrl+\` to safely stop the model's generation midway while preserving the partial response in your conversation context (leaving `Ctrl+C` free to exit the application).
 
 ---
 
@@ -227,16 +230,24 @@ The agent autonomously decides when to call tools based on the user's query:
 git clone https://github.com/RahulBiju-dev/AI-CLI-Agent.git
 cd AI-CLI-Agent
 
+# Install system dependencies (for PDF vision support)
+sudo dnf install poppler-utils -y
+
 # Install Python dependencies
 pip install -r requirements.txt
 
 # Ensure Ollama has the required models
 ollama pull gemma4:e4b
 ollama pull embeddinggemma
+ollama pull moondream
 
 # Start the agent (auto-builds the custom model on first run)
 python main.py
 ```
+
+### Multimodal Vision Capabilities
+The agent supports memory-safe multimodal vision, allowing it to read slides, diagrams, and architectures from large PDFs without RAM exhaustion.
+> **Note:** You MUST run `ollama pull moondream` in your terminal before using the agent with PDFs or images to enable this feature!
 
 ### What happens on first run
 
@@ -301,6 +312,9 @@ The vault provides persistent semantic search over your local documents:
 | Command | Description |
 |---------|-------------|
 | `/vault list` | List indexed vault collections |
+| `/vault aliases` | List registered vault aliases |
+| `/vault alias <name> <coll>` | Register a friendly alias for a collection |
+| `/vault rename <old> <new>` | Rename a vault collection (also `/vault mv`) |
 | `/vault add <path>` | Index a file or folder into the vault |
 | `/vault search <query>` | Search indexed content for relevant chunks |
 | `/vault delete <source>` | Remove indexed entries by source path |
@@ -309,7 +323,22 @@ The vault provides persistent semantic search over your local documents:
 | `/vault search <query> --source file.md` | Restrict search to a specific source |
 | `/vault delete --all` | Delete an entire collection |
 
-**Auto-indexing:** When you paste a file path as input and the file is large (>200KB) or binary (PDF/DOCX), the agent automatically indexes it into the vault before processing.
+**Auto-indexing:** When you paste a file path as input and the file is large (>200KB) or binary (PDF/DOCX), the agent automatically indexes it into its own vault collection before processing. The collection name is derived from the filename (e.g., `DAA_Notes.pdf` → collection `DAA_Notes`).
+
+**Auto-naming:** When no collection name is specified, the vault automatically derives one from the filename or folder name instead of dumping everything into a generic bucket. This means each document gets its own isolated, searchable collection:
+
+| Input | Auto-derived collection |
+|-------|------------------------|
+| `DAA_Notes.pdf` | `DAA_Notes` |
+| `Compression Notes.pdf` | `Compression_Notes` |
+| `physics_notes.md` | `physics_notes` |
+| Folder `/docs/` | `docs` |
+
+**Auto-vaulting on file creation:** Every file created with the `create_file` tool is automatically saved into the `vaults/` directory, indexed into its own ChromaDB collection, and registered with a human-friendly alias. This means you can immediately search any file the agent creates for you without manually indexing it.
+
+**Vault Aliases:** Vaults are automatically given friendly aliases derived from the filename. When searching, you can use the original name (e.g., `"physics_notes"`) instead of remembering the sanitized ChromaDB collection name. Aliases are stored in `vaults/.vault_aliases.json` and support exact and substring matching.
+
+**Multimodal Support:** For PDFs, the agent uses `moondream` via Ollama to generate visual descriptions of diagrams and slides. This is integrated directly into the vault indexing pipeline. Ensure you have run `ollama pull moondream` and installed `poppler-utils`.
 
 ### Runtime Configuration
 
@@ -391,10 +420,11 @@ AI-CLI-Agent/
 │   ├── browser.py             # System browser control (xdg-open)
 │   ├── code.py                # Source code viewer with line numbers
 │   ├── document.py            # PDF/DOCX extraction with chunking
-│   ├── file.py                # Text file read/write with search
+│   ├── file.py                # Text file read/write with search; auto-vaults created files
 │   ├── spotify.py             # Spotify cross-platform desktop control
-│   ├── vault_indexer.py       # Document chunking + ChromaDB indexing
-│   ├── vault_search.py        # Vector similarity search
+│   ├── vision_describer.py    # Multimodal image description via moondream
+│   ├── vault_indexer.py       # Document chunking, ChromaDB indexing, alias registry
+│   ├── vault_search.py        # Vector similarity search with alias resolution
 │   └── vault_embeddings.py    # Ollama embedding API helpers
 │
 ├── sessions/                  # Saved session JSON files
