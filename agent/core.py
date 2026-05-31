@@ -969,6 +969,15 @@ def _handle_command(cmd: str, session: dict, history: list[dict]) -> bool | None
 
 def run() -> None:
     """Run the interactive agent loop."""
+    import subprocess
+    default_system_prompt = ""
+    try:
+        res = subprocess.run(["ollama", "show", MODEL_NAME, "--system"], capture_output=True, text=True)
+        if res.returncode == 0:
+            default_system_prompt = res.stdout.strip()
+    except Exception:
+        pass
+
     history: list[dict] = []
     session: dict = {
         "options": {},       # Runtime model parameters (temperature, etc.)
@@ -1000,14 +1009,15 @@ def run() -> None:
             continue  # Command was handled, skip LLM call
 
         # ── Sync system prompt ────────────────────────────────────────
-        # Ensure the custom system prompt is present in history if set
-        if session.get("system"):
-            if not history or history[0].get("role") != "system":
+        # Ensure the custom or default system prompt is consistently present in history
+        active_system = session.get("system") or default_system_prompt
+        if active_system:
+            if not history or history[0].get("role") != "system" or history[0].get("content") != active_system:
                 # Remove any stray system messages elsewhere and insert at front
                 history[:] = [m for m in history if m.get("role") != "system"]
-                history.insert(0, {"role": "system", "content": session["system"]})
+                history.insert(0, {"role": "system", "content": active_system})
         else:
-            # If using Modelfile default, strip any injected system prompts from history
+            # If no system prompt is available at all, strip any injected ones
             history[:] = [m for m in history if m.get("role") != "system"]
 
         # ── Auto-index large or binary files when user inputs a local file path ─
