@@ -439,15 +439,31 @@ def find_free_port() -> int:
 def start_web_server():
     """Starts the multi-threaded web server and opens the browser."""
     # Attempt to bind to default port 5005 first, then fall back to random port
+    host = '127.0.0.1'
+    if '--public' in sys.argv:
+        host = '0.0.0.0'
+        
     try:
-        server = ThreadingHTTPServer(('127.0.0.1', 5005), AgentHTTPRequestHandler)
+        server = ThreadingHTTPServer((host, 5005), AgentHTTPRequestHandler)
         port = 5005
     except OSError:
         port = find_free_port()
-        server = ThreadingHTTPServer(('127.0.0.1', port), AgentHTTPRequestHandler)
+        server = ThreadingHTTPServer((host, port), AgentHTTPRequestHandler)
         
     url = f"http://127.0.0.1:{port}"
     print(f"\n🚀 Starting Gemma Agent Web Interface at {url}")
+    
+    if host == '0.0.0.0':
+        local_ip = "127.0.0.1"
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            local_ip = s.getsockname()[0]
+            s.close()
+        except Exception:
+            pass
+        print(f"📡 Accessible across your local network at: http://{local_ip}:{port}")
+        
     print(f"Opening default web browser...\n")
     
     def open_browser():

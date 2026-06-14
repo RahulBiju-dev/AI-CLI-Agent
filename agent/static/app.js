@@ -871,8 +871,8 @@ function handleSSEEvent(event) {
     
     // 2. Thinking phase start
     else if (event.type === 'thinking_start') {
-        // If we already have a bubble, create a new container in it. Otherwise, create a new assistant block.
         const body = getOrCreateAssistantBodyElement();
+        state.currentAssistantThinkingText = '';
         state.currentThinkingBox = createThinkingBoxElement('', true);
         body.appendChild(state.currentThinkingBox);
         scrollToBottom();
@@ -1007,16 +1007,14 @@ function updateSendButtonState() {
     
     if (state.isGenerating) {
         sendBtn.disabled = false;
-        sendBtn.innerHTML = '<i data-lucide="square"></i>';
+        sendBtn.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" class="lucide-icon"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect></svg>';
         sendBtn.classList.add('stop-btn');
         sendBtn.title = 'Stop generation';
     } else {
         const hasText = userInput && userInput.value.trim();
         sendBtn.disabled = !hasText;
-        sendBtn.innerHTML = '<i data-lucide="send"></i>';
+        sendBtn.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" class="lucide-icon"><line x1="22" y1="2" x2="11" y2="13"></line><polygon points="22 2 15 22 11 13 2 9 22 2"></polygon></svg>';
         sendBtn.classList.remove('stop-btn');
         sendBtn.title = 'Send message';
     }
-    
-    if (window.lucide) lucide.createIcons();
 }

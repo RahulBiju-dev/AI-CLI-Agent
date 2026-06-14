@@ -21,12 +21,17 @@
     --accent-amber: #b7791f;     /* Muted amber for warnings */
     --accent-red: #c53030;       /* Softer red for errors */
     
-    --font-sans: 'Outfit', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    --font-sans: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
     --font-mono: 'JetBrains Mono', "SFMono-Regular", Consolas, monospace;
     
     --shadow-neon: 0 4px 15px rgba(26, 54, 93, 0.1);
     --shadow-heavy: 0 10px 30px rgba(62, 49, 36, 0.15);
     --transition-smooth: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+::selection {
+    background-color: rgba(26, 54, 93, 0.15);
+    color: var(--text-primary);
 }
 
 /* ── Reset & Base Styles ────────────────────────────────────────────── */
@@ -40,6 +45,7 @@ body {
     background-color: var(--bg-primary);
     color: var(--text-primary);
     font-family: var(--font-sans);
+    font-weight: 500;
     height: 100vh;
     overflow: hidden;
     line-height: 1.5;
@@ -188,9 +194,10 @@ body {
 }
 
 .tab-btn.active {
-    background-color: var(--bg-elevated);
+    background-color: rgba(26, 54, 93, 0.1);
     color: var(--accent-cyan);
-    box-shadow: 0 2px 4px rgba(62, 49, 36, 0.05);
+    font-weight: 700;
+    box-shadow: inset 0 1px 2px rgba(26, 54, 93, 0.05);
 }
 
 .tab-content {
@@ -696,7 +703,7 @@ input:checked + .switch-slider:before {
 .message {
     display: flex;
     gap: 16px;
-    max-width: 820px;
+    max-width: 1180px;
     width: 100%;
     margin: 0 auto;
     animation: slideUp 0.3s ease-out;
@@ -744,7 +751,7 @@ input:checked + .switch-slider:before {
 .message-bubble {
     padding: 14px 18px;
     border-radius: 12px;
-    font-size: 0.95rem;
+    font-size: 1.05rem;
     line-height: 1.6;
     word-break: break-word;
 }
@@ -776,7 +783,7 @@ input:checked + .switch-slider:before {
     border-radius: 4px;
 }
 .message-bubble pre {
-    background-color: var(--bg-primary);
+    background-color: var(--bg-elevated);
     border: 1px solid var(--border-color);
     border-radius: 8px;
     padding: 16px;
@@ -806,8 +813,8 @@ input:checked + .switch-slider:before {
 .thinking-box {
     width: 100%;
     margin-bottom: 14px;
-    border-left: 2px solid rgba(217, 70, 239, 0.3); /* Magenta highlight */
-    background: rgba(217, 70, 239, 0.02);
+    border-left: 3px solid var(--accent-cyan); /* Ink Blue highlight */
+    background: rgba(26, 54, 93, 0.05); /* Soft Ink Blue background */
     border-radius: 0 8px 8px 0;
     overflow: hidden;
     transition: var(--transition-smooth);
@@ -821,12 +828,12 @@ input:checked + .switch-slider:before {
     cursor: pointer;
     user-select: none;
     font-size: 0.8rem;
-    color: var(--accent-magenta);
+    color: var(--accent-cyan); /* Ink Blue */
     font-weight: 600;
 }
 
 .thinking-header:hover {
-    background-color: rgba(217, 70, 239, 0.04);
+    background-color: rgba(26, 54, 93, 0.08);
 }
 
 .thinking-title {
@@ -849,7 +856,7 @@ input:checked + .switch-slider:before {
     font-size: 0.8rem;
     color: var(--text-secondary);
     white-space: pre-wrap;
-    border-top: 1px solid rgba(217, 70, 239, 0.08);
+    border-top: 1px solid rgba(26, 54, 93, 0.1);
 }
 
 .thinking-box.collapsed .thinking-content {
@@ -866,7 +873,7 @@ input:checked + .switch-slider:before {
 .thinking-dot {
     width: 6px;
     height: 6px;
-    background-color: var(--accent-magenta);
+    background-color: var(--accent-cyan);
     border-radius: 50%;
     animation: pulse 1.2s infinite;
 }
@@ -962,7 +969,7 @@ input:checked + .switch-slider:before {
 }
 
 .input-wrapper {
-    max-width: 820px;
+    max-width: 1180px;
     margin: 0 auto;
     background-color: var(--bg-elevated);
     border: 1px solid var(--border-color);
@@ -991,6 +998,11 @@ input:checked + .switch-slider:before {
     padding: 10px 4px;
     max-height: 200px;
     line-height: 1.4;
+    scrollbar-width: none; /* Hide scrollbar Firefox */
+}
+
+.chat-input::-webkit-scrollbar {
+    display: none; /* Hide scrollbar Webkit */
 }
 
 .send-btn {
@@ -1029,7 +1041,7 @@ input:checked + .switch-slider:before {
 }
 
 .input-footer {
-    max-width: 820px;
+    max-width: 1180px;
     margin: 8px auto 0 auto;
     text-align: center;
     font-size: 0.75rem;
