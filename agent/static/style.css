@@ -1198,9 +1198,10 @@ input:checked + .switch-slider:before {
         left: -320px;
         top: 0;
         bottom: 0;
+        margin-left: 0;
     }
     
-    .sidebar.active {
+    .sidebar:not(.collapsed) {
         left: 0;
     }
     

@@ -55,10 +55,10 @@ function initEventListeners() {
     const sidebar = document.getElementById('sidebar');
     
     if (menuToggle && sidebar) {
-        menuToggle.addEventListener('click', () => sidebar.classList.add('active'));
+        menuToggle.addEventListener('click', () => sidebar.classList.toggle('collapsed'));
     }
     if (closeSidebar && sidebar) {
-        closeSidebar.addEventListener('click', () => sidebar.classList.remove('active'));
+        closeSidebar.addEventListener('click', () => sidebar.classList.add('collapsed'));
     }
     
     // Parameter Sliders
@@ -419,7 +419,7 @@ async function loadSavedSession(filename) {
         if (data.status === 'success') {
             loadSessionState();
             // Close mobile sidebar if open
-            document.getElementById('sidebar').classList.remove('active');
+            document.getElementById('sidebar').classList.add('collapsed');
         } else {
             alert('Failed to load session: ' + data.error);
         }
