@@ -692,8 +692,16 @@ input:checked + .switch-slider:before {
 }
 
 .message.assistant .message-avatar {
-    background-color: var(--ink-primary);
+    background-color: transparent;
     color: var(--bg-paper);
+}
+
+.message-avatar img {
+    width: 100%;
+    height: 100%;
+    border-radius: 50%;
+    object-fit: cover;
+    display: block;
 }
 
 .message-body {

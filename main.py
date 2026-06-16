@@ -34,7 +34,7 @@ def main() -> None:
             run()
         else:
             from agent.web import start_web_server
-            start_web_server()
+            start_web_server() 
     except KeyboardInterrupt:
         _console.print("\n[dim]Interrupted — goodbye.[/]")
         sys.exit(0)

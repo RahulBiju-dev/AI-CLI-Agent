@@ -547,7 +547,7 @@ function appendAssistantMessage(msgData, animate = true) {
     
     const avatar = document.createElement('div');
     avatar.className = 'message-avatar';
-    avatar.textContent = 'S';
+    avatar.innerHTML = '<img src="/avatar.png" alt="S">';
     msg.appendChild(avatar);
     
     const body = document.createElement('div');
@@ -650,8 +650,7 @@ function escapeHtml(str) {
 }
 
 function scrollToBottom() {
-    const container = document.getElementById('chat-messages');
-    if (container) container.scrollTop = container.scrollHeight;
+    // Autoscroll disabled per user request
 }
 
 function addCopyButtons(container) {
@@ -835,7 +834,7 @@ function getOrCreateAssistantBodyElement() {
     
     const avatar = document.createElement('div');
     avatar.className = 'message-avatar';
-    avatar.textContent = 'S';
+    avatar.innerHTML = '<img src="/avatar.png" alt="S">';
     msg.appendChild(avatar);
     
     const body = document.createElement('div');

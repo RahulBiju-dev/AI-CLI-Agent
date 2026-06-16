@@ -717,9 +717,12 @@ class AgentHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
             self.send_json_response(200, response_data)
             return
             
-        elif self.path == '/favicon.ico':
-            self.send_response(204)
-            self.end_headers()
+        elif self.path == '/favicon.ico' or self.path == '/favicon.png':
+            self.serve_static_file('favicon.png', 'image/png')
+            return
+            
+        elif self.path == '/avatar.png':
+            self.serve_static_file('avatar.png', 'image/png')
             return
             
         else:
