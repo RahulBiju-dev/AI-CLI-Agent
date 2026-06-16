@@ -455,7 +455,7 @@ function renderHistory() {
         else appendAssistantMessage(msg, false);
     });
     
-    scrollToBottom();
+    scrollToBottom(true);
 }
 
 function renderWelcomeScreen(container) {
@@ -534,7 +534,7 @@ function appendUserMessage(content, animate = true) {
         </div>
     `;
     container.appendChild(msg);
-    if (animate) scrollToBottom();
+    if (animate) scrollToBottom(true);
 }
 
 function appendAssistantMessage(msgData, animate = true) {
@@ -577,7 +577,7 @@ function appendAssistantMessage(msgData, animate = true) {
     container.appendChild(msg);
     addCopyButtons(bubble);
     
-    if (animate) scrollToBottom();
+    if (animate) scrollToBottom(true);
 }
 
 function createThinkingBoxElement(text, isStreaming = false) {
@@ -649,8 +649,21 @@ function escapeHtml(str) {
     return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
-function scrollToBottom() {
-    // Autoscroll disabled per user request
+function scrollToBottom(force = false) {
+    const container = document.getElementById('chat-messages');
+    if (!container) return;
+    
+    if (force) {
+        container.scrollTop = container.scrollHeight;
+        return;
+    }
+    
+    // Smart scroll: only scroll if the user is already near the bottom (within 100px)
+    const threshold = 100;
+    const isNearBottom = container.scrollHeight - container.scrollTop - container.clientHeight <= threshold;
+    if (isNearBottom) {
+        container.scrollTop = container.scrollHeight;
+    }
 }
 
 function addCopyButtons(container) {
