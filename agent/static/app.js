@@ -130,9 +130,37 @@ function initEventListeners() {
             userInput.style.height = 'auto';
             userInput.style.height = (userInput.scrollHeight) + 'px';
             updateSendButtonState();
+            showAutocomplete(userInput.value);
         });
         
         userInput.addEventListener('keydown', (e) => {
+            const popup = document.getElementById('autocomplete-popup');
+            const isPopupVisible = popup && popup.style.display === 'block';
+            
+            if (isPopupVisible) {
+                if (e.key === 'ArrowDown') {
+                    e.preventDefault();
+                    activeAutocompleteIndex = (activeAutocompleteIndex + 1) % filteredCommands.length;
+                    renderAutocompleteItems();
+                    return;
+                } else if (e.key === 'ArrowUp') {
+                    e.preventDefault();
+                    activeAutocompleteIndex = (activeAutocompleteIndex - 1 + filteredCommands.length) % filteredCommands.length;
+                    renderAutocompleteItems();
+                    return;
+                } else if (e.key === 'Tab' || e.key === 'Enter') {
+                    e.preventDefault();
+                    if (activeAutocompleteIndex >= 0 && activeAutocompleteIndex < filteredCommands.length) {
+                        selectAutocompleteItem(filteredCommands[activeAutocompleteIndex]);
+                    }
+                    return;
+                } else if (e.key === 'Escape') {
+                    e.preventDefault();
+                    hideAutocomplete();
+                    return;
+                }
+            }
+            
             if (e.key === 'Enter' && !e.shiftKey) {
                 e.preventDefault();
                 if (!state.isGenerating) {
@@ -164,6 +192,15 @@ function initEventListeners() {
     // Modals
     setupModal('save-session-btn', 'save-modal');
     setupModal('help-btn', 'help-modal');
+    
+    // Close autocomplete on click outside
+    document.addEventListener('click', (e) => {
+        const popup = document.getElementById('autocomplete-popup');
+        const userInputEl = document.getElementById('user-input');
+        if (popup && e.target !== popup && e.target !== userInputEl && !popup.contains(e.target)) {
+            hideAutocomplete();
+        }
+    });
     
     const confirmSaveBtn = document.getElementById('confirm-save-btn');
     const sessionNameInput = document.getElementById('save-session-name');
@@ -866,3 +903,127 @@ function updateSendButtonState() {
     }
     if (window.lucide) lucide.createIcons();
 }
+
+// ── Autocomplete Functionality ───────────────────────────────────────
+const SLASH_COMMANDS = [
+    { cmd: '/help', usage: '', desc: 'Show help menu' },
+    { cmd: '/clear', usage: '', desc: 'Clear history & system override' },
+    { cmd: '/save', usage: '[name]', desc: 'Save current session file' },
+    { cmd: '/load', usage: '[name|index]', desc: 'Load a saved session file' },
+    { cmd: '/set parameter', usage: '<name> <val>', desc: 'Set parameter (e.g. temperature 0.7)' },
+    { cmd: '/set system', usage: '"<prompt>"', desc: 'Set custom system prompt override' },
+    { cmd: '/set history', usage: '', desc: 'Enable conversation history (default)' },
+    { cmd: '/set nohistory', usage: '', desc: 'Disable conversation history' },
+    { cmd: '/set wordwrap', usage: '', desc: 'Enable word wrapping (default)' },
+    { cmd: '/set nowordwrap', usage: '', desc: 'Disable word wrapping' },
+    { cmd: '/set format json', usage: '', desc: 'Force JSON output from the model' },
+    { cmd: '/set noformat', usage: '', desc: 'Disable forced output format (default)' },
+    { cmd: '/set verbose', usage: '', desc: 'Show generation stats after each response' },
+    { cmd: '/set quiet', usage: '', desc: 'Hide generation stats (default)' },
+    { cmd: '/set think', usage: '', desc: 'Enable model thinking/reasoning (default)' },
+    { cmd: '/set nothink', usage: '', desc: 'Disable model thinking' },
+    { cmd: '/show parameters', usage: '', desc: 'Show current session parameters' },
+    { cmd: '/show system', usage: '', desc: 'Show the active system prompt' },
+    { cmd: '/show model', usage: '', desc: 'Show model info' },
+    { cmd: '/vault list', usage: '', desc: 'List indexed vaults' },
+    { cmd: '/vault aliases', usage: '', desc: 'List registered vault aliases' },
+    { cmd: '/vault alias', usage: '<name> <coll>', desc: 'Register friendly alias for a collection' },
+    { cmd: '/vault rename', usage: '<old> <new>', desc: 'Rename a vault collection' },
+    { cmd: '/vault add', usage: '<path>', desc: 'Index folder/file to searchable vault' },
+    { cmd: '/vault search', usage: '<query>', desc: 'Search indexed content' },
+    { cmd: '/vault delete', usage: '<source>', desc: 'Delete indexed chunks' },
+    { cmd: '/quit', usage: '', desc: 'Exit the agent session' },
+    { cmd: '/exit', usage: '', desc: 'Exit the agent session' },
+    { cmd: '/q', usage: '', desc: 'Exit the agent session' }
+];
+
+let activeAutocompleteIndex = -1;
+let filteredCommands = [];
+
+function showAutocomplete(filterText) {
+    const popup = document.getElementById('autocomplete-popup');
+    if (!popup) return;
+    
+    if (!filterText.startsWith('/')) {
+        hideAutocomplete();
+        return;
+    }
+    
+    const query = filterText.toLowerCase();
+    filteredCommands = SLASH_COMMANDS.filter(item => {
+        return item.cmd.toLowerCase().startsWith(query);
+    });
+    
+    if (filteredCommands.length === 0) {
+        hideAutocomplete();
+        return;
+    }
+    
+    activeAutocompleteIndex = 0;
+    renderAutocompleteItems();
+    popup.style.display = 'block';
+}
+
+function hideAutocomplete() {
+    const popup = document.getElementById('autocomplete-popup');
+    if (popup) {
+        popup.style.display = 'none';
+        popup.innerHTML = '';
+    }
+    filteredCommands = [];
+    activeAutocompleteIndex = -1;
+}
+
+function renderAutocompleteItems() {
+    const popup = document.getElementById('autocomplete-popup');
+    if (!popup) return;
+    
+    popup.innerHTML = '';
+    filteredCommands.forEach((item, index) => {
+        const div = document.createElement('div');
+        div.className = 'autocomplete-item' + (index === activeAutocompleteIndex ? ' active' : '');
+        
+        const cmdSpan = document.createElement('span');
+        cmdSpan.className = 'autocomplete-cmd';
+        cmdSpan.textContent = item.cmd;
+        
+        const usageSpan = document.createElement('span');
+        usageSpan.className = 'autocomplete-usage';
+        usageSpan.textContent = item.usage ? ' ' + item.usage : '';
+        
+        const descSpan = document.createElement('span');
+        descSpan.className = 'autocomplete-desc';
+        descSpan.textContent = `— ${item.desc}`;
+        
+        div.appendChild(cmdSpan);
+        div.appendChild(usageSpan);
+        div.appendChild(descSpan);
+        
+        div.addEventListener('click', () => {
+            selectAutocompleteItem(item);
+        });
+        
+        popup.appendChild(div);
+    });
+    
+    const activeItem = popup.children[activeAutocompleteIndex];
+    if (activeItem) {
+        activeItem.scrollIntoView({ block: 'nearest' });
+    }
+}
+
+function selectAutocompleteItem(item) {
+    const userInput = document.getElementById('user-input');
+    if (!userInput) return;
+    
+    const suffix = item.usage ? ' ' : '';
+    userInput.value = item.cmd + suffix;
+    
+    hideAutocomplete();
+    userInput.focus();
+    
+    userInput.style.height = 'auto';
+    userInput.style.height = userInput.scrollHeight + 'px';
+    updateSendButtonState();
+}
+

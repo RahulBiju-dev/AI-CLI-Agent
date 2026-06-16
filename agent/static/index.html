@@ -162,6 +162,9 @@
             </div>
             
             <div class="input-container">
+                <!-- Autocomplete Popup -->
+                <div id="autocomplete-popup" class="autocomplete-popup"></div>
+                
                 <div class="input-wrapper">
                     <textarea id="user-input" class="chat-input" placeholder="Message Selene..." rows="1"></textarea>
                     <button id="send-btn" class="send-btn" disabled>
@@ -215,11 +218,73 @@
                 </div>
                 <div class="help-section" style="margin-top: 16px;">
                     <h4>Slash Commands</h4>
-                    <div class="help-list">
-                        <span><code>/help</code> - Show this menu</span>
-                        <span><code>/clear</code> - Clear current history</span>
-                        <span><code>/vault list</code> - List indexed vaults</span>
-                        <span><code>/vault add &lt;path&gt;</code> - Index a folder/file</span>
+                    <div class="help-commands-container" style="max-height: 200px; overflow-y: auto; border: 1px solid var(--border-color); border-radius: 8px; padding: 8px; background-color: var(--bg-paper);">
+                        <table class="help-table" style="width: 100%; border-collapse: collapse; text-align: left; font-size: 0.85rem;">
+                            <thead>
+                                <tr style="border-bottom: 1px solid var(--border-color);">
+                                    <th style="padding: 6px;">Command</th>
+                                    <th style="padding: 6px;">Description</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <tr>
+                                    <td style="padding: 6px; font-family: var(--font-mono); color: var(--ink-primary); font-weight: bold;">/help</td>
+                                    <td style="padding: 6px;">Show this help menu</td>
+                                </tr>
+                                <tr>
+                                    <td style="padding: 6px; font-family: var(--font-mono); color: var(--ink-primary); font-weight: bold;">/clear</td>
+                                    <td style="padding: 6px;">Clear history & system override</td>
+                                </tr>
+                                <tr>
+                                    <td style="padding: 6px; font-family: var(--font-mono); color: var(--ink-primary); font-weight: bold;">/save [name]</td>
+                                    <td style="padding: 6px;">Save current session file</td>
+                                </tr>
+                                <tr>
+                                    <td style="padding: 6px; font-family: var(--font-mono); color: var(--ink-primary); font-weight: bold;">/load [name]</td>
+                                    <td style="padding: 6px;">Load a saved session file</td>
+                                </tr>
+                                <tr>
+                                    <td style="padding: 6px; font-family: var(--font-mono); color: var(--ink-primary); font-weight: bold;">/set parameter &lt;n&gt; &lt;v&gt;</td>
+                                    <td style="padding: 6px;">Set parameter (e.g. temperature 0.7)</td>
+                                </tr>
+                                <tr>
+                                    <td style="padding: 6px; font-family: var(--font-mono); color: var(--ink-primary); font-weight: bold;">/set system &lt;prompt&gt;</td>
+                                    <td style="padding: 6px;">Set custom system prompt override</td>
+                                </tr>
+                                <tr>
+                                    <td style="padding: 6px; font-family: var(--font-mono); color: var(--ink-primary); font-weight: bold;">/set history / nohistory</td>
+                                    <td style="padding: 6px;">Enable/disable conversation history</td>
+                                </tr>
+                                <tr>
+                                    <td style="padding: 6px; font-family: var(--font-mono); color: var(--ink-primary); font-weight: bold;">/set think / nothink</td>
+                                    <td style="padding: 6px;">Enable/disable model thinking process</td>
+                                </tr>
+                                <tr>
+                                    <td style="padding: 6px; font-family: var(--font-mono); color: var(--ink-primary); font-weight: bold;">/show parameters / system</td>
+                                    <td style="padding: 6px;">Show current parameters/prompt</td>
+                                </tr>
+                                <tr>
+                                    <td style="padding: 6px; font-family: var(--font-mono); color: var(--ink-primary); font-weight: bold;">/vault list / aliases</td>
+                                    <td style="padding: 6px;">List indexed vaults or registered aliases</td>
+                                </tr>
+                                <tr>
+                                    <td style="padding: 6px; font-family: var(--font-mono); color: var(--ink-primary); font-weight: bold;">/vault add &lt;path&gt;</td>
+                                    <td style="padding: 6px;">Index file or folder to searchable vault</td>
+                                </tr>
+                                <tr>
+                                    <td style="padding: 6px; font-family: var(--font-mono); color: var(--ink-primary); font-weight: bold;">/vault search &lt;query&gt;</td>
+                                    <td style="padding: 6px;">Search indexed content</td>
+                                </tr>
+                                <tr>
+                                    <td style="padding: 6px; font-family: var(--font-mono); color: var(--ink-primary); font-weight: bold;">/vault delete &lt;source&gt;</td>
+                                    <td style="padding: 6px;">Remove source from indexed vaults</td>
+                                </tr>
+                                <tr>
+                                    <td style="padding: 6px; font-family: var(--font-mono); color: var(--ink-primary); font-weight: bold;">/quit / /exit</td>
+                                    <td style="padding: 6px;">Exit the agent session</td>
+                                </tr>
+                            </tbody>
+                        </table>
                     </div>
                 </div>
             </div>
