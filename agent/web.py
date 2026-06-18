@@ -557,12 +557,19 @@ def generate_chat_events(user_input: str, session_data: dict, history_data: list
         tool_calls = []
         in_thinking = False
         thinking_started = False
+        prompt_tokens = 0
+        eval_tokens = 0
         
         for chunk in stream:
             msg = chunk.message
             
+            if getattr(chunk, "prompt_eval_count", None):
+                prompt_tokens = chunk.prompt_eval_count
+            if getattr(chunk, "eval_count", None):
+                eval_tokens = chunk.eval_count
+            
             # Intercept tool calls
-            if msg.tool_calls:
+            if getattr(msg, "tool_calls", None):
                 tool_calls = [
                     {"function": {"name": tc.function.name, "arguments": tc.function.arguments}}
                     for tc in msg.tool_calls
@@ -581,7 +588,7 @@ def generate_chat_events(user_input: str, session_data: dict, history_data: list
                 continue
                 
             # Stream final content text
-            content_chunk = msg.content or ""
+            content_chunk = getattr(msg, "content", None) or ""
             if content_chunk:
                 if in_thinking:
                     in_thinking = False
@@ -591,6 +598,14 @@ def generate_chat_events(user_input: str, session_data: dict, history_data: list
                 
         if in_thinking:
             yield {"type": "thinking_end"}
+            
+        # Send token usage if available
+        if prompt_tokens or eval_tokens:
+            yield {
+                "type": "token_usage", 
+                "total": prompt_tokens + eval_tokens,
+                "budget": 8192
+            }
             
         # Compile assistant message
         assistant_msg = {"role": "assistant", "content": content_buf}

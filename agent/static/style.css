@@ -1023,6 +1023,28 @@ input:checked + .switch-slider:before {
     flex-shrink: 0;
 }
 
+.token-usage {
+    position: absolute;
+    bottom: 22px;
+    right: 70px;
+    font-size: 0.75rem;
+    font-family: var(--font-mono);
+    color: var(--text-muted);
+    opacity: 0.5;
+    pointer-events: none;
+    transition: color 0.3s ease, opacity 0.3s ease;
+}
+
+.token-usage.warning {
+    color: var(--accent-amber);
+    opacity: 0.9;
+}
+
+.token-usage.danger {
+    color: var(--accent-red);
+    opacity: 1;
+}
+
 .send-btn.stop-btn {
     background-color: var(--accent-red);
 }

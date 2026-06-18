@@ -831,6 +831,21 @@ function handleSSEEvent(event) {
         state.currentAssistantText = '';
         scrollToBottom();
     }
+    else if (event.type === 'token_usage') {
+        const usageDiv = document.getElementById('token-usage');
+        if (usageDiv) {
+            const pct = event.total / event.budget;
+            usageDiv.textContent = `${event.total} / ${event.budget} ctx`;
+            usageDiv.style.display = 'block';
+            
+            usageDiv.className = 'token-usage';
+            if (pct >= 1.0) {
+                usageDiv.classList.add('danger');
+            } else if (pct >= 0.9) {
+                usageDiv.classList.add('warning');
+            }
+        }
+    }
     else if (event.type === 'done') {
         finishGeneration(false);
     }

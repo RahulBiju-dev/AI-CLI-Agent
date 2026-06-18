@@ -166,8 +166,9 @@
                 <!-- Autocomplete Popup -->
                 <div id="autocomplete-popup" class="autocomplete-popup"></div>
                 
-                <div class="input-wrapper">
+                <div class="input-wrapper" style="position: relative;">
                     <textarea id="user-input" class="chat-input" placeholder="Message Selene..." rows="1"></textarea>
+                    <div id="token-usage" class="token-usage" style="display: none;">0 / 8192 tokens</div>
                     <button id="send-btn" class="send-btn" disabled>
                         <i data-lucide="arrow-up" style="width: 18px; height: 18px;"></i>
                     </button>
