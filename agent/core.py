@@ -15,8 +15,13 @@ from agent.terminal import (
     _console,
     _print_status,
     _Spinner,
-    _render_terminal_markdown,
+    assistant_stream_panel,
+    flush_terminal_input,
+    print_assistant_message,
+    print_thinking_footer,
+    print_thinking_header,
     print_welcome_header,
+    read_user_input,
 )
 
 import signal
@@ -31,7 +36,6 @@ except ImportError:
     pass
 
 import ollama
-from rich.markdown import Markdown
 from rich.live import Live
 
 from tools.registry import TOOL_DISPATCH, TOOL_SCHEMAS
@@ -190,9 +194,7 @@ def _stream_thinking_response(
                 spinner.stop()
                 if in_thinking:
                     in_thinking = False
-                    _console.print(
-                f"\n[magenta][dim]└─ [Interrupted] ────────────────────────[/]\n",
-                    )
+                    print_thinking_footer("interrupted")
                 _console.print(f"\n[yellow]⚠ Generation interrupted by user (Ctrl+\\).[/]\n")
                 break
             
@@ -217,10 +219,7 @@ def _stream_thinking_response(
                 if not in_thinking:
                     in_thinking = True
                     spinner.stop()
-                    # Print thinking header
-                    _console.print(
-                f"\n[magenta][dim]┌─ thinking ─────────────────────────────[/]",
-                    )
+                    print_thinking_header()
                     thinking_displayed = True
 
                 thinking_buf += thinking_chunk
@@ -235,9 +234,7 @@ def _stream_thinking_response(
                 if in_thinking:
                     # Transition from thinking to answering
                     in_thinking = False
-                    _console.print(
-                f"\n[magenta][dim]└────────────────────────────────────────[/]\n",
-                    )
+                    print_thinking_footer()
                     spinner.stop()
                 elif spinner._thread and not spinner._stop_event.is_set():
                     spinner.stop()
@@ -249,10 +246,11 @@ def _stream_thinking_response(
                 # Initialize Live display on the first content chunk
                 if live is None:
                     live = Live(
-                        Markdown(_render_terminal_markdown(content_buf)),
+                        assistant_stream_panel(content_buf),
                         console=_console,
                         auto_refresh=False,
-                        screen=True,
+                        screen=False,
+                        transient=True,
                         vertical_overflow="visible",
                     )
                     live.start()
@@ -261,28 +259,26 @@ def _stream_thinking_response(
                 now = time.monotonic()
                 if now - _last_render >= _RENDER_INTERVAL:
                     # Update Markdown rendering in real-time
-                    live.update(Markdown(_render_terminal_markdown(content_buf)), refresh=True)
+                    live.update(assistant_stream_panel(content_buf), refresh=True)
                     _last_render = now
 
     finally:
         signal.signal(signal.SIGQUIT, old_handler)
         if live:
             live.stop()
+        flush_terminal_input()
 
     # End of stream
     spinner.stop()
 
     if in_thinking:
         # Stream ended while still in thinking (no content followed)
-        _console.print(
-                f"\n[magenta][dim]└────────────────────────────────────────[/]\n",
-        )
+        print_thinking_footer()
 
     if content_buf:
-        # Print the final complete markdown to the terminal so it remains in the scrollback buffer.
-        # Using screen=True during streaming prevents the scrolling terminal duplication bug entirely.
-        _console.print(Markdown(_render_terminal_markdown(content_buf)))
-        _console.print()  # final newline after streamed answer
+        # Print the final complete markdown to persistent scrollback after the
+        # transient live panel is removed.
+        print_assistant_message(content_buf)
 
     # Verbose stats
     if verbose:
@@ -1134,7 +1130,7 @@ def run() -> None:
     while True:
         # ── User input ────────────────────────────────────────────────
         try:
-            user_input = _console.input("[green bold]>>> [/]").strip()
+            user_input = read_user_input()
         except EOFError:
             break
 
