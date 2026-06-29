@@ -19,7 +19,7 @@ from datetime import datetime, timezone
 import ollama
 
 # Import agent configurations and helpers from core
-from agent.core import MODEL_NAME, _trim_history
+from agent.core import MODEL_NAME, _trim_history, _check_and_compact_history
 from tools.registry import TOOL_DISPATCH, TOOL_SCHEMAS
 
 # Setup directories
@@ -562,7 +562,8 @@ def generate_chat_events(user_input: str, session_data: dict, history_data: list
     # 3. Build messages to send
     if session_data.get("history", True):
         history_data.append({"role": "user", "content": user_input})
-        messages_to_send = _trim_history(history_data)
+        num_ctx = session_data.get("options", {}).get("num_ctx", 8192)
+        messages_to_send = _trim_history(history_data, num_ctx)
     else:
         messages_to_send = []
         if history_data and history_data[0].get("role") == "system":
@@ -660,6 +661,8 @@ def generate_chat_events(user_input: str, session_data: dict, history_data: list
             
         # If there are no tool calls, this turn is completed
         if not tool_calls:
+            if session_data.get("history", True):
+                _check_and_compact_history(history_data, session_data)
             yield {"type": "done", "history": history_data}
             break
             
@@ -696,7 +699,8 @@ def generate_chat_events(user_input: str, session_data: dict, history_data: list
             
         if session_data.get("history", True):
             history_data.extend(tool_results)
-            messages_to_send = _trim_history(history_data)
+            num_ctx = session_data.get("options", {}).get("num_ctx", 8192)
+            messages_to_send = _trim_history(history_data, num_ctx)
         else:
             messages_to_send.append(assistant_msg)
             messages_to_send.extend(tool_results)

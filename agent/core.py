@@ -50,10 +50,7 @@ _ALL_PARAMS = _FLOAT_PARAMS | _INT_PARAMS
 # from agent.terminal to keep terminal logic modular.
 
 # ── History management ────────────────────────────────────────────────
-# Rough token budget for conversation history.
 # Keeps prompt size bounded so tok/s stays consistent across long sessions.
-_HISTORY_TOKEN_BUDGET = 6000  # ~6k tokens ≈ leaves room for response in 8192 ctx
-
 
 def _estimate_tokens(text: str) -> int:
     """Estimate the number of tokens in a string using a fast heuristic.
@@ -87,19 +84,20 @@ def _sigquit_handler(signum, frame):
     _interrupted = True
 
 
-def _trim_history(messages: list[dict], budget: int = _HISTORY_TOKEN_BUDGET) -> list[dict]:
-    """Trim conversation history to fit within a token budget.
+def _trim_history(messages: list[dict], num_ctx: int = 8192) -> list[dict]:
+    """Trim conversation history to fit within a dynamic token budget.
 
     Preserves the system prompt (if any) and the most recent messages.
     Tool messages are kept with their associated assistant message.
     
     Args:
         messages (list[dict]): The full conversation history list.
-        budget (int, optional): The maximum allowed tokens. Defaults to _HISTORY_TOKEN_BUDGET.
+        num_ctx (int, optional): The context window size. Defaults to 8192.
         
     Returns:
-        list[dict]: A trimmed list of messages fitting the budget.
+        list[dict]: A trimmed list of messages fitting the 95% budget.
     """
+    budget = int(num_ctx * 0.95)
     if not messages:
         return messages
 
@@ -134,6 +132,77 @@ def _trim_history(messages: list[dict], budget: int = _HISTORY_TOKEN_BUDGET) -> 
 
     kept.reverse()
     return system_msgs + kept
+
+
+def _compact_history_bg(history: list[dict], session: dict, start_idx: int, end_idx: int) -> None:
+    """Run background summarization and replace older messages."""
+    import ollama
+    messages_to_compact = history[start_idx:end_idx]
+    
+    # We want to format the previous conversation for the LLM to summarize
+    text_to_summarize = ""
+    for msg in messages_to_compact:
+        role = msg.get("role", "unknown")
+        content = msg.get("content", "")
+        text_to_summarize += f"[{role.upper()}]: {content}\n\n"
+        
+    system_prompt = session.get("system", "")
+    if not system_prompt and history and history[0].get("role") == "system":
+        system_prompt = history[0].get("content", "")
+        
+    summarize_prompt = (
+        "Please provide a concise, factual summary of the following conversation history. "
+        "Retain all key context, decisions, and factual information so it can be used "
+        "in place of the full history without losing context.\n\n"
+        f"Conversation:\n{text_to_summarize}"
+    )
+    
+    compact_messages = []
+    if system_prompt:
+        compact_messages.append({"role": "system", "content": system_prompt})
+    compact_messages.append({"role": "user", "content": summarize_prompt})
+    
+    try:
+        response = ollama.chat(
+            model=MODEL_NAME,
+            messages=compact_messages,
+            options=session.get("options", {})
+        )
+        summary = response.message.content or ""
+        if summary:
+            # Safely replace the sublist in the live history.
+            # In Python, list slice assignment is thread-safe due to the GIL.
+            history[start_idx:end_idx] = [
+                {"role": "assistant", "content": f"[System Note: Older conversation compacted]\n{summary}"}
+            ]
+    except Exception as e:
+        # Ignore errors in background compaction to prevent terminal spam
+        pass
+    finally:
+        session["_is_compacting"] = False
+
+
+def _check_and_compact_history(history: list[dict], session: dict) -> None:
+    """Check token usage and trigger background compaction if > 90%."""
+    if session.get("_is_compacting"):
+        return
+        
+    num_ctx = session.get("options", {}).get("num_ctx", 8192)
+    compact_threshold = int(num_ctx * 0.90)
+    
+    total_tokens = sum(_estimate_tokens(m.get("content", "") + m.get("thinking", "")) for m in history)
+    
+    if total_tokens > compact_threshold:
+        # Determine the slice to compact. Keep system prompt (idx 0) and at least the 4 most recent messages (e.g. 2 turns).
+        if len(history) >= 6:
+            start_idx = 1 if history[0].get("role") == "system" else 0
+            end_idx = len(history) - 4
+            if start_idx < end_idx:
+                session["_is_compacting"] = True
+                import threading
+                t = threading.Thread(target=_compact_history_bg, args=(history, session, start_idx, end_idx))
+                t.daemon = True
+                t.start()
 
 def _stream_thinking_response(
     model: str,
@@ -1209,7 +1278,8 @@ def run() -> None:
         if session["history"]:
             history.append({"role": "user", "content": user_input})
             # Trim history to keep prompt size bounded for consistent tok/s
-            messages_to_send = _trim_history(history)
+            num_ctx = session["options"].get("num_ctx", 8192)
+            messages_to_send = _trim_history(history, num_ctx)
         else:
             messages_to_send = []
             if history and history[0].get("role") == "system":
@@ -1240,7 +1310,8 @@ def run() -> None:
             if session["history"]:
                 history.extend(tool_results)
                 # Trim history to keep follow-up requests within token budget
-                messages_to_send = _trim_history(history)
+                num_ctx = session["options"].get("num_ctx", 8192)
+                messages_to_send = _trim_history(history, num_ctx)
             else:
                 messages_to_send.append(assistant_msg)
                 messages_to_send.extend(tool_results)
@@ -1257,3 +1328,7 @@ def run() -> None:
             )
             if session["history"]:
                 history.append(assistant_msg)
+                
+        # ── Trigger automatic history compaction in background ──────
+        if session["history"]:
+            _check_and_compact_history(history, session)
