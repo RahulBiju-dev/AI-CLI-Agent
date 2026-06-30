@@ -1,299 +1,97 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Selene — AI Assistant</title>
-    
-    <!-- Fonts: Literata (Serif) & JetBrains Mono -->
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Literata:opsz,wght@7..72,300;7..72,400;7..72,500;7..72,600;7..72,700&display=swap" rel="stylesheet">
-    
-    <!-- Icons -->
-    <script src="https://unpkg.com/lucide@latest"></script>
-    
-    <!-- Markdown & Syntax Highlighting -->
-    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css">
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
-    
-    <!-- App Styles -->
-    <link rel="icon" type="image/png" href="/favicon.png">
-    <link rel="stylesheet" href="/style.css">
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Selene</title>
+  <meta name="description" content="Selene is a local AI chatbot with thinking and tool-call visibility.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <link rel="icon" href="/favicon.png" type="image/png">
+  <link rel="stylesheet" href="/style.css">
 </head>
 <body>
-    <div class="app-layout">
-        
-        <!-- Sidebar -->
-        <aside id="sidebar" class="sidebar">
-            <div class="sidebar-header">
-                <div class="logo">
-                    <div class="logo-icon">
-                        <!-- Crescent moon SVG -->
-                        <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="color: var(--bg-paper);"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path></svg>
-                    </div>
-                    <div class="logo-text">
-                        <span class="logo-title">SELENE</span>
-                        <span class="logo-subtitle">AI AGENT</span>
-                    </div>
-                </div>
-                <button id="close-sidebar" class="icon-btn close-sidebar-btn" style="display: none;">
-                    <i data-lucide="x"></i>
-                </button>
-            </div>
-            
-            <div class="sidebar-scroll">
-                <div class="sidebar-actions">
-                    <button id="new-chat-btn" class="btn btn-primary">
-                        <i data-lucide="plus" style="width: 16px; height: 16px;"></i> New Conversation
-                    </button>
-                </div>
-                
-                <div class="sidebar-tabs">
-                    <button class="tab-btn active" data-target="tab-sessions">Sessions</button>
-                    <button class="tab-btn" data-target="tab-settings">Settings</button>
-                </div>
-                
-                <!-- Sessions Tab -->
-                <div id="tab-sessions" class="tab-content active">
-                    <div class="sidebar-section">
-                        <div class="section-title">Saved Sessions</div>
-                        <div id="sessions-list" class="sessions-list">
-                            <div class="loading-placeholder">Loading sessions...</div>
-                        </div>
-                    </div>
-                </div>
-                
-                <!-- Settings Tab -->
-                <div id="tab-settings" class="tab-content">
-                    <div class="sidebar-section">
-                        <div class="section-title">Model Parameters</div>
-                        
-                        <div class="setting-item">
-                            <div class="setting-label">
-                                <span>Temperature</span>
-                                <span id="temp-val" class="setting-value">0.4</span>
-                            </div>
-                            <input type="range" id="param-temperature" class="slider" min="0" max="2" step="0.1" value="0.4">
-                        </div>
-                        
-                        <div class="setting-item">
-                            <div class="setting-label">
-                                <span>Top-P</span>
-                                <span id="topp-val" class="setting-value">0.9</span>
-                            </div>
-                            <input type="range" id="param-top_p" class="slider" min="0" max="1" step="0.05" value="0.9">
-                        </div>
-                        
-                        <div class="setting-item">
-                            <div class="setting-label">
-                                <span>Top-K</span>
-                                <span id="topk-val" class="setting-value">40</span>
-                            </div>
-                            <input type="range" id="param-top_k" class="slider" min="1" max="100" step="1" value="40">
-                        </div>
-                    </div>
-                    
-                    <div class="sidebar-section">
-                        <div class="section-title">Behavior</div>
-                        
-                        <div class="setting-item toggle-item">
-                            <div class="setting-details">
-                                <span class="setting-name">Conversation History</span>
-                                <span class="setting-desc">Remember past messages</span>
-                            </div>
-                            <label class="switch">
-                                <input type="checkbox" id="setting-history" checked>
-                                <span class="switch-slider"></span>
-                            </label>
-                        </div>
-                        
-                        <div class="setting-item toggle-item">
-                            <div class="setting-details">
-                                <span class="setting-name">Thinking Process</span>
-                                <span class="setting-desc">Show model reasoning</span>
-                            </div>
-                            <label class="switch">
-                                <input type="checkbox" id="setting-think" checked>
-                                <span class="switch-slider"></span>
-                            </label>
-                        </div>
-                    </div>
-                    
-                    <div class="sidebar-section">
-                        <div class="section-title">System Prompt (Override)</div>
-                        <textarea id="system-prompt" class="textarea-prompt" placeholder="Leave blank to use default Selene persona..."></textarea>
-                        <button id="apply-prompt-btn" class="btn btn-secondary btn-sm">Apply Changes</button>
-                    </div>
-                </div>
-            </div>
-            
-            <div class="sidebar-footer">
-                <button id="save-session-btn" class="btn btn-secondary btn-sm" style="width: 100%; margin-bottom: 12px;">
-                    <i data-lucide="save" style="width: 14px; height: 14px;"></i> Save Session
-                </button>
-                <div>Selene AI Agent v1.0</div>
-            </div>
-        </aside>
-        
-        <!-- Main Content -->
-        <main class="main-content">
-            <nav class="navbar">
-                <div class="nav-left">
-                    <button id="menu-toggle" class="icon-btn menu-btn" title="Toggle Sidebar">
-                        <i data-lucide="menu"></i>
-                    </button>
-                </div>
-                <div class="nav-right">
-                    <div class="status-indicator" title="Ollama Status: Checking...">
-                        <div class="status-dot online"></div>
-                    </div>
-                    <button id="help-btn" class="icon-btn" title="Help">
-                        <i data-lucide="help-circle"></i>
-                    </button>
-                    <button id="clear-history-btn" class="icon-btn" title="Clear History">
-                        <i data-lucide="trash-2"></i>
-                    </button>
-                </div>
-            </nav>
-            
-            <div id="chat-messages" class="chat-messages">
-                <!-- Welcome Screen / Messages will be injected here -->
-            </div>
-            
-            <div class="input-container">
-                <!-- Autocomplete Popup -->
-                <div id="autocomplete-popup" class="autocomplete-popup"></div>
-                
-                <div class="input-wrapper" style="position: relative;">
-                    <textarea id="user-input" class="chat-input" placeholder="Message Selene..." rows="1"></textarea>
-                    <div id="token-usage" class="token-usage" style="display: none;">0 / 8192 tokens</div>
-                    <button id="send-btn" class="send-btn" disabled>
-                        <i data-lucide="arrow-up" style="width: 18px; height: 18px;"></i>
-                    </button>
-                </div>
-                <div class="input-footer">
-                    Press <kbd>Enter</kbd> to send, <kbd>Shift</kbd> + <kbd>Enter</kbd> for new line. Type <kbd>/</kbd> for commands.
-                </div>
-            </div>
-        </main>
-        
-    </div>
+  <div class="sky" aria-hidden="true">
+    <span class="moon"></span>
+    <span class="star star-a"></span>
+    <span class="star star-b"></span>
+    <span class="star star-c"></span>
+  </div>
 
-    <!-- Modals -->
-    <div id="save-modal" class="modal-overlay">
-        <div class="modal">
-            <div class="modal-header">
-                <h3>Save Session</h3>
-                <button class="icon-btn close-modal-btn"><i data-lucide="x"></i></button>
-            </div>
-            <div class="modal-body">
-                <p>Enter a name for this conversation to save it for later.</p>
-                <input type="text" id="save-session-name" class="modal-input" placeholder="e.g., Project Planning">
-            </div>
-            <div class="modal-footer">
-                <button class="btn btn-secondary close-modal-btn">Cancel</button>
-                <button id="confirm-save-btn" class="btn btn-primary">Save</button>
-            </div>
+  <div class="app-shell">
+    <aside class="sidebar" aria-label="Selene workspace">
+      <header class="brand">
+        <img class="brand-mark" src="/avatar.png" alt="Selene avatar">
+        <div>
+          <h1>Selene</h1>
         </div>
-    </div>
-    
-    <div id="help-modal" class="modal-overlay">
-        <div class="modal">
-            <div class="modal-header">
-                <h3>Agent Commands</h3>
-                <button class="icon-btn close-modal-btn"><i data-lucide="x"></i></button>
-            </div>
-            <div class="modal-body">
-                <div class="help-section">
-                    <h4>Available Tools</h4>
-                    <div class="help-list">
-                        <span>🔍 Web Search (DuckDuckGo)</span>
-                        <span>📄 Read Documents (PDF, DOCX, TXT)</span>
-                        <span>💻 View Source Code</span>
-                        <span>🌐 Open Browser URLs</span>
-                        <span>🎵 Control Spotify Playback</span>
-                        <span>📚 Search Indexed Vaults (RAG)</span>
-                        <span>📝 Create Files & Obsidian Notes</span>
-                    </div>
-                </div>
-                <div class="help-section" style="margin-top: 16px;">
-                    <h4>Slash Commands</h4>
-                    <div class="help-commands-container" style="max-height: 200px; overflow-y: auto; border: 1px solid var(--border-color); border-radius: 8px; padding: 8px; background-color: var(--bg-paper);">
-                        <table class="help-table" style="width: 100%; border-collapse: collapse; text-align: left; font-size: 0.85rem;">
-                            <thead>
-                                <tr style="border-bottom: 1px solid var(--border-color);">
-                                    <th style="padding: 6px;">Command</th>
-                                    <th style="padding: 6px;">Description</th>
-                                </tr>
-                            </thead>
-                            <tbody>
-                                <tr>
-                                    <td style="padding: 6px; font-family: var(--font-mono); color: var(--ink-primary); font-weight: bold;">/help</td>
-                                    <td style="padding: 6px;">Show this help menu</td>
-                                </tr>
-                                <tr>
-                                    <td style="padding: 6px; font-family: var(--font-mono); color: var(--ink-primary); font-weight: bold;">/clear</td>
-                                    <td style="padding: 6px;">Clear history & system override</td>
-                                </tr>
-                                <tr>
-                                    <td style="padding: 6px; font-family: var(--font-mono); color: var(--ink-primary); font-weight: bold;">/save [name]</td>
-                                    <td style="padding: 6px;">Save current session file</td>
-                                </tr>
-                                <tr>
-                                    <td style="padding: 6px; font-family: var(--font-mono); color: var(--ink-primary); font-weight: bold;">/load [name]</td>
-                                    <td style="padding: 6px;">Load a saved session file</td>
-                                </tr>
-                                <tr>
-                                    <td style="padding: 6px; font-family: var(--font-mono); color: var(--ink-primary); font-weight: bold;">/set parameter &lt;n&gt; &lt;v&gt;</td>
-                                    <td style="padding: 6px;">Set parameter (e.g. temperature 0.7)</td>
-                                </tr>
-                                <tr>
-                                    <td style="padding: 6px; font-family: var(--font-mono); color: var(--ink-primary); font-weight: bold;">/set system &lt;prompt&gt;</td>
-                                    <td style="padding: 6px;">Set custom system prompt override</td>
-                                </tr>
-                                <tr>
-                                    <td style="padding: 6px; font-family: var(--font-mono); color: var(--ink-primary); font-weight: bold;">/set history / nohistory</td>
-                                    <td style="padding: 6px;">Enable/disable conversation history</td>
-                                </tr>
-                                <tr>
-                                    <td style="padding: 6px; font-family: var(--font-mono); color: var(--ink-primary); font-weight: bold;">/set think / nothink</td>
-                                    <td style="padding: 6px;">Enable/disable model thinking process</td>
-                                </tr>
-                                <tr>
-                                    <td style="padding: 6px; font-family: var(--font-mono); color: var(--ink-primary); font-weight: bold;">/show parameters / system</td>
-                                    <td style="padding: 6px;">Show current parameters/prompt</td>
-                                </tr>
-                                <tr>
-                                    <td style="padding: 6px; font-family: var(--font-mono); color: var(--ink-primary); font-weight: bold;">/vault list / aliases</td>
-                                    <td style="padding: 6px;">List indexed vaults or registered aliases</td>
-                                </tr>
-                                <tr>
-                                    <td style="padding: 6px; font-family: var(--font-mono); color: var(--ink-primary); font-weight: bold;">/vault add &lt;path&gt;</td>
-                                    <td style="padding: 6px;">Index file or folder to searchable vault</td>
-                                </tr>
-                                <tr>
-                                    <td style="padding: 6px; font-family: var(--font-mono); color: var(--ink-primary); font-weight: bold;">/vault search &lt;query&gt;</td>
-                                    <td style="padding: 6px;">Search indexed content</td>
-                                </tr>
-                                <tr>
-                                    <td style="padding: 6px; font-family: var(--font-mono); color: var(--ink-primary); font-weight: bold;">/vault delete &lt;source&gt;</td>
-                                    <td style="padding: 6px;">Remove source from indexed vaults</td>
-                                </tr>
-                                <tr>
-                                    <td style="padding: 6px; font-family: var(--font-mono); color: var(--ink-primary); font-weight: bold;">/quit / /exit</td>
-                                    <td style="padding: 6px;">Exit the agent session</td>
-                                </tr>
-                            </tbody>
-                        </table>
-                    </div>
-                </div>
-            </div>
-        </div>
-    </div>
+      </header>
 
-    <!-- App Logic -->
-    <script src="/app.js"></script>
+      <button id="new-chat-btn" class="primary-btn" type="button">New Chat</button>
+
+      <section class="side-section">
+        <div class="section-title">Sessions</div>
+        <div id="session-list" class="session-list" role="list"></div>
+      </section>
+
+      <button id="settings-btn" class="settings-trigger" type="button" aria-haspopup="dialog" aria-controls="settings-panel">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Z"/><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.88l.06.06-2.83 2.83-.06-.06a1.7 1.7 0 0 0-1.88-.34 1.7 1.7 0 0 0-1.03 1.56V21h-4v-.08A1.7 1.7 0 0 0 9 19.37a1.7 1.7 0 0 0-1.88.34l-.06.06-2.83-2.83.06-.06A1.7 1.7 0 0 0 4.63 15 1.7 1.7 0 0 0 3.08 14H3v-4h.08A1.7 1.7 0 0 0 4.63 9a1.7 1.7 0 0 0-.34-1.88l-.06-.06 2.83-2.83.06.06A1.7 1.7 0 0 0 9 4.63 1.7 1.7 0 0 0 10 3.08V3h4v.08A1.7 1.7 0 0 0 15 4.63a1.7 1.7 0 0 0 1.88-.34l.06-.06 2.83 2.83-.06.06A1.7 1.7 0 0 0 19.37 9 1.7 1.7 0 0 0 20.92 10H21v4h-.08A1.7 1.7 0 0 0 19.4 15Z"/></svg>
+        <span>Settings</span>
+      </button>
+    </aside>
+
+    <main class="chat-shell">
+      <header class="chat-topbar">
+        <div>
+          <h2 id="chat-title">New conversation</h2>
+        </div>
+      </header>
+
+      <section id="messages" class="messages" aria-live="polite" aria-label="Conversation"></section>
+
+      <form id="composer-form" class="composer" autocomplete="off">
+        <div class="composer-inner">
+          <textarea id="chat-input" rows="1" placeholder="Message Selene..." aria-label="Message Selene"></textarea>
+          <div id="slash-menu" class="slash-menu" role="listbox" aria-label="Slash commands"></div>
+          <div class="composer-footer">
+            <div class="context-meter" title="Estimated context window usage">
+              <span id="context-label">0 / 8192</span>
+              <span class="meter-track"><span id="context-fill"></span></span>
+            </div>
+            <button id="send-btn" class="send-btn" type="submit" disabled>Send</button>
+          </div>
+        </div>
+      </form>
+    </main>
+  </div>
+
+  <div id="settings-backdrop" class="settings-backdrop" hidden></div>
+  <aside id="settings-panel" class="settings-panel" role="dialog" aria-modal="true" aria-labelledby="settings-title" aria-hidden="true">
+    <header class="settings-header">
+      <div><p class="eyebrow">Customize Selene</p><h2 id="settings-title">Settings</h2></div>
+      <button id="settings-close" class="icon-btn" type="button" aria-label="Close settings">&times;</button>
+    </header>
+    <div class="settings-body">
+      <section class="settings-group">
+        <h3>Conversation</h3>
+        <label class="panel-field">
+          <span>System prompt</span>
+          <small>Instructions included with every request.</small>
+          <textarea id="setting-system" rows="7" placeholder="You are Selene, a helpful assistant..."></textarea>
+        </label>
+        <label class="switch-row"><span><strong>Keep history</strong><small>Include past turns in new requests.</small></span><input id="setting-history" type="checkbox" checked></label>
+        <label class="switch-row"><span><strong>Show thinking</strong><small>Let supported models expose reasoning.</small></span><input id="setting-think" type="checkbox" checked></label>
+      </section>
+      <section class="settings-group">
+        <h3>Model</h3>
+        <label class="field-row"><span>Temperature <output id="temperature-value">0.70</output></span><small>Higher values produce more varied answers.</small><input id="setting-temperature" type="range" min="0" max="2" step="0.05" value="0.7"></label>
+        <label class="field-row"><span>Context window</span><small>Maximum tokens available to prompts and responses.</small><select id="setting-context"><option value="4096">4k</option><option value="8192" selected>8k</option><option value="16384">16k</option><option value="32768">32k</option><option value="65536">64k</option><option value="131072">128k</option></select></label>
+      </section>
+    </div>
+  </aside>
+
+  <div id="toast-region" class="toast-region" aria-live="polite"></div>
+  <script src="/app.js"></script>
 </body>
 </html>

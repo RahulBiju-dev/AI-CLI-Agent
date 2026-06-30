@@ -8,10 +8,124 @@ from __future__ import annotations
 
 import re
 import sys
+from dataclasses import dataclass
 from rich.console import Console
 
 # Shared console (write to stderr so Live and spinner use the same stream)
 _console = Console(stderr=True)
+
+
+@dataclass(frozen=True)
+class TerminalTheme:
+    """Small central palette for the CLI chrome."""
+
+    accent: str = "cyan"
+    accent_2: str = "bright_magenta"
+    success: str = "green"
+    warning: str = "yellow"
+    danger: str = "red"
+    muted: str = "dim"
+    border: str = "cyan"
+
+
+THEME = TerminalTheme()
+
+
+_ANSI_ESCAPE_RE = re.compile(
+    r"""
+    \x1b
+    (?:
+        \[[0-?]*[ -/]*[@-~]      # CSI sequences: arrows, mouse wheel, bracketed paste
+      | \][^\x07]*(?:\x07|\x1b\\) # OSC sequences
+      | [@-Z\\-_]                 # 2-byte escapes
+    )
+    """,
+    re.VERBOSE,
+)
+_CONTROL_INPUT_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+
+def flush_terminal_input() -> None:
+    """Drop queued terminal bytes before showing the next prompt.
+
+    Scrolling in an alternate screen, arrow keys, bracketed paste markers, or
+    impatient key presses can leave escape bytes in the terminal input queue.
+    Flushing before each prompt prevents those bytes from becoming user text.
+    """
+    if not sys.stdin.isatty():
+        return
+    try:
+        import termios
+
+        termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
+    except Exception:
+        # Windows and some pseudo terminals do not expose tcflush. Sanitization
+        # still protects the prompt after the line is read.
+        return
+
+
+def sanitize_terminal_input(text: str) -> str:
+    """Remove terminal-control garbage while preserving intentional text."""
+    if not text:
+        return ""
+
+    text = _ANSI_ESCAPE_RE.sub("", text)
+
+    chars: list[str] = []
+    for char in text:
+        if char in ("\b", "\x7f"):
+            if chars:
+                chars.pop()
+            continue
+        chars.append(char)
+
+    cleaned = "".join(chars).replace("\r", "\n")
+    cleaned = _CONTROL_INPUT_RE.sub("", cleaned)
+    return cleaned.strip()
+
+
+def read_user_input() -> str:
+    """Read one prompt line using the shared console and terminal hygiene."""
+    flush_terminal_input()
+    raw = _console.input("[bold cyan]selene[/] [dim]$[/] ")
+    return sanitize_terminal_input(raw)
+
+
+def assistant_stream_panel(text: str):
+    """Build the live assistant renderable."""
+    from rich.markdown import Markdown
+    from rich.panel import Panel
+
+    body = Markdown(_render_terminal_markdown(text or " "))
+    return Panel(
+        body,
+        border_style=THEME.border,
+        padding=(1, 2),
+        title="[bold cyan]assistant[/]",
+        title_align="left",
+    )
+
+
+def print_assistant_message(text: str) -> None:
+    """Print the final assistant response in the persistent scrollback."""
+    if not text:
+        return
+    _console.print(assistant_stream_panel(text))
+    _console.print()
+
+
+def print_thinking_header() -> None:
+    from rich.rule import Rule
+
+    _console.print(Rule("[dim magenta]thinking[/]", style="dim magenta"))
+
+
+def print_thinking_footer(label: str | None = None) -> None:
+    from rich.rule import Rule
+
+    text = f"[dim magenta]{label}[/]" if label else ""
+    _console.print(Rule(text, style="dim magenta"))
+    _console.print()
 
 
 def _print_status(icon: str, message: str, color: str = "cyan") -> None:
@@ -26,48 +140,36 @@ def _print_status(icon: str, message: str, color: str = "cyan") -> None:
 
 
 def print_welcome_header() -> None:
-    """Prints a stylish welcome header with an ASCII art logo.
-    
-    This function uses `rich.panel.Panel` and `rich.columns.Columns` to display a centered
-    ASCII art logo alongside a welcome title and help instruction.
-    """
-    from rich.panel import Panel
-    from rich.columns import Columns
+    """Print the terminal app header."""
     from rich.text import Text
-    
-    # ASCII Art logo
-    logo_art_raw = r"""
-                              /
-                   __       //
-                   -\= \=\ //
-                 --=_\=---//=--
-               -_==/  \/ //\/--
-                ==/   /O   O\==--
-   _ _ _ _     /_/    \  ]  /--
-  /\ ( (- \    /       ] ] ]==-
- (\ _\_\_\-\__/     \  (,_,)--
-(\_/                 \     \-
-\/      /       (   ( \  ] /)
-/      (         \   \_ \./ )
-(       \         \      )  \
-(       /\_ _ _ _ /---/ /\_  \
- \     / \     / ____/ /   \  \
-  (   /   )   / /  /__ )   (  )
-  (  )   / __/ '---`       / /
-  \  /   \ \             _/ /
-  ] ]     )_\_         /__\/
-  /_\     ]___\
- (___)
-""".strip("\n")
-    logo_art = Text(logo_art_raw, style="cyan")
-    
-    title_text = Text("\n\n\n\n\n\nAI CLI Agent\n", style="bold white", justify="center")
-    title_text.append("Type ", style="dim")
-    title_text.append("/help", style="bold green")
-    title_text.append(" to see available commands.", style="dim")
-    
-    columns = Columns([logo_art, title_text], expand=True, align="center")
-    _console.print(Panel(columns, border_style="cyan", padding=(1, 2)))
+
+    logo_lines = [
+        r"*          .                  .",
+        r"      _..._",
+        r"   .::::   `.",
+        r"  :::::      :       ____  _____ _     _____ _   _ _____",
+        r"  `::::.   .'       / ___|| ____| |   | ____| \ | | ____|",
+        r"     `''''`         \___ \|  _| | |   |  _| |  \| |  _|",
+        r".                    ___) | |___| |___| |___| |\  | |___",
+        r"     *              |____/|_____|_____|_____|_| \_|_____|",
+        "",
+        r"                 N I G H T   M O D E   A G E N T",
+    ]
+    width = min(_console.size.width, 100)
+    block_width = max(len(line) for line in logo_lines)
+    left_margin = max((width - block_width) // 2, 0)
+    _console.print()
+    for index, line in enumerate(logo_lines):
+        style = "dim cyan" if index == len(logo_lines) - 1 else "cyan"
+        padded_line = f"{' ' * left_margin}{line}"
+        _console.print(
+            Text(padded_line, style=style),
+            markup=False,
+            highlight=False,
+            no_wrap=True,
+            overflow="crop",
+        )
+    _console.print()
 
 
 class _Spinner:
@@ -79,6 +181,7 @@ class _Spinner:
 
     def __init__(self, message: str = "Thinking", color: str = "magenta") -> None:
         self._message = message
+        
         self._color = color
         self._status = _console.status(f"[{self._color} bold]{self._message}…[/]", spinner="dots", spinner_style=f"{self._color} bold")
         

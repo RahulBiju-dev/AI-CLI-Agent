@@ -1,1075 +1,1169 @@
-/*
- * ────────────────────────────────────────────────────────────────────────
- * app.js
- * 
- * Main client-side script for the Selene AI Agent Web UI.
- * Handles DOM events, state management, SSE streaming from the backend,
- * and rendering of Markdown, tool cards, and thinking panels.
- * ────────────────────────────────────────────────────────────────────────
- */
+"use strict";
 
-// ── Global Application State ─────────────────────────────────────────
-const state = {
-    activeSession: 'Active Session',
-    history: [],
-    settings: {
-        options: {
-            temperature: 0.4,
-            top_p: 0.9,
-            top_k: 40
-        },
-        verbose: false,
-        wordwrap: true,
-        system: '',
-        history: true,
-        think: true
-    },
-    savedSessions: [],
-    
-    // Generation & Streaming State
-    isGenerating: false,
-    currentAssistantBody: null,
-    currentAssistantBubble: null,
-    currentThinkingBox: null,
-    currentAssistantText: '',
-    currentAssistantThinkingText: '',
-    toolCards: {},
-    toolCallCounter: 0
+const DEFAULT_SETTINGS = {
+  options: { temperature: 0.7, top_p: 0.9, top_k: 40, num_ctx: 8192 },
+  verbose: false,
+  wordwrap: true,
+  system: "",
+  history: true,
+  format: "",
+  think: true
 };
 
-let currentAbortController = null;
+const SLASH_COMMANDS = [
+  { command: "/help", description: "Show available commands" },
+  { command: "/clear", description: "Clear conversation history" },
+  { command: "/save ", description: "Save current session with an optional name" },
+  { command: "/load ", description: "Load a saved session by name or index" },
+  { command: "/set parameter ", description: "Set a model parameter, e.g. temperature 0.7" },
+  { command: "/set system \"\"", description: "Set the system prompt for this session" },
+  { command: "/set history", description: "Enable conversation history" },
+  { command: "/set nohistory", description: "Disable conversation history" },
+  { command: "/set wordwrap", description: "Enable word wrapping" },
+  { command: "/set nowordwrap", description: "Disable word wrapping" },
+  { command: "/set format json", description: "Force JSON output from the model" },
+  { command: "/set noformat", description: "Disable forced output format" },
+  { command: "/set verbose", description: "Show generation stats after each response" },
+  { command: "/set quiet", description: "Hide generation stats" },
+  { command: "/set think", description: "Enable model thinking/reasoning" },
+  { command: "/set nothink", description: "Disable model thinking" },
+  { command: "/show parameters", description: "Show current session parameters" },
+  { command: "/show system", description: "Show the active system prompt" },
+  { command: "/show model", description: "Show model info" },
+  { command: "/vault list", description: "List indexed vault collections" },
+  { command: "/vault aliases", description: "List registered vault aliases" },
+  { command: "/vault alias ", description: "Register a friendly alias for a collection" },
+  { command: "/vault rename ", description: "Rename a vault collection" },
+  { command: "/vault add ", description: "Add a file or folder to the searchable vault" },
+  { command: "/vault search ", description: "Search the indexed vault" },
+  { command: "/vault delete ", description: "Delete indexed vault chunks by source or path" },
+  { command: "/quit", description: "Exit the agent" },
+  { command: "/exit", description: "Exit the agent" },
+  { command: "/q", description: "Exit the agent" }
+];
 
-// ── Initialization ───────────────────────────────────────────────────
-document.addEventListener('DOMContentLoaded', () => {
-    initLibraries();
-    initEventListeners();
-    loadSessionState();
+const state = {
+  history: [],
+  settings: cloneSettings(DEFAULT_SETTINGS),
+  savedSessions: [],
+  activeSessionName: "New conversation",
+  modelName: "selene",
+  isGenerating: false,
+  followOutput: true,
+  controller: null,
+  stream: {
+    assistantStack: null,
+    assistantBubble: null,
+    assistantText: "",
+    thinkingBlock: null,
+    thinkingText: "",
+    lastToolBlock: null
+  },
+  slash: {
+    open: false,
+    selected: 0,
+    matches: []
+  },
+  sky: {
+    frame: null,
+    resizeObserver: null,
+    scene: null
+  }
+};
+
+const el = {};
+
+document.addEventListener("DOMContentLoaded", () => {
+  bindElements();
+  bindEvents();
+  loadState();
 });
 
-/**
- * Initialize third-party libraries:
- * - marked.js with highlight.js for markdown/code rendering
- * - lucide.js for icon generation
- */
-function initLibraries() {
-    marked.setOptions({
-        highlight: function (code, lang) {
-            const language = hljs.getLanguage(lang) ? lang : 'plaintext';
-            return hljs.highlight(code, { language }).value;
-        },
-        langPrefix: 'hljs language-'
-    });
-    
-    if (window.lucide) {
-        lucide.createIcons();
-    }
+function bindElements() {
+  el.messages = document.getElementById("messages");
+  el.form = document.getElementById("composer-form");
+  el.input = document.getElementById("chat-input");
+  el.send = document.getElementById("send-btn");
+  el.contextLabel = document.getElementById("context-label");
+  el.contextFill = document.getElementById("context-fill");
+  el.contextMeter = document.querySelector(".context-meter");
+  el.sessionList = document.getElementById("session-list");
+  el.title = document.getElementById("chat-title");
+  el.history = document.getElementById("setting-history");
+  el.think = document.getElementById("setting-think");
+  el.temperature = document.getElementById("setting-temperature");
+  el.temperatureValue = document.getElementById("temperature-value");
+  el.context = document.getElementById("setting-context");
+  el.system = document.getElementById("setting-system");
+  el.settingsPanel = document.getElementById("settings-panel");
+  el.settingsBackdrop = document.getElementById("settings-backdrop");
+  el.slashMenu = document.getElementById("slash-menu");
 }
 
-// ── Event Listeners ──────────────────────────────────────────────────
-/**
- * Attach DOM event listeners for the sidebar, settings, and chat inputs.
- * Sets up keybindings, slider value binding, and click events.
- */
-function initEventListeners() {
-    // Menu Sidebar toggle
-    const menuToggle = document.getElementById('menu-toggle');
-    const closeSidebar = document.getElementById('close-sidebar');
-    const sidebar = document.getElementById('sidebar');
-    
-    if (menuToggle && sidebar) {
-        menuToggle.addEventListener('click', () => sidebar.classList.toggle('collapsed'));
+function bindEvents() {
+  el.form?.addEventListener("submit", (event) => {
+    event.preventDefault();
+    if (state.isGenerating) stopGeneration();
+    else sendMessage();
+  });
+
+  el.input?.addEventListener("input", () => {
+    resizeComposer();
+    updateComposerState();
+    updateSlashMenu();
+  });
+
+  el.input?.addEventListener("keydown", (event) => {
+    if (handleSlashKeydown(event)) return;
+    if (event.key === "Enter" && !event.shiftKey) {
+      event.preventDefault();
+      if (state.isGenerating) stopGeneration();
+      else sendMessage();
     }
-    if (closeSidebar && sidebar) {
-        closeSidebar.addEventListener('click', () => sidebar.classList.add('collapsed'));
+  });
+
+  document.addEventListener("click", (event) => {
+    if (!el.slashMenu?.contains(event.target) && event.target !== el.input) {
+      closeSlashMenu();
     }
-    
-    // Parameter Sliders
-    const sliders = [
-        { id: 'param-temperature', valId: 'temp-val', key: 'temperature', isOption: true },
-        { id: 'param-top_p', valId: 'topp-val', key: 'top_p', isOption: true },
-        { id: 'param-top_k', valId: 'topk-val', key: 'top_k', isOption: true }
-    ];
-    
-    sliders.forEach(sliderInfo => {
-        const slider = document.getElementById(sliderInfo.id);
-        const display = document.getElementById(sliderInfo.valId);
-        if (slider && display) {
-            slider.addEventListener('input', (e) => {
-                const val = parseFloat(e.target.value);
-                display.textContent = val;
-                
-                if (sliderInfo.isOption) {
-                    state.settings.options[sliderInfo.key] = val;
-                } else {
-                    state.settings[sliderInfo.key] = val;
-                }
-                saveSettingsOnBackend();
-            });
-        }
-    });
-    
-    // Settings Switches
-    const historySwitch = document.getElementById('setting-history');
-    const thinkSwitch = document.getElementById('setting-think');
-    
-    if (historySwitch) {
-        historySwitch.addEventListener('change', (e) => {
-            state.settings.history = e.target.checked;
-            saveSettingsOnBackend();
-        });
-    }
-    if (thinkSwitch) {
-        thinkSwitch.addEventListener('change', (e) => {
-            state.settings.think = e.target.checked;
-            saveSettingsOnBackend();
-        });
-    }
-    
-    // Custom System Prompt
-    const systemPromptArea = document.getElementById('system-prompt');
-    const applyPromptBtn = document.getElementById('apply-prompt-btn');
-    
-    if (applyPromptBtn && systemPromptArea) {
-        applyPromptBtn.addEventListener('click', () => {
-            state.settings.system = systemPromptArea.value.trim();
-            saveSettingsOnBackend();
-            
-            const originalText = applyPromptBtn.textContent;
-            applyPromptBtn.textContent = 'Applied ✓';
-            setTimeout(() => applyPromptBtn.textContent = originalText, 1500);
-        });
-    }
-    
-    // Input Area
-    const userInput = document.getElementById('user-input');
-    const sendBtn = document.getElementById('send-btn');
-    
-    if (userInput) {
-        userInput.addEventListener('input', () => {
-            userInput.style.height = 'auto';
-            userInput.style.height = (userInput.scrollHeight) + 'px';
-            updateSendButtonState();
-            showAutocomplete(userInput.value);
-        });
-        
-        userInput.addEventListener('keydown', (e) => {
-            const popup = document.getElementById('autocomplete-popup');
-            const isPopupVisible = popup && popup.style.display === 'block';
-            
-            if (isPopupVisible) {
-                if (e.key === 'ArrowDown') {
-                    e.preventDefault();
-                    activeAutocompleteIndex = (activeAutocompleteIndex + 1) % filteredCommands.length;
-                    renderAutocompleteItems();
-                    return;
-                } else if (e.key === 'ArrowUp') {
-                    e.preventDefault();
-                    activeAutocompleteIndex = (activeAutocompleteIndex - 1 + filteredCommands.length) % filteredCommands.length;
-                    renderAutocompleteItems();
-                    return;
-                } else if (e.key === 'Tab' || e.key === 'Enter') {
-                    e.preventDefault();
-                    if (activeAutocompleteIndex >= 0 && activeAutocompleteIndex < filteredCommands.length) {
-                        selectAutocompleteItem(filteredCommands[activeAutocompleteIndex]);
-                    }
-                    return;
-                } else if (e.key === 'Escape') {
-                    e.preventDefault();
-                    hideAutocomplete();
-                    return;
-                }
-            }
-            
-            if (e.key === 'Enter' && !e.shiftKey) {
-                e.preventDefault();
-                if (!state.isGenerating) {
-                    sendMessage();
-                }
-            }
-        });
-    }
-    
-    if (sendBtn) {
-        sendBtn.addEventListener('click', () => {
-            if (state.isGenerating) {
-                if (currentAbortController) {
-                    currentAbortController.abort();
-                }
-                finishGeneration(true);
-            } else {
-                sendMessage();
-            }
-        });
-    }
-    
-    // Buttons
-    document.getElementById('new-chat-btn')?.addEventListener('click', clearSession);
-    document.getElementById('clear-history-btn')?.addEventListener('click', () => {
-        if (confirm('Clear this conversation history?')) clearSession();
-    });
-    
-    // Modals
-    setupModal('save-session-btn', 'save-modal');
-    setupModal('help-btn', 'help-modal');
-    
-    // Close autocomplete on click outside
-    document.addEventListener('click', (e) => {
-        const popup = document.getElementById('autocomplete-popup');
-        const userInputEl = document.getElementById('user-input');
-        if (popup && e.target !== popup && e.target !== userInputEl && !popup.contains(e.target)) {
-            hideAutocomplete();
-        }
-    });
-    
-    const confirmSaveBtn = document.getElementById('confirm-save-btn');
-    const sessionNameInput = document.getElementById('save-session-name');
-    if (confirmSaveBtn && sessionNameInput) {
-        confirmSaveBtn.addEventListener('click', async () => {
-            const name = sessionNameInput.value.trim();
-            if (!name) return;
-            
-            try {
-                const res = await fetch('/api/save-session', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ name })
-                });
-                const data = await res.json();
-                if (data.status === 'success') {
-                    document.querySelectorAll('.modal-overlay').forEach(m => m.classList.remove('active'));
-                    sessionNameInput.value = '';
-                    loadSessionState();
-                } else {
-                    alert('Error saving session: ' + data.error);
-                }
-            } catch (err) {
-                console.error(err);
-            }
-        });
-    }
-    
-    // Tabs
-    document.querySelectorAll('.tab-btn').forEach(btn => {
-        btn.addEventListener('click', () => {
-            document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
-            document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
-            
-            btn.classList.add('active');
-            const target = document.getElementById(btn.getAttribute('data-target'));
-            if (target) target.classList.add('active');
-        });
-    });
+  });
+
+  document.getElementById("new-chat-btn")?.addEventListener("click", newConversation);
+  document.getElementById("settings-btn")?.addEventListener("click", openSettings);
+  document.getElementById("settings-close")?.addEventListener("click", closeSettings);
+  el.settingsBackdrop?.addEventListener("click", closeSettings);
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && el.settingsPanel?.classList.contains("open")) closeSettings();
+  });
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) stopWelcomeSky();
+    else if (el.messages?.querySelector(".welcome")) startWelcomeSky();
+  });
+
+  el.messages?.addEventListener("wheel", (event) => {
+    if (event.deltaY < 0) state.followOutput = false;
+  }, { passive: true });
+  el.messages?.addEventListener("touchmove", () => { state.followOutput = false; }, { passive: true });
+  el.messages?.addEventListener("scroll", () => {
+    if (distanceFromBottom() < 24) state.followOutput = true;
+  }, { passive: true });
+
+  el.history?.addEventListener("change", () => {
+    state.settings.history = el.history.checked;
+    persistSettings();
+  });
+
+  el.think?.addEventListener("change", () => {
+    state.settings.think = el.think.checked;
+    persistSettings();
+  });
+
+  el.temperature?.addEventListener("input", () => {
+    const value = Number(el.temperature.value);
+    state.settings.options = state.settings.options || {};
+    state.settings.options.temperature = value;
+    el.temperatureValue.textContent = value.toFixed(2);
+    persistSettings();
+  });
+
+  el.context?.addEventListener("change", () => {
+    state.settings.options = state.settings.options || {};
+    state.settings.options.num_ctx = Number(el.context.value);
+    persistSettings();
+    updateContextMeter();
+  });
+
+  const persistSystemPrompt = debounce(persistSettings, 350);
+  el.system?.addEventListener("input", () => {
+    state.settings.system = el.system.value;
+    updateContextMeter();
+    persistSystemPrompt();
+  });
 }
 
-function setupModal(triggerId, modalId) {
-    const trigger = document.getElementById(triggerId);
-    const modal = document.getElementById(modalId);
-    if (!trigger || !modal) return;
-    
-    trigger.addEventListener('click', () => {
-        modal.classList.add('active');
-        const firstInput = modal.querySelector('input');
-        if (firstInput) setTimeout(() => firstInput.focus(), 100);
-    });
-    
-    modal.querySelectorAll('.close-modal-btn').forEach(btn => {
-        btn.addEventListener('click', () => modal.classList.remove('active'));
-    });
-    
-    modal.addEventListener('click', (e) => {
-        if (e.target === modal) modal.classList.remove('active');
-    });
+async function loadState() {
+  try {
+    const response = await fetch("/api/settings");
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const data = await response.json();
+
+    state.history = data.history || [];
+    state.savedSessions = data.saved_sessions || [];
+    state.settings = mergeSettings(data.settings || {});
+    state.activeSessionName = data.active_session_name || "New conversation";
+    state.modelName = data.model_name || "selene";
+
+    document.title = titleForSession(state.activeSessionName);
+    el.title.textContent = cleanSessionName(state.activeSessionName);
+
+    syncSettingsUI();
+    renderSessions();
+    renderMessages();
+    updateComposerState();
+  } catch (error) {
+    toast("Could not reach Selene. Make sure the backend and Ollama are running.");
+    renderWelcome();
+  }
 }
 
-// ── Backend Communications ───────────────────────────────────────────
-async function loadSessionState() {
-    try {
-        const res = await fetch('/api/settings');
-        const data = await res.json();
-        
-        state.settings = data.settings;
-        state.history = data.history;
-        state.savedSessions = data.saved_sessions;
-        state.activeSession = data.active_session_name || 'Active Session';
-        
-        const sessionTitle = document.getElementById('current-session-title');
-        if (sessionTitle) {
-            sessionTitle.textContent = state.activeSession;
-        }
-        const modelBadge = document.getElementById('model-badge');
-        if (modelBadge) {
-            modelBadge.textContent = data.model_name || 'selene';
-        }
-        
-        const dot = document.querySelector('.status-dot');
-        const statusIndicator = document.querySelector('.status-indicator');
-        if (dot) {
-            if (data.ollama_status === 'Online') {
-                dot.className = 'status-dot online';
-            } else {
-                dot.className = 'status-dot offline';
-            }
-        }
-        if (statusIndicator) {
-            statusIndicator.title = `Ollama Status: ${data.ollama_status || 'Offline'}`;
-        }
-        const statusText = document.getElementById('connection-status');
-        if (statusText) {
-            statusText.textContent = data.ollama_status === 'Online' ? 'Online' : 'Ollama Offline';
-        }
-        
-        syncSettingsToUI();
-        renderSavedSessionsList();
-        renderHistory();
-        
-    } catch (err) {
-        console.error('Failed to load session settings:', err);
+function mergeSettings(settings) {
+  return {
+    ...DEFAULT_SETTINGS,
+    ...settings,
+    options: {
+      ...DEFAULT_SETTINGS.options,
+      ...(settings.options || {})
     }
+  };
 }
 
-async function saveSettingsOnBackend() {
-    try {
-        await fetch('/api/settings', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(state.settings)
-        });
-    } catch (err) {
-        console.error('Failed to save settings:', err);
+function cloneSettings(settings) {
+  return JSON.parse(JSON.stringify(settings));
+}
+
+function syncSettingsUI() {
+  if (el.history) el.history.checked = state.settings.history !== false;
+  if (el.think) el.think.checked = state.settings.think !== false;
+  if (el.system) el.system.value = state.settings.system || "";
+
+  const temp = Number(state.settings.options?.temperature ?? 0.7);
+  if (el.temperature) el.temperature.value = String(temp);
+  if (el.temperatureValue) el.temperatureValue.textContent = temp.toFixed(2);
+
+  const ctx = String(contextBudget());
+  if (el.context) {
+    const hasOption = [...el.context.options].some((option) => option.value === ctx);
+    if (!hasOption) {
+      const option = document.createElement("option");
+      option.value = ctx;
+      option.textContent = `${Math.round(Number(ctx) / 1024)}k`;
+      el.context.appendChild(option);
     }
+    el.context.value = ctx;
+  }
 }
 
-function syncSettingsToUI() {
-    const ids = {
-        'param-temperature': ['temp-val', state.settings.options.temperature ?? 0.4],
-        'param-top_p': ['topp-val', state.settings.options.top_p ?? 0.9],
-        'param-top_k': ['topk-val', state.settings.options.top_k ?? 40]
+async function persistSettings() {
+  try {
+    await fetch("/api/settings", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(state.settings)
+    });
+  } catch {
+    toast("Settings could not be saved.");
+  }
+}
+
+function renderSessions() {
+  if (!el.sessionList) return;
+  el.sessionList.innerHTML = "";
+
+  if (!state.savedSessions.length) return;
+
+  state.savedSessions.forEach((name) => {
+    const item = document.createElement("div");
+    item.className = `session-item${name === state.activeSessionName ? " active" : ""}`;
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "session-open";
+    button.textContent = cleanSessionName(name);
+    button.title = name;
+    button.addEventListener("click", () => loadSession(name));
+
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "session-delete";
+    remove.setAttribute("aria-label", `Delete ${cleanSessionName(name)}`);
+    remove.title = "Delete chat";
+    remove.innerHTML = `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M9 7V4h6v3m3 0-1 14H7L6 7m4 4v6m4-6v6"/></svg>`;
+    remove.addEventListener("click", (event) => {
+      event.stopPropagation();
+      deleteSession(name);
+    });
+    item.append(button, remove);
+    el.sessionList.appendChild(item);
+  });
+}
+
+function renderMessages() {
+  stopWelcomeSky();
+  el.messages.innerHTML = "";
+  const display = toDisplayMessages(state.history);
+
+  if (!display.length) {
+    renderWelcome();
+    return;
+  }
+
+  display.forEach((message) => {
+    if (message.role === "user") {
+      appendUserMessage(message.content, false);
+    } else {
+      appendAssistantMessage(message, false);
+    }
+  });
+  scrollToBottom(true);
+}
+
+function toDisplayMessages(history) {
+  const display = [];
+  for (let i = 0; i < history.length; i += 1) {
+    const message = history[i];
+    if (message.role === "system") continue;
+    if (message.role === "user") {
+      display.push({ role: "user", content: message.content || "" });
+      continue;
+    }
+    if (message.role === "assistant") {
+      const toolResults = [];
+      let j = i + 1;
+      while (history[j]?.role === "tool") {
+        toolResults.push(history[j]);
+        j += 1;
+      }
+      display.push({
+        role: "assistant",
+        content: message.content || "",
+        thinking: message.thinking || "",
+        toolCalls: message.tool_calls || [],
+        toolResults
+      });
+      i = j - 1;
+    }
+  }
+  return display;
+}
+
+function renderWelcome() {
+  el.messages.innerHTML = `
+    <div class="welcome">
+      <canvas class="welcome-sky" aria-hidden="true"></canvas>
+      <h3 data-text="Selene">Selene</h3>
+      <p>A clean local AI chat interface for thinking, tools, and answers in one dark workspace.</p>
+      <div class="suggestions">
+        <button class="suggestion" type="button" data-prompt="Summarize this project and identify the most important files.">
+          Project summary <span>Understand the workspace</span>
+        </button>
+        <button class="suggestion" type="button" data-prompt="Search the web for the latest AI developer tooling news.">
+          Web research <span>Use tools when needed</span>
+        </button>
+        <button class="suggestion" type="button" data-prompt="Help me debug a Python error step by step.">
+          Debug with me <span>Reason through a problem</span>
+        </button>
+        <button class="suggestion" type="button" data-prompt="/help">
+          Commands <span>Show slash commands</span>
+        </button>
+      </div>
+    </div>
+  `;
+
+  el.messages.querySelectorAll(".suggestion").forEach((button) => {
+    button.addEventListener("click", () => {
+      el.input.value = button.dataset.prompt || "";
+      resizeComposer();
+      updateComposerState();
+      el.input.focus();
+    });
+  });
+  startWelcomeSky();
+}
+
+function startWelcomeSky() {
+  stopWelcomeSky();
+  const canvas = el.messages.querySelector(".welcome-sky");
+  const context = canvas?.getContext("2d");
+  if (!canvas || !context || document.hidden) return;
+
+  const now = performance.now();
+  const scene = {
+    canvas,
+    context,
+    width: 0,
+    height: 0,
+    lastFrame: now,
+    shootingStar: null,
+    nextShootingStar: now + randomBetween(14000, 30000),
+    stars: Array.from({ length: 28 }, () => newCanvasStar(now, true))
+  };
+  state.sky.scene = scene;
+
+  const resize = () => {
+    const bounds = canvas.getBoundingClientRect();
+    const ratio = Math.min(window.devicePixelRatio || 1, 2);
+    scene.width = Math.max(1, bounds.width);
+    scene.height = Math.max(1, bounds.height);
+    canvas.width = Math.round(scene.width * ratio);
+    canvas.height = Math.round(scene.height * ratio);
+    context.setTransform(ratio, 0, 0, ratio, 0, 0);
+  };
+  resize();
+  state.sky.resizeObserver = new ResizeObserver(resize);
+  state.sky.resizeObserver.observe(canvas);
+
+  const drawFrame = (timestamp) => {
+    if (!canvas.isConnected || document.hidden || state.sky.scene !== scene) return;
+    const delta = Math.min(34, Math.max(0, timestamp - scene.lastFrame));
+    scene.lastFrame = timestamp;
+    drawWelcomeSky(scene, timestamp, delta);
+    state.sky.frame = requestAnimationFrame(drawFrame);
+  };
+  state.sky.frame = requestAnimationFrame(drawFrame);
+}
+
+function stopWelcomeSky() {
+  if (state.sky.frame !== null) cancelAnimationFrame(state.sky.frame);
+  state.sky.resizeObserver?.disconnect();
+  state.sky.frame = null;
+  state.sky.resizeObserver = null;
+  state.sky.scene = null;
+}
+
+function newCanvasStar(now, initial = false) {
+  return {
+    x: Math.random(),
+    y: Math.random(),
+    radius: randomBetween(.45, 1.25),
+    brightness: randomBetween(.28, .72),
+    born: now + (initial ? randomBetween(-5000, 1200) : randomBetween(350, 2600)),
+    duration: randomBetween(4500, 10000)
+  };
+}
+
+function drawWelcomeSky(scene, now, delta) {
+  const { context, width, height, stars } = scene;
+  context.clearRect(0, 0, width, height);
+
+  stars.forEach((star, index) => {
+    const progress = (now - star.born) / star.duration;
+    if (progress >= 1) {
+      stars[index] = newCanvasStar(now);
+      return;
+    }
+    if (progress < 0) return;
+    const opacity = Math.pow(Math.sin(Math.PI * progress), 1.7) * star.brightness;
+    context.beginPath();
+    context.arc(star.x * width, star.y * height, star.radius, 0, Math.PI * 2);
+    context.fillStyle = `rgba(240, 244, 255, ${opacity})`;
+    context.fill();
+  });
+
+  if (!scene.shootingStar && now >= scene.nextShootingStar) {
+    const angle = randomBetween(14, 27) * Math.PI / 180;
+    const speed = randomBetween(250, 350);
+    scene.shootingStar = {
+      x: randomBetween(width * .02, width * .52),
+      y: randomBetween(height * .04, height * .45),
+      vx: Math.cos(angle) * speed,
+      vy: Math.sin(angle) * speed,
+      age: 0,
+      duration: randomBetween(1.8, 2.5),
+      trail: randomBetween(72, 118)
     };
-    
-    for (const [id, [valId, val]] of Object.entries(ids)) {
-        const slider = document.getElementById(id);
-        const display = document.getElementById(valId);
-        if (slider && display) {
-            slider.value = val;
-            display.textContent = val;
-        }
-    }
-    
-    const hist = document.getElementById('setting-history');
-    if (hist) hist.checked = state.settings.history;
-    
-    const think = document.getElementById('setting-think');
-    if (think) think.checked = state.settings.think;
-    
-    const prompt = document.getElementById('system-prompt');
-    if (prompt) prompt.value = state.settings.system || '';
+  }
+
+  const shot = scene.shootingStar;
+  if (!shot) return;
+  shot.age += delta / 1000;
+  shot.x += shot.vx * delta / 1000;
+  shot.y += shot.vy * delta / 1000;
+  const speed = Math.hypot(shot.vx, shot.vy);
+  const ux = shot.vx / speed;
+  const uy = shot.vy / speed;
+  const fadeIn = Math.min(1, shot.age / .24);
+  const fadeOut = Math.min(1, Math.max(0, (shot.duration - shot.age) / .9));
+  const opacity = Math.min(fadeIn, fadeOut) * .82;
+  const tailX = shot.x - ux * shot.trail;
+  const tailY = shot.y - uy * shot.trail;
+  const streak = context.createLinearGradient(tailX, tailY, shot.x, shot.y);
+  streak.addColorStop(0, "rgba(255,255,255,0)");
+  streak.addColorStop(.55, `rgba(238,243,255,${opacity * .22})`);
+  streak.addColorStop(1, `rgba(255,255,255,${opacity})`);
+  context.beginPath();
+  context.moveTo(tailX, tailY);
+  context.lineTo(shot.x, shot.y);
+  context.lineWidth = .9;
+  context.strokeStyle = streak;
+  context.stroke();
+  context.beginPath();
+  context.arc(shot.x, shot.y, 1.15, 0, Math.PI * 2);
+  context.fillStyle = `rgba(255,255,255,${opacity})`;
+  context.fill();
+
+  if (shot.age >= shot.duration || shot.x > width + shot.trail || shot.y > height + shot.trail) {
+    scene.shootingStar = null;
+    scene.nextShootingStar = now + randomBetween(24000, 52000);
+  }
 }
 
-async function clearSession() {
-    try {
-        await fetch('/api/clear-session', { method: 'POST' });
-        loadSessionState();
-    } catch (err) {
-        console.error(err);
-    }
+function randomBetween(min, max) {
+  return min + Math.random() * (max - min);
 }
 
-function renderSavedSessionsList() {
-    const container = document.getElementById('sessions-list');
-    if (!container) return;
-    
-    if (state.savedSessions.length === 0) {
-        container.innerHTML = '<div class="loading-placeholder">No saved sessions</div>';
-        return;
-    }
-    
-    container.innerHTML = '';
-    state.savedSessions.forEach((sessionFile) => {
-        const basename = sessionFile.replace('.json', '');
-        let displayName = basename;
-        let timeLabel = '';
-        
-        const match = basename.match(/^(.+)_(\d{8})_(\d{6})$/);
-        if (match) {
-            displayName = match[1].replace(/_/g, ' ');
-            const [yr, mo, dy, hr, mn] = [
-                match[2].substring(0,4), match[2].substring(4,6), match[2].substring(6,8),
-                match[3].substring(0,2), match[3].substring(2,4)
-            ];
-            timeLabel = `${dy}/${mo}/${yr} ${hr}:${mn}`;
-        }
-        
-        const item = document.createElement('div');
-        item.className = 'session-item';
-        if (basename + '.json' === state.activeSession) item.classList.add('active');
-        
-        item.innerHTML = `
-            <div class="session-details">
-                <span class="session-name" title="${displayName}">${displayName}</span>
-                <span class="session-meta">${timeLabel || 'Session file'}</span>
-            </div>
-            <i data-lucide="chevron-right" style="width: 14px; height: 14px; color: var(--text-muted);"></i>
-        `;
-        
-        item.addEventListener('click', async () => {
-            try {
-                const res = await fetch('/api/load-session', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ name: sessionFile })
-                });
-                const data = await res.json();
-                if (data.status === 'success') {
-                    loadSessionState();
-                    document.getElementById('sidebar')?.classList.add('collapsed');
-                }
-            } catch (err) {
-                console.error(err);
-            }
-        });
-        container.appendChild(item);
-    });
-    
-    if (window.lucide) lucide.createIcons();
-}
-
-// ── Rendering Chat Logs ──────────────────────────────────────────────
-function renderHistory() {
-    const container = document.getElementById('chat-messages');
-    if (!container) return;
-    
-    container.innerHTML = '';
-    const displayMessages = [];
-    
-    for (let i = 0; i < state.history.length; i++) {
-        const msg = state.history[i];
-        if (msg.role === 'user') {
-            displayMessages.push({ role: 'user', content: msg.content });
-        } else if (msg.role === 'assistant') {
-            const tools = [];
-            let j = i + 1;
-            while (j < state.history.length && state.history[j].role === 'tool') {
-                tools.push(state.history[j]);
-                j++;
-            }
-            i = j - 1;
-            
-            displayMessages.push({
-                role: 'assistant',
-                content: msg.content,
-                thinking: msg.thinking,
-                tool_calls: msg.tool_calls,
-                tool_results: tools
-            });
-        }
-    }
-    
-    if (displayMessages.length === 0) {
-        renderWelcomeScreen(container);
-        return;
-    }
-    
-    displayMessages.forEach(msg => {
-        if (msg.role === 'user') appendUserMessage(msg.content, false);
-        else appendAssistantMessage(msg, false);
-    });
-    
+function appendUserMessage(text, scroll = true) {
+  stopWelcomeSky();
+  el.messages.querySelector(".welcome")?.remove();
+  const row = messageShell("user", "You");
+  row.stack.appendChild(bubble(text, false));
+  el.messages.appendChild(row.root);
+  if (scroll) {
+    state.followOutput = true;
     scrollToBottom(true);
+  }
 }
 
-function renderWelcomeScreen(container) {
-    const welcome = document.createElement('div');
-    welcome.className = 'welcome-container';
-    welcome.innerHTML = `
-        <div class="welcome-logo">
-            <svg xmlns="http://www.w3.org/2000/svg" width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path></svg>
-        </div>
-        <div>
-            <h1 class="welcome-title">Selene</h1>
-            <p class="welcome-subtitle">A professional AI agent interface with local tools, web search, and document reasoning capabilities.</p>
-        </div>
-        
-        <div class="suggestions-grid">
-            <div class="suggestion-card" data-cmd="Search the web for today's tech news">
-                <div class="suggestion-header">
-                    <i data-lucide="globe" style="width: 18px; height: 18px;"></i> Web Search
-                </div>
-                <div class="suggestion-text">"Search the web for today's tech news"</div>
-            </div>
-            <div class="suggestion-card" data-cmd="Index the project folder and summarize its architecture">
-                <div class="suggestion-header">
-                    <i data-lucide="database" style="width: 18px; height: 18px;"></i> Document Vault
-                </div>
-                <div class="suggestion-text">"Index the project folder and summarize it"</div>
-            </div>
-            <div class="suggestion-card" data-cmd="Play some focus music on Spotify">
-                <div class="suggestion-header">
-                    <i data-lucide="music" style="width: 18px; height: 18px;"></i> Spotify
-                </div>
-                <div class="suggestion-text">"Play some focus music on Spotify"</div>
-            </div>
-            <div class="suggestion-card" data-cmd="Show me a python script to list all files in a directory recursively">
-                <div class="suggestion-header">
-                    <i data-lucide="code" style="width: 18px; height: 18px;"></i> Coding
-                </div>
-                <div class="suggestion-text">"Write a python script to list files"</div>
-            </div>
-        </div>
-    `;
-    
-    container.appendChild(welcome);
-    
-    welcome.querySelectorAll('.suggestion-card').forEach(card => {
-        card.addEventListener('click', () => {
-            const input = document.getElementById('user-input');
-            if (input) {
-                input.value = card.getAttribute('data-cmd');
-                input.style.height = 'auto';
-                input.style.height = input.scrollHeight + 'px';
-                updateSendButtonState();
-                input.focus();
-            }
-        });
-    });
-    
-    if (window.lucide) lucide.createIcons();
+function appendAssistantMessage(message, scroll = true) {
+  el.messages.querySelector(".welcome")?.remove();
+  const row = messageShell("assistant", "S");
+
+  if (message.thinking) {
+    row.stack.appendChild(detailBlock("Thinking", "reasoning", message.thinking, false));
+  }
+
+  message.toolCalls?.forEach((call, index) => {
+    const fn = call.function || {};
+    const result = message.toolResults?.[index]?.content || "";
+    const args = formatJSON(fn.arguments || {});
+    const body = `Arguments:\n${args}${result ? `\n\nResult:\n${result}` : ""}`;
+    row.stack.appendChild(detailBlock(fn.name || "tool", "tool", body, false));
+  });
+
+  if (message.content) row.stack.appendChild(bubble(message.content, true));
+  el.messages.appendChild(row.root);
+  if (scroll) scrollToBottom(true);
 }
 
-function appendUserMessage(content, animate = true) {
-    const container = document.getElementById('chat-messages');
-    if (!container) return;
-    
-    const welcome = container.querySelector('.welcome-container');
-    if (welcome) welcome.remove();
-    
-    const msg = document.createElement('div');
-    msg.className = 'message user';
-    if (!animate) msg.style.animation = 'none';
-    
-    msg.innerHTML = `
-        <div class="message-avatar">U</div>
-        <div class="message-body">
-            <div class="message-bubble">${escapeHtml(content)}</div>
-        </div>
-    `;
-    container.appendChild(msg);
-    if (animate) scrollToBottom(true);
+function messageShell(role, avatarText) {
+  const root = document.createElement("article");
+  root.className = `message ${role}`;
+
+  const avatar = document.createElement("div");
+  avatar.className = "avatar";
+  if (role === "assistant") {
+    const image = document.createElement("img");
+    image.src = "/avatar.png";
+    image.alt = "Selene";
+    avatar.appendChild(image);
+  } else {
+    avatar.textContent = avatarText;
+  }
+
+  const stack = document.createElement("div");
+  stack.className = "message-stack";
+
+  root.append(avatar, stack);
+  return { root, stack };
 }
 
-function appendAssistantMessage(msgData, animate = true) {
-    const container = document.getElementById('chat-messages');
-    if (!container) return;
-    
-    const msg = document.createElement('div');
-    msg.className = 'message assistant';
-    if (!animate) msg.style.animation = 'none';
-    
-    const avatar = document.createElement('div');
-    avatar.className = 'message-avatar';
-    avatar.innerHTML = '<img src="/avatar.png" alt="S">';
-    msg.appendChild(avatar);
-    
-    const body = document.createElement('div');
-    body.className = 'message-body';
-    
-    if (msgData.thinking) {
-        body.appendChild(createThinkingBoxElement(msgData.thinking, false));
-    }
-    
-    if (msgData.tool_calls) {
-        msgData.tool_calls.forEach((tc, idx) => {
-            const args = tc.function.arguments;
-            let result = '';
-            if (msgData.tool_results && msgData.tool_results[idx]) {
-                result = msgData.tool_results[idx].content;
-            }
-            body.appendChild(createToolCardElement(tc.function.name, args, result, false));
-        });
-    }
-    
-    const bubble = document.createElement('div');
-    bubble.className = 'message-bubble';
-    bubble.innerHTML = marked.parse(msgData.content || '');
-    body.appendChild(bubble);
-    
-    msg.appendChild(body);
-    container.appendChild(msg);
-    addCopyButtons(bubble);
-    
-    if (animate) scrollToBottom(true);
+function bubble(content, markdown) {
+  const node = document.createElement("div");
+  node.className = "bubble";
+  node.innerHTML = markdown ? renderMarkdown(content) : escapeHTML(content).replace(/\n/g, "<br>");
+  return node;
 }
 
-function createThinkingBoxElement(text, isStreaming = false) {
-    const box = document.createElement('div');
-    box.className = 'thinking-box';
-    if (!isStreaming) box.classList.add('collapsed');
-    
-    const header = document.createElement('div');
-    header.className = 'thinking-header';
-    header.innerHTML = `
-        <div class="thinking-title">
-            <i data-lucide="brain" style="width: 14px; height: 14px;"></i> Thinking Process
-        </div>
-        <div class="thinking-meta">
-            ${isStreaming ? `
-                <span class="thinking-pulse">
-                    <span class="thinking-dot"></span><span class="thinking-dot"></span><span class="thinking-dot"></span>
-                </span>
-            ` : `<i data-lucide="chevron-down" class="thinking-arrow" style="width: 14px; height: 14px;"></i>`}
-        </div>
-    `;
-    box.appendChild(header);
-    
-    const content = document.createElement('div');
-    content.className = 'thinking-content';
-    content.textContent = text;
-    box.appendChild(content);
-    
-    header.addEventListener('click', () => box.classList.toggle('collapsed'));
-    
-    if (window.lucide) lucide.createIcons();
-    return box;
-}
+function detailBlock(title, label, content, running) {
+  const block = document.createElement("section");
+  block.className = `detail-block open${running ? " running" : ""}`;
 
-function createToolCardElement(name, args, result = '', isExecuting = false) {
-    const card = document.createElement('div');
-    card.className = 'tool-card';
-    if (!isExecuting) card.classList.add('collapsed');
-    
-    let statusIcon = isExecuting ? '<i data-lucide="loader" class="thinking-pulse" style="width: 14px; height: 14px;"></i>' : 
-                     (result && !result.toLowerCase().startsWith('error') ? '<i data-lucide="check" style="width: 14px; height: 14px; color: var(--accent-green);"></i>' : '<i data-lucide="alert-circle" style="width: 14px; height: 14px; color: var(--accent-red);"></i>');
-    
-    const header = document.createElement('div');
-    header.className = 'tool-header';
-    header.innerHTML = `
-        <div class="tool-info">
-            ${statusIcon}
-            <span>Executed tool: <code>${name}</code></span>
-        </div>
-        <i data-lucide="chevron-down" class="tool-arrow" style="width: 16px; height: 16px;"></i>
-    `;
-    card.appendChild(header);
-    
-    const content = document.createElement('div');
-    content.className = 'tool-result';
-    let details = `Arguments:\n${JSON.stringify(args, null, 2)}\n\n`;
-    if (result) details += `Result:\n${result}`;
-    else if (isExecuting) details += `Running in background...`;
-    
-    content.textContent = details;
-    card.appendChild(content);
-    
-    header.addEventListener('click', () => card.classList.toggle('collapsed'));
-    if (window.lucide) lucide.createIcons();
-    return card;
-}
+  const toggle = document.createElement("button");
+  toggle.type = "button";
+  toggle.className = "block-toggle";
+  toggle.innerHTML = `
+    <span class="block-title">${escapeHTML(title)} <span class="pill">${escapeHTML(label)}</span></span>
+    <span aria-hidden="true">+</span>
+  `;
 
-function escapeHtml(str) {
-    return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
-}
+  const body = document.createElement("div");
+  body.className = "block-body";
+  body.textContent = content || (running ? "Running..." : "");
 
-function scrollToBottom(force = false) {
-    const container = document.getElementById('chat-messages');
-    if (!container) return;
-    
-    if (force) {
-        container.scrollTop = container.scrollHeight;
-        return;
-    }
-    
-    // Smart scroll: only scroll if the user is already near the bottom (within 100px)
-    const threshold = 100;
-    const isNearBottom = container.scrollHeight - container.scrollTop - container.clientHeight <= threshold;
-    if (isNearBottom) {
-        container.scrollTop = container.scrollHeight;
-    }
-}
-
-function addCopyButtons(container) {
-    container.querySelectorAll('pre').forEach(pre => {
-        if (pre.querySelector('.copy-btn')) return;
-        
-        const btn = document.createElement('button');
-        btn.className = 'copy-btn';
-        btn.innerHTML = `<i data-lucide="copy" style="width: 14px; height: 14px;"></i> Copy`;
-        pre.appendChild(btn);
-        
-        btn.addEventListener('click', () => {
-            const code = pre.querySelector('code').textContent;
-            navigator.clipboard.writeText(code).then(() => {
-                btn.innerHTML = `<i data-lucide="check" style="width: 14px; height: 14px;"></i> Copied`;
-                setTimeout(() => {
-                    btn.innerHTML = `<i data-lucide="copy" style="width: 14px; height: 14px;"></i> Copy`;
-                    if (window.lucide) lucide.createIcons();
-                }, 2000);
-            });
-        });
-    });
-    if (window.lucide) lucide.createIcons();
-}
-
-// ── SSE Streaming Logic ──────────────────────────────────────────────
-function resetStreamingState() {
-    state.currentAssistantBody = null;
-    state.currentAssistantBubble = null;
-    state.currentThinkingBox = null;
-    state.currentAssistantText = '';
-    state.currentAssistantThinkingText = '';
-    state.toolCards = {};
-    state.toolCallCounter = 0;
+  toggle.addEventListener("click", () => block.classList.toggle("open"));
+  block.append(toggle, body);
+  return block;
 }
 
 async function sendMessage() {
-    const inputArea = document.getElementById('user-input');
-    if (!inputArea || state.isGenerating) return;
-    
-    const text = inputArea.value.trim();
-    if (!text) return;
-    
-    inputArea.value = '';
-    inputArea.style.height = 'auto';
-    updateSendButtonState();
-    
-    appendUserMessage(text);
-    
-    // Initialize state for the new response
-    state.isGenerating = true;
-    resetStreamingState();
-    updateSendButtonState();
-    
-    currentAbortController = new AbortController();
-    
-    try {
-        const response = await fetch('/api/chat', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ message: text }),
-            signal: currentAbortController.signal
-        });
-        
-        if (!response.ok) throw new Error(`HTTP ${response.status}`);
-        
-        const reader = response.body.getReader();
-        const decoder = new TextDecoder('utf-8');
-        let buffer = '';
-        
-        while (true) {
-            const { value, done } = await reader.read();
-            if (done) break;
-            
-            buffer += decoder.decode(value, { stream: true });
-            const lines = buffer.split('\n');
-            buffer = lines.pop(); 
-            
-            for (const line of lines) {
-                if (line.startsWith('data: ')) {
-                    try {
-                        handleSSEEvent(JSON.parse(line.substring(6)));
-                    } catch (e) {
-                        console.error('SSE JSON error:', e);
-                    }
-                }
-            }
-        }
-    } catch (err) {
-        if (err.name === 'AbortError') {
-            appendStatusMessage('Interrupted by user.', 'primary');
-        } else {
-            console.error('Stream error:', err);
-            appendStatusMessage('Connection error. Is the server running?', 'red');
-        }
-        finishGeneration(false);
+  if (state.isGenerating) return;
+  const text = el.input.value.trim();
+  if (!text) return;
+
+  closeSlashMenu();
+  appendUserMessage(text);
+  if (!text.startsWith("/")) state.history.push({ role: "user", content: text });
+  el.input.value = "";
+  resizeComposer();
+  updateComposerState();
+
+  state.isGenerating = true;
+  state.controller = new AbortController();
+  resetStream();
+  updateComposerState();
+
+  try {
+    const response = await fetch("/api/chat", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ message: text }),
+      signal: state.controller.signal
+    });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    await readEventStream(response);
+  } catch (error) {
+    if (error.name !== "AbortError") {
+      toast("Selene lost the response stream. Check Ollama and try again.");
+      finishGeneration();
     }
+  }
 }
 
-function handleSSEEvent(event) {
-    if (event.type === 'status') {
-        appendStatusMessage(event.message, event.color === 'red' ? 'red' : 'primary');
+async function readEventStream(response) {
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split("\n");
+    buffer = lines.pop() || "";
+
+    for (const line of lines) {
+      if (!line.startsWith("data: ")) continue;
+      try {
+        handleStreamEvent(JSON.parse(line.slice(6)));
+      } catch {
+        // Ignore malformed SSE chunks.
+      }
     }
-    else if (event.type === 'thinking_start') {
-        const body = getOrCreateAssistantBodyElement();
-        state.currentThinkingBox = createThinkingBoxElement('', true);
-        body.appendChild(state.currentThinkingBox);
-        scrollToBottom();
-    }
-    else if (event.type === 'thinking_chunk') {
-        if (state.currentThinkingBox) {
-            state.currentAssistantThinkingText += event.text;
-            const contentDiv = state.currentThinkingBox.querySelector('.thinking-content');
-            if (contentDiv) contentDiv.textContent = state.currentAssistantThinkingText;
-        }
-    }
-    else if (event.type === 'thinking_end') {
-        if (state.currentThinkingBox) {
-            state.currentThinkingBox.classList.add('collapsed');
-            const meta = state.currentThinkingBox.querySelector('.thinking-meta');
-            if (meta) {
-                meta.innerHTML = `<i data-lucide="chevron-down" class="thinking-arrow" style="width: 14px; height: 14px;"></i>`;
-                if (window.lucide) lucide.createIcons();
-            }
-        }
-    }
-    else if (event.type === 'content_chunk') {
-        const body = getOrCreateAssistantBodyElement();
-        if (!state.currentAssistantBubble) {
-            state.currentAssistantBubble = document.createElement('div');
-            state.currentAssistantBubble.className = 'message-bubble';
-            body.appendChild(state.currentAssistantBubble);
-        }
-        state.currentAssistantText += event.text;
-        state.currentAssistantBubble.innerHTML = marked.parse(state.currentAssistantText);
-        addCopyButtons(state.currentAssistantBubble);
-        scrollToBottom();
-    }
-    else if (event.type === 'tool_start') {
-        const body = getOrCreateAssistantBodyElement();
-        state.toolCallCounter++;
-        const callId = `tool_${state.toolCallCounter}`;
-        
-        const card = createToolCardElement(event.name, event.arguments, '', true);
-        body.appendChild(card);
-        state.toolCards[callId] = card;
-        
-        // Temporarily store the ID on the event name (a bit hacky but works since backend doesn't send IDs)
-        // For multiple concurrent tools this would fail, but Selene tools run sequentially
-        state.lastToolCallId = callId;
-        scrollToBottom();
-    }
-    else if (event.type === 'tool_end') {
-        const callId = state.lastToolCallId;
-        const card = state.toolCards[callId];
-        if (card) {
-            const newCard = createToolCardElement(event.name, {}, event.result, false);
-            card.parentNode.replaceChild(newCard, card);
-            state.toolCards[callId] = newCard;
-        }
-        
-        // Reset bubbles so the post-tool response gets a fresh bubble/body block
-        state.currentAssistantBody = null;
-        state.currentAssistantBubble = null;
-        state.currentAssistantText = '';
-        scrollToBottom();
-    }
-    else if (event.type === 'token_usage') {
-        const usageDiv = document.getElementById('token-usage');
-        if (usageDiv) {
-            const pct = event.total / event.budget;
-            usageDiv.textContent = `${event.total} / ${event.budget} ctx`;
-            usageDiv.style.display = 'block';
-            
-            usageDiv.className = 'token-usage';
-            if (pct >= 1.0) {
-                usageDiv.classList.add('danger');
-            } else if (pct >= 0.9) {
-                usageDiv.classList.add('warning');
-            }
-        }
-    }
-    else if (event.type === 'done') {
-        finishGeneration(false);
-    }
+  }
 }
 
-function getOrCreateAssistantBodyElement() {
-    // If we have an active body for this turn, return it
-    if (state.currentAssistantBody) return state.currentAssistantBody;
-    
-    // Otherwise, create a new assistant message wrapper
-    const container = document.getElementById('chat-messages');
-    const msg = document.createElement('div');
-    msg.className = 'message assistant';
-    
-    const avatar = document.createElement('div');
-    avatar.className = 'message-avatar';
-    avatar.innerHTML = '<img src="/avatar.png" alt="S">';
-    msg.appendChild(avatar);
-    
-    const body = document.createElement('div');
-    body.className = 'message-body';
-    msg.appendChild(body);
-    container.appendChild(msg);
-    
-    state.currentAssistantBody = body;
-    return body;
+function handleStreamEvent(event) {
+  switch (event.type) {
+    case "status":
+      appendStatus(event.message || "");
+      break;
+    case "thinking_start":
+      ensureAssistantStack();
+      state.stream.thinkingBlock = detailBlock("Thinking", "reasoning", "", true);
+      state.stream.assistantStack.appendChild(state.stream.thinkingBlock);
+      scrollToBottom();
+      break;
+    case "thinking_chunk":
+      state.stream.thinkingText += event.text || "";
+      setBlockBody(state.stream.thinkingBlock, state.stream.thinkingText);
+      break;
+    case "thinking_end":
+      state.stream.thinkingBlock?.classList.remove("running");
+      state.stream.thinkingBlock?.classList.remove("open");
+      break;
+    case "tool_start":
+      ensureAssistantStack();
+      state.stream.lastToolBlock = detailBlock(event.name || "tool", "tool", `Arguments:\n${formatJSON(event.arguments || {})}`, true);
+      state.stream.assistantStack.appendChild(state.stream.lastToolBlock);
+      scrollToBottom();
+      break;
+    case "tool_end":
+      if (state.stream.lastToolBlock) {
+        state.stream.lastToolBlock.classList.remove("running");
+        setBlockBody(state.stream.lastToolBlock, `Result:\n${event.result || ""}`);
+      }
+      resetStream();
+      break;
+    case "content_chunk":
+      ensureAssistantStack();
+      if (!state.stream.assistantBubble) {
+        state.stream.assistantBubble = document.createElement("div");
+        state.stream.assistantBubble.className = "bubble";
+        state.stream.assistantStack.appendChild(state.stream.assistantBubble);
+      }
+      state.stream.assistantText += event.text || event.content || "";
+      state.stream.assistantBubble.innerHTML = renderMarkdown(state.stream.assistantText);
+      scrollToBottom();
+      break;
+    case "token_usage":
+      updateContextMeter(event.total, event.budget);
+      break;
+    case "done":
+      if (event.history) state.history = event.history;
+      if (event.active_session_name) state.activeSessionName = event.active_session_name;
+      if (event.saved_sessions) state.savedSessions = event.saved_sessions;
+      el.title.textContent = cleanSessionName(state.activeSessionName);
+      document.title = titleForSession(state.activeSessionName);
+      renderSessions();
+      updateContextMeter();
+      finishGeneration();
+      break;
+  }
 }
 
-function finishGeneration(wasAborted = false) {
-    if (!state.isGenerating) return;
-    
-    state.isGenerating = false;
-    currentAbortController = null;
-    updateSendButtonState();
-    
-    if (state.currentThinkingBox) {
-        state.currentThinkingBox.classList.add('collapsed');
-        const meta = state.currentThinkingBox.querySelector('.thinking-meta');
-        if (meta) {
-            meta.innerHTML = `<i data-lucide="chevron-down" class="thinking-arrow" style="width: 14px; height: 14px;"></i>`;
-        }
+function ensureAssistantStack() {
+  if (state.stream.assistantStack) return;
+  const row = messageShell("assistant", "S");
+  el.messages.querySelector(".welcome")?.remove();
+  el.messages.appendChild(row.root);
+  state.stream.assistantStack = row.stack;
+}
+
+function resetStream() {
+  state.stream.assistantStack = null;
+  state.stream.assistantBubble = null;
+  state.stream.assistantText = "";
+  state.stream.thinkingBlock = null;
+  state.stream.thinkingText = "";
+  state.stream.lastToolBlock = null;
+}
+
+function finishGeneration() {
+  state.isGenerating = false;
+  state.controller = null;
+  resetStream();
+  updateComposerState();
+}
+
+function stopGeneration() {
+  state.controller?.abort();
+  toast("Generation stopped.");
+  finishGeneration();
+  refreshSessions().catch(() => {});
+}
+
+function appendStatus(text) {
+  const status = document.createElement("div");
+  status.className = "status-line";
+  status.textContent = text;
+  el.messages.appendChild(status);
+  scrollToBottom();
+}
+
+function setBlockBody(block, text) {
+  const body = block?.querySelector(".block-body");
+  if (body) body.textContent = text;
+}
+
+async function clearConversation() {
+  if (state.isGenerating) stopGeneration();
+  try {
+    await fetch("/api/clear-session", { method: "POST" });
+    state.history = [];
+    state.activeSessionName = "New conversation";
+    el.title.textContent = "New conversation";
+    document.title = "Selene";
+    renderWelcome();
+    updateContextMeter();
+  } catch {
+    toast("Could not clear the conversation.");
+  }
+}
+
+async function newConversation() {
+  if (state.isGenerating) stopGeneration();
+  try {
+    const response = await fetch("/api/new-session", { method: "POST" });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    state.history = [];
+    state.activeSessionName = "New conversation";
+    el.title.textContent = "New conversation";
+    document.title = "Selene";
+    state.followOutput = true;
+    renderWelcome();
+    updateContextMeter();
+    await refreshSessions();
+  } catch {
+    toast("Could not start a new conversation.");
+  }
+}
+
+async function deleteSession(name) {
+  if (!window.confirm(`Delete “${cleanSessionName(name)}”? This cannot be undone.`)) return;
+  try {
+    const response = await fetch("/api/delete-session", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name })
+    });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    if (name === state.activeSessionName) {
+      state.history = [];
+      state.activeSessionName = "New conversation";
+      el.title.textContent = "New conversation";
+      document.title = "Selene";
+      renderWelcome();
+      updateContextMeter();
     }
-    if (window.lucide) lucide.createIcons();
-    
-    loadSessionState();
+    await refreshSessions();
+    toast("Chat deleted.");
+  } catch {
+    toast("Could not delete that chat.");
+  }
 }
 
-function appendStatusMessage(text, type = 'primary') {
-    const container = document.getElementById('chat-messages');
-    if (!container) return;
-    
-    const row = document.createElement('div');
-    row.className = 'status-msg-bubble';
-    
-    let icon = 'info';
-    if (type === 'red') icon = 'alert-triangle';
-    if (text.startsWith('✓')) icon = 'check-circle';
-    
-    row.innerHTML = `
-        <i data-lucide="${icon}" class="status-msg-icon" style="color: var(--accent-${type});"></i>
-        <span>${escapeHtml(text.replace('✓ ', '').replace('⚠ ', ''))}</span>
+async function refreshSessions() {
+  const response = await fetch("/api/settings");
+  if (!response.ok) return;
+  const data = await response.json();
+  state.savedSessions = data.saved_sessions || [];
+  state.activeSessionName = data.active_session_name || state.activeSessionName;
+  renderSessions();
+}
+
+function openSettings() {
+  el.settingsBackdrop.hidden = false;
+  requestAnimationFrame(() => {
+    el.settingsBackdrop.classList.add("open");
+    el.settingsPanel.classList.add("open");
+    el.settingsPanel.setAttribute("aria-hidden", "false");
+  });
+  document.getElementById("settings-close")?.focus();
+}
+
+function closeSettings() {
+  el.settingsBackdrop?.classList.remove("open");
+  el.settingsPanel?.classList.remove("open");
+  el.settingsPanel?.setAttribute("aria-hidden", "true");
+  setTimeout(() => { if (el.settingsBackdrop) el.settingsBackdrop.hidden = true; }, 180);
+  document.getElementById("settings-btn")?.focus();
+}
+
+async function saveSession() {
+  const name = window.prompt("Save this chat as:", cleanSessionName(state.activeSessionName));
+  if (name === null) return;
+  try {
+    const response = await fetch("/api/save-session", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name })
+    });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    toast("Session saved.");
+    loadState();
+  } catch {
+    toast("Could not save this session.");
+  }
+}
+
+async function loadSession(name) {
+  try {
+    const response = await fetch("/api/load-session", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name })
+    });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    await loadState();
+    toast("Session loaded.");
+  } catch {
+    toast("Could not load that session.");
+  }
+}
+
+function updateComposerState() {
+  const hasText = Boolean(el.input?.value.trim());
+  if (el.send) {
+    el.send.disabled = !state.isGenerating && !hasText;
+    el.send.textContent = state.isGenerating ? "Stop" : "Send";
+    el.send.classList.toggle("stop", state.isGenerating);
+  }
+  updateContextMeter();
+}
+
+function updateSlashMenu() {
+  if (!el.input || !el.slashMenu) return;
+
+  const text = el.input.value;
+  const cursor = el.input.selectionStart ?? text.length;
+  const beforeCursor = text.slice(0, cursor);
+
+  if (!beforeCursor.startsWith("/") || beforeCursor.includes("\n") || state.isGenerating) {
+    closeSlashMenu();
+    return;
+  }
+
+  const query = beforeCursor.toLowerCase();
+  const matches = SLASH_COMMANDS
+    .filter((item) => {
+      const haystack = `${item.command} ${item.description}`.toLowerCase();
+      return haystack.includes(query) || item.command.toLowerCase().startsWith(query);
+    })
+    .slice(0, 10);
+
+  state.slash.open = true;
+  state.slash.matches = matches;
+  state.slash.selected = Math.min(state.slash.selected, Math.max(matches.length - 1, 0));
+  renderSlashMenu();
+}
+
+function renderSlashMenu() {
+  if (!el.slashMenu) return;
+  el.slashMenu.innerHTML = "";
+  el.slashMenu.classList.toggle("open", state.slash.open);
+
+  if (!state.slash.open) return;
+
+  if (!state.slash.matches.length) {
+    const empty = document.createElement("div");
+    empty.className = "slash-empty";
+    empty.textContent = "No matching commands";
+    el.slashMenu.appendChild(empty);
+    return;
+  }
+
+  state.slash.matches.forEach((item, index) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = `slash-item${index === state.slash.selected ? " active" : ""}`;
+    button.setAttribute("role", "option");
+    button.setAttribute("aria-selected", String(index === state.slash.selected));
+    button.innerHTML = `
+      <span class="slash-command">${escapeHTML(item.command)}</span>
+      <span class="slash-desc">${escapeHTML(item.description)}</span>
     `;
-    container.appendChild(row);
-    if (window.lucide) lucide.createIcons();
-    scrollToBottom();
-}
-
-function updateSendButtonState() {
-    const sendBtn = document.getElementById('send-btn');
-    const inputArea = document.getElementById('user-input');
-    if (!sendBtn || !inputArea) return;
-    
-    if (state.isGenerating) {
-        sendBtn.disabled = false;
-        sendBtn.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect></svg>';
-        sendBtn.className = 'send-btn stop-btn';
-    } else {
-        const hasText = inputArea.value.trim().length > 0;
-        sendBtn.disabled = !hasText;
-        sendBtn.innerHTML = '<i data-lucide="arrow-up" style="width: 18px; height: 18px;"></i>';
-        sendBtn.className = 'send-btn';
-    }
-    if (window.lucide) lucide.createIcons();
-}
-
-// ── Autocomplete Functionality ───────────────────────────────────────
-const SLASH_COMMANDS = [
-    { cmd: '/help', usage: '', desc: 'Show help menu' },
-    { cmd: '/clear', usage: '', desc: 'Clear history & system override' },
-    { cmd: '/save', usage: '[name]', desc: 'Save current session file' },
-    { cmd: '/load', usage: '[name|index]', desc: 'Load a saved session file' },
-    { cmd: '/set parameter', usage: '<name> <val>', desc: 'Set parameter (e.g. temperature 0.7)' },
-    { cmd: '/set system', usage: '"<prompt>"', desc: 'Set custom system prompt override' },
-    { cmd: '/set history', usage: '', desc: 'Enable conversation history (default)' },
-    { cmd: '/set nohistory', usage: '', desc: 'Disable conversation history' },
-    { cmd: '/set wordwrap', usage: '', desc: 'Enable word wrapping (default)' },
-    { cmd: '/set nowordwrap', usage: '', desc: 'Disable word wrapping' },
-    { cmd: '/set format json', usage: '', desc: 'Force JSON output from the model' },
-    { cmd: '/set noformat', usage: '', desc: 'Disable forced output format (default)' },
-    { cmd: '/set verbose', usage: '', desc: 'Show generation stats after each response' },
-    { cmd: '/set quiet', usage: '', desc: 'Hide generation stats (default)' },
-    { cmd: '/set think', usage: '', desc: 'Enable model thinking/reasoning (default)' },
-    { cmd: '/set nothink', usage: '', desc: 'Disable model thinking' },
-    { cmd: '/show parameters', usage: '', desc: 'Show current session parameters' },
-    { cmd: '/show system', usage: '', desc: 'Show the active system prompt' },
-    { cmd: '/show model', usage: '', desc: 'Show model info' },
-    { cmd: '/vault list', usage: '', desc: 'List indexed vaults' },
-    { cmd: '/vault aliases', usage: '', desc: 'List registered vault aliases' },
-    { cmd: '/vault alias', usage: '<name> <coll>', desc: 'Register friendly alias for a collection' },
-    { cmd: '/vault rename', usage: '<old> <new>', desc: 'Rename a vault collection' },
-    { cmd: '/vault add', usage: '<path>', desc: 'Index folder/file to searchable vault' },
-    { cmd: '/vault search', usage: '<query>', desc: 'Search indexed content' },
-    { cmd: '/vault delete', usage: '<source>', desc: 'Delete indexed chunks' },
-    { cmd: '/quit', usage: '', desc: 'Exit the agent session' },
-    { cmd: '/exit', usage: '', desc: 'Exit the agent session' },
-    { cmd: '/q', usage: '', desc: 'Exit the agent session' }
-];
-
-let activeAutocompleteIndex = -1;
-let filteredCommands = [];
-
-function showAutocomplete(filterText) {
-    const popup = document.getElementById('autocomplete-popup');
-    if (!popup) return;
-    
-    if (!filterText.startsWith('/')) {
-        hideAutocomplete();
-        return;
-    }
-    
-    const query = filterText.toLowerCase();
-    filteredCommands = SLASH_COMMANDS.filter(item => {
-        return item.cmd.toLowerCase().startsWith(query);
+    button.addEventListener("mouseenter", () => {
+      state.slash.selected = index;
+      renderSlashMenu();
     });
-    
-    if (filteredCommands.length === 0) {
-        hideAutocomplete();
-        return;
+    button.addEventListener("click", () => chooseSlashCommand(index));
+    el.slashMenu.appendChild(button);
+  });
+}
+
+function handleSlashKeydown(event) {
+  if (!state.slash.open) return false;
+
+  if (event.key === "ArrowDown") {
+    event.preventDefault();
+    moveSlashSelection(1);
+    return true;
+  }
+  if (event.key === "ArrowUp") {
+    event.preventDefault();
+    moveSlashSelection(-1);
+    return true;
+  }
+  if (event.key === "Tab") {
+    event.preventDefault();
+    chooseSlashCommand();
+    return true;
+  }
+  if (event.key === "Enter" && !event.shiftKey && state.slash.matches.length) {
+    event.preventDefault();
+    chooseSlashCommand();
+    return true;
+  }
+  if (event.key === "Escape") {
+    event.preventDefault();
+    closeSlashMenu();
+    return true;
+  }
+  return false;
+}
+
+function moveSlashSelection(delta) {
+  const count = state.slash.matches.length;
+  if (!count) return;
+  state.slash.selected = (state.slash.selected + delta + count) % count;
+  renderSlashMenu();
+}
+
+function chooseSlashCommand(index = state.slash.selected) {
+  const item = state.slash.matches[index];
+  if (!item || !el.input) return;
+
+  const suffix = item.command.endsWith(" ") || item.command.endsWith("\"\"") ? "" : " ";
+  el.input.value = `${item.command}${suffix}`;
+
+  if (item.command.endsWith("\"\"")) {
+    const cursor = item.command.length - 1;
+    el.input.setSelectionRange(cursor, cursor);
+  } else {
+    const cursor = el.input.value.length;
+    el.input.setSelectionRange(cursor, cursor);
+  }
+
+  closeSlashMenu();
+  resizeComposer();
+  updateComposerState();
+  el.input.focus();
+}
+
+function closeSlashMenu() {
+  state.slash.open = false;
+  state.slash.selected = 0;
+  state.slash.matches = [];
+  if (el.slashMenu) {
+    el.slashMenu.classList.remove("open");
+    el.slashMenu.innerHTML = "";
+  }
+}
+
+function updateContextMeter(forcedUsed = null, forcedBudget = null) {
+  const budget = forcedBudget || contextBudget();
+  const used = forcedUsed ?? estimatedContextTokens();
+  const pct = Math.min(100, Math.round((used / budget) * 100));
+
+  if (el.contextLabel) el.contextLabel.textContent = `${used} / ${budget}`;
+  if (el.contextFill) el.contextFill.style.width = `${pct}%`;
+  if (el.contextMeter) {
+    el.contextMeter.classList.toggle("warn", pct >= 75 && pct < 90);
+    el.contextMeter.classList.toggle("hot", pct >= 90);
+  }
+}
+
+function estimatedContextTokens() {
+  const historyText = state.history
+    .filter((message) => message.role !== "system")
+    .map((message) => [
+    message.role || "",
+    message.content || "",
+    message.thinking || "",
+    JSON.stringify(message.tool_calls || "")
+  ].join("\n")).join("\n");
+  const systemPrompt = state.settings.system ||
+    (state.history.find((message) => message.role === "system")?.content || "");
+  return estimateTokens(`${systemPrompt}\n${historyText}\n${el.input?.value || ""}`);
+}
+
+function estimateTokens(text) {
+  return Math.max(0, Math.ceil(String(text || "").length / 4));
+}
+
+function contextBudget() {
+  return Number(state.settings.options?.num_ctx || 8192);
+}
+
+function resizeComposer() {
+  if (!el.input) return;
+  el.input.style.height = "auto";
+  el.input.style.height = `${Math.min(el.input.scrollHeight, 220)}px`;
+}
+
+function scrollToBottom(force = false) {
+  if (!el.messages) return;
+  if (force || state.followOutput) el.messages.scrollTop = el.messages.scrollHeight;
+}
+
+function distanceFromBottom() {
+  if (!el.messages) return 0;
+  return el.messages.scrollHeight - el.messages.scrollTop - el.messages.clientHeight;
+}
+
+function renderMarkdown(text) {
+  const lines = String(text || "").replace(/\r/g, "").split("\n");
+  const output = [];
+  let paragraph = [];
+  let listType = "";
+  let inCode = false;
+  let code = [];
+  let language = "";
+
+  const flushParagraph = () => {
+    if (paragraph.length) output.push(`<p>${inlineMarkdown(paragraph.join("\n")).replace(/\n/g, "<br>")}</p>`);
+    paragraph = [];
+  };
+  const closeList = () => {
+    if (listType) output.push(`</${listType}>`);
+    listType = "";
+  };
+
+  lines.forEach((line) => {
+    const fence = line.match(/^```\s*([\w+-]*)/);
+    if (fence) {
+      if (inCode) {
+        output.push(`<pre><code${language ? ` class="language-${escapeHTML(language)}"` : ""}>${escapeHTML(code.join("\n"))}</code></pre>`);
+        code = []; language = ""; inCode = false;
+      } else {
+        flushParagraph(); closeList(); inCode = true; language = fence[1] || "";
+      }
+      return;
     }
-    
-    activeAutocompleteIndex = 0;
-    renderAutocompleteItems();
-    popup.style.display = 'block';
-}
+    if (inCode) { code.push(line); return; }
+    if (!line.trim()) { flushParagraph(); closeList(); return; }
 
-function hideAutocomplete() {
-    const popup = document.getElementById('autocomplete-popup');
-    if (popup) {
-        popup.style.display = 'none';
-        popup.innerHTML = '';
+    const heading = line.match(/^(#{1,6})\s+(.+)$/);
+    if (heading) { flushParagraph(); closeList(); const level = heading[1].length; output.push(`<h${level}>${inlineMarkdown(heading[2])}</h${level}>`); return; }
+    if (/^\s*([-*_])(?:\s*\1){2,}\s*$/.test(line)) { flushParagraph(); closeList(); output.push("<hr>"); return; }
+    const quote = line.match(/^>\s?(.*)$/);
+    if (quote) { flushParagraph(); closeList(); output.push(`<blockquote>${inlineMarkdown(quote[1])}</blockquote>`); return; }
+    const unordered = line.match(/^\s*[-*+]\s+(.+)$/);
+    const ordered = line.match(/^\s*\d+[.)]\s+(.+)$/);
+    if (unordered || ordered) {
+      flushParagraph();
+      const wanted = ordered ? "ol" : "ul";
+      if (listType !== wanted) { closeList(); output.push(`<${wanted}>`); listType = wanted; }
+      output.push(`<li>${inlineMarkdown((unordered || ordered)[1])}</li>`);
+      return;
     }
-    filteredCommands = [];
-    activeAutocompleteIndex = -1;
+    closeList(); paragraph.push(line);
+  });
+  if (inCode) output.push(`<pre><code>${escapeHTML(code.join("\n"))}</code></pre>`);
+  flushParagraph(); closeList();
+  return output.join("");
 }
 
-function renderAutocompleteItems() {
-    const popup = document.getElementById('autocomplete-popup');
-    if (!popup) return;
-    
-    popup.innerHTML = '';
-    filteredCommands.forEach((item, index) => {
-        const div = document.createElement('div');
-        div.className = 'autocomplete-item' + (index === activeAutocompleteIndex ? ' active' : '');
-        
-        const cmdSpan = document.createElement('span');
-        cmdSpan.className = 'autocomplete-cmd';
-        cmdSpan.textContent = item.cmd;
-        
-        const usageSpan = document.createElement('span');
-        usageSpan.className = 'autocomplete-usage';
-        usageSpan.textContent = item.usage ? ' ' + item.usage : '';
-        
-        const descSpan = document.createElement('span');
-        descSpan.className = 'autocomplete-desc';
-        descSpan.textContent = `— ${item.desc}`;
-        
-        div.appendChild(cmdSpan);
-        div.appendChild(usageSpan);
-        div.appendChild(descSpan);
-        
-        div.addEventListener('click', () => {
-            selectAutocompleteItem(item);
-        });
-        
-        popup.appendChild(div);
-    });
-    
-    const activeItem = popup.children[activeAutocompleteIndex];
-    if (activeItem) {
-        activeItem.scrollIntoView({ block: 'nearest' });
+function inlineMarkdown(text) {
+  let value = escapeHTML(text);
+  const codeSpans = [];
+  value = value.replace(/`([^`]+)`/g, (_, code) => {
+    codeSpans.push(`<code>${code}</code>`);
+    return `\u0000CODE${codeSpans.length - 1}\u0000`;
+  });
+  value = value
+    .replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>')
+    .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+    .replace(/__([^_]+)__/g, "<strong>$1</strong>")
+    .replace(/~~([^~]+)~~/g, "<del>$1</del>")
+    .replace(/(^|[^*])\*([^*\n]+)\*/g, "$1<em>$2</em>")
+    .replace(/(^|[^_])_([^_\n]+)_/g, "$1<em>$2</em>");
+  return value.replace(/\u0000CODE(\d+)\u0000/g, (_, index) => codeSpans[Number(index)]);
+}
+
+function debounce(fn, delay) {
+  let timer;
+  return (...args) => {
+    clearTimeout(timer);
+    timer = setTimeout(() => fn(...args), delay);
+  };
+}
+
+function formatJSON(value) {
+  if (typeof value === "string") {
+    try {
+      return JSON.stringify(JSON.parse(value), null, 2);
+    } catch {
+      return value;
     }
+  }
+  return JSON.stringify(value, null, 2);
 }
 
-function selectAutocompleteItem(item) {
-    const userInput = document.getElementById('user-input');
-    if (!userInput) return;
-    
-    const suffix = item.usage ? ' ' : '';
-    userInput.value = item.cmd + suffix;
-    
-    hideAutocomplete();
-    userInput.focus();
-    
-    userInput.style.height = 'auto';
-    userInput.style.height = userInput.scrollHeight + 'px';
-    updateSendButtonState();
+function escapeHTML(value) {
+  return String(value || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
 }
 
+function cleanSessionName(name) {
+  const base = String(name || "New conversation").replace(/\.json$/, "");
+  return base
+    .replace(/_\d{8}_\d{6}(?:_\d+)?$/, "")
+    .replace(/_/g, " ")
+    .replace(/^Active Session$/, "New conversation");
+}
+
+function titleForSession(name) {
+  const clean = cleanSessionName(name);
+  return clean === "New conversation" ? "Selene" : `${clean} - Selene`;
+}
+
+function toast(message) {
+  const node = document.createElement("div");
+  node.className = "toast";
+  node.textContent = message;
+  document.getElementById("toast-region")?.appendChild(node);
+  setTimeout(() => node.remove(), 3600);
+}
