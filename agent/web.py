@@ -93,6 +93,32 @@ def save_session(name: str) -> str:
     return filename
 
 
+def autosave_session() -> str | None:
+    """Create or update the active chat without requiring a manual save."""
+    if not GLOBAL_STATE["history"]:
+        return None
+
+    filename = GLOBAL_STATE.get("active_session_name", "")
+    filepath = os.path.join(_SESSIONS_DIR, os.path.basename(filename))
+    if filename in ("", "Active Session", "New conversation") or not os.path.isfile(filepath):
+        first_user = next(
+            (m.get("content", "") for m in GLOBAL_STATE["history"] if m.get("role") == "user"),
+            "Conversation",
+        )
+        title = " ".join(first_user.strip().split()[:6]) or "Conversation"
+        return save_session(title[:60])
+
+    payload = {
+        "saved_at": datetime.now(timezone.utc).isoformat(),
+        "model": MODEL_NAME,
+        "session": GLOBAL_STATE["session"],
+        "history": GLOBAL_STATE["history"],
+    }
+    with open(filepath, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+    return filename
+
+
 def load_session(filename: str) -> None:
     """Load session from a JSON file.
     
@@ -110,6 +136,14 @@ def load_session(filename: str) -> None:
         data = json.load(f)
         
     GLOBAL_STATE["history"] = data.get("history", [])
+    GLOBAL_STATE["session"] = {
+        **GLOBAL_STATE["session"],
+        **data.get("session", {}),
+        "options": {
+            **GLOBAL_STATE["session"].get("options", {}),
+            **data.get("session", {}).get("options", {}),
+        },
+    }
     GLOBAL_STATE["active_session_name"] = filename
 
 
@@ -562,6 +596,8 @@ def generate_chat_events(user_input: str, session_data: dict, history_data: list
     # 3. Build messages to send
     if session_data.get("history", True):
         history_data.append({"role": "user", "content": user_input})
+        # Persist the prompt immediately so stopping a generation cannot lose it.
+        autosave_session()
         messages_to_send = _trim_history(history_data)
     else:
         messages_to_send = []
@@ -645,7 +681,7 @@ def generate_chat_events(user_input: str, session_data: dict, history_data: list
             yield {
                 "type": "token_usage", 
                 "total": prompt_tokens + eval_tokens,
-                "budget": 8192
+                "budget": int(session_data.get("options", {}).get("num_ctx", 8192))
             }
             
         # Compile assistant message
@@ -660,7 +696,13 @@ def generate_chat_events(user_input: str, session_data: dict, history_data: list
             
         # If there are no tool calls, this turn is completed
         if not tool_calls:
-            yield {"type": "done", "history": history_data}
+            autosave_session()
+            yield {
+                "type": "done",
+                "history": history_data,
+                "active_session_name": GLOBAL_STATE["active_session_name"],
+                "saved_sessions": list_saved_sessions(),
+            }
             break
             
         # Execute tool calls
@@ -756,6 +798,8 @@ class AgentHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header('Content-Type', content_type)
             self.send_header('Content-Length', str(len(content)))
+            self.send_header('Cache-Control', 'no-store, no-cache, must-revalidate')
+            self.send_header('Pragma', 'no-cache')
             self.send_header('Access-Control-Allow-Origin', '*')
             self.end_headers()
             self.wfile.write(content)
@@ -801,7 +845,7 @@ class AgentHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
             return
             
         elif self.path == '/avatar.png':
-            self.serve_static_file('avatar.png', 'image/png')
+            self.serve_static_file('avatar.png', 'image/jpeg')
             return
             
         else:
@@ -822,6 +866,7 @@ class AgentHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
             try:
                 body = self.read_json_body()
                 GLOBAL_STATE["session"] = body
+                autosave_session()
                 self.send_json_response(200, {"status": "success", "settings": GLOBAL_STATE["session"]})
             except Exception as e:
                 self.send_json_response(400, {"status": "error", "error": str(e)})
@@ -877,8 +922,38 @@ class AgentHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
             except Exception as e:
                 self.send_json_response(500, {"status": "error", "error": str(e)})
             return
+
+        # 5. Start a fresh session after safely persisting the current one
+        elif self.path == '/api/new-session':
+            autosave_session()
+            GLOBAL_STATE["history"] = []
+            GLOBAL_STATE["active_session_name"] = "Active Session"
+            self.send_json_response(200, {
+                "status": "success",
+                "saved_sessions": list_saved_sessions(),
+            })
+            return
+
+        # 6. Permanently delete a saved conversation
+        elif self.path == '/api/delete-session':
+            try:
+                body = self.read_json_body()
+                name = os.path.basename(body.get("name", ""))
+                if not name or name not in list_saved_sessions():
+                    raise FileNotFoundError("Session not found")
+                os.remove(os.path.join(_SESSIONS_DIR, name))
+                if GLOBAL_STATE["active_session_name"] == name:
+                    GLOBAL_STATE["history"] = []
+                    GLOBAL_STATE["active_session_name"] = "Active Session"
+                self.send_json_response(200, {
+                    "status": "success",
+                    "saved_sessions": list_saved_sessions(),
+                })
+            except Exception as e:
+                self.send_json_response(404, {"status": "error", "error": str(e)})
+            return
             
-        # 5. Clear Session history
+        # 7. Clear Session history
         elif self.path == '/api/clear-session':
             GLOBAL_STATE["history"].clear()
             GLOBAL_STATE["session"]["system"] = ""
@@ -912,6 +987,14 @@ def start_web_server():
     Attempts to bind to port 5005. If unavailable, falls back to a random free port.
     It will also launch the default web browser automatically.
     """
+    # Restore the most recent autosaved chat when the server is restarted.
+    saved_sessions = list_saved_sessions()
+    if saved_sessions and not GLOBAL_STATE["history"]:
+        try:
+            load_session(saved_sessions[0])
+        except (OSError, ValueError, json.JSONDecodeError):
+            pass
+
     # Attempt to bind to default port 5005 first, then fall back to random port
     host = '127.0.0.1'
     if '--public' in sys.argv:

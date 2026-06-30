@@ -1,7 +1,6 @@
 const { app, BrowserWindow } = require('electron');
 const path = require('path');
 const { spawn } = require('child_process');
-const fs = require('fs');
 
 let mainWindow;
 let pythonProcess;
@@ -27,25 +26,19 @@ function createWindow(port) {
 }
 
 function startPythonBackend() {
-  let backendPath;
   const isWindows = process.platform === 'win32';
   const backendExecName = isWindows ? 'selene-backend.exe' : 'selene-backend';
 
   if (app.isPackaged) {
     // In production, the executable is inside resources/
-    backendPath = path.join(process.resourcesPath, backendExecName);
-  } else {
-    // In dev, the executable is in dist/ (or just run `python main.py` optionally)
-    backendPath = path.join(__dirname, '../dist', backendExecName);
-  }
-
-  // Fallback to python script directly if backend executable doesn't exist (e.g., during rapid dev)
-  if (!fs.existsSync(backendPath)) {
-    console.log(`Backend executable not found at ${backendPath}, falling back to python script...`);
-    pythonProcess = spawn('python3', [path.join(__dirname, '../main.py'), '--no-browser']);
-  } else {
+    const backendPath = path.join(process.resourcesPath, backendExecName);
     console.log(`Starting backend executable from ${backendPath}...`);
     pythonProcess = spawn(backendPath, ['--no-browser']);
+  } else {
+    // Development must use source so frontend edits are never hidden by a stale dist build.
+    const sourceBackend = path.join(__dirname, '../main.py');
+    console.log(`Starting development backend from ${sourceBackend}...`);
+    pythonProcess = spawn('python3', [sourceBackend, '--no-browser']);
   }
 
   pythonProcess.stdout.on('data', (data) => {

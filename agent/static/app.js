@@ -49,6 +49,7 @@ const state = {
   activeSessionName: "New conversation",
   modelName: "selene",
   isGenerating: false,
+  followOutput: true,
   controller: null,
   stream: {
     assistantStack: null,
@@ -62,6 +63,11 @@ const state = {
     open: false,
     selected: 0,
     matches: []
+  },
+  sky: {
+    frame: null,
+    resizeObserver: null,
+    scene: null
   }
 };
 
@@ -82,13 +88,15 @@ function bindElements() {
   el.contextFill = document.getElementById("context-fill");
   el.contextMeter = document.querySelector(".context-meter");
   el.sessionList = document.getElementById("session-list");
-  el.connection = document.getElementById("connection-label");
   el.title = document.getElementById("chat-title");
   el.history = document.getElementById("setting-history");
   el.think = document.getElementById("setting-think");
   el.temperature = document.getElementById("setting-temperature");
   el.temperatureValue = document.getElementById("temperature-value");
   el.context = document.getElementById("setting-context");
+  el.system = document.getElementById("setting-system");
+  el.settingsPanel = document.getElementById("settings-panel");
+  el.settingsBackdrop = document.getElementById("settings-backdrop");
   el.slashMenu = document.getElementById("slash-menu");
 }
 
@@ -120,9 +128,25 @@ function bindEvents() {
     }
   });
 
-  document.getElementById("new-chat-btn")?.addEventListener("click", clearConversation);
-  document.getElementById("clear-btn")?.addEventListener("click", clearConversation);
-  document.getElementById("save-btn")?.addEventListener("click", saveSession);
+  document.getElementById("new-chat-btn")?.addEventListener("click", newConversation);
+  document.getElementById("settings-btn")?.addEventListener("click", openSettings);
+  document.getElementById("settings-close")?.addEventListener("click", closeSettings);
+  el.settingsBackdrop?.addEventListener("click", closeSettings);
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && el.settingsPanel?.classList.contains("open")) closeSettings();
+  });
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) stopWelcomeSky();
+    else if (el.messages?.querySelector(".welcome")) startWelcomeSky();
+  });
+
+  el.messages?.addEventListener("wheel", (event) => {
+    if (event.deltaY < 0) state.followOutput = false;
+  }, { passive: true });
+  el.messages?.addEventListener("touchmove", () => { state.followOutput = false; }, { passive: true });
+  el.messages?.addEventListener("scroll", () => {
+    if (distanceFromBottom() < 24) state.followOutput = true;
+  }, { passive: true });
 
   el.history?.addEventListener("change", () => {
     state.settings.history = el.history.checked;
@@ -148,6 +172,13 @@ function bindEvents() {
     persistSettings();
     updateContextMeter();
   });
+
+  const persistSystemPrompt = debounce(persistSettings, 350);
+  el.system?.addEventListener("input", () => {
+    state.settings.system = el.system.value;
+    updateContextMeter();
+    persistSystemPrompt();
+  });
 }
 
 async function loadState() {
@@ -162,7 +193,6 @@ async function loadState() {
     state.activeSessionName = data.active_session_name || "New conversation";
     state.modelName = data.model_name || "selene";
 
-    el.connection.textContent = data.ollama_status === "Online" ? "Ollama online" : "Ollama offline";
     document.title = titleForSession(state.activeSessionName);
     el.title.textContent = cleanSessionName(state.activeSessionName);
 
@@ -171,7 +201,6 @@ async function loadState() {
     renderMessages();
     updateComposerState();
   } catch (error) {
-    el.connection.textContent = "Backend unavailable";
     toast("Could not reach Selene. Make sure the backend and Ollama are running.");
     renderWelcome();
   }
@@ -195,6 +224,7 @@ function cloneSettings(settings) {
 function syncSettingsUI() {
   if (el.history) el.history.checked = state.settings.history !== false;
   if (el.think) el.think.checked = state.settings.think !== false;
+  if (el.system) el.system.value = state.settings.system || "";
 
   const temp = Number(state.settings.options?.temperature ?? 0.7);
   if (el.temperature) el.temperature.value = String(temp);
@@ -229,26 +259,35 @@ function renderSessions() {
   if (!el.sessionList) return;
   el.sessionList.innerHTML = "";
 
-  if (!state.savedSessions.length) {
-    const empty = document.createElement("div");
-    empty.className = "empty-sessions";
-    empty.textContent = "Saved chats will appear here.";
-    el.sessionList.appendChild(empty);
-    return;
-  }
+  if (!state.savedSessions.length) return;
 
   state.savedSessions.forEach((name) => {
+    const item = document.createElement("div");
+    item.className = `session-item${name === state.activeSessionName ? " active" : ""}`;
     const button = document.createElement("button");
     button.type = "button";
-    button.className = "session-item";
+    button.className = "session-open";
     button.textContent = cleanSessionName(name);
     button.title = name;
     button.addEventListener("click", () => loadSession(name));
-    el.sessionList.appendChild(button);
+
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "session-delete";
+    remove.setAttribute("aria-label", `Delete ${cleanSessionName(name)}`);
+    remove.title = "Delete chat";
+    remove.innerHTML = `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M9 7V4h6v3m3 0-1 14H7L6 7m4 4v6m4-6v6"/></svg>`;
+    remove.addEventListener("click", (event) => {
+      event.stopPropagation();
+      deleteSession(name);
+    });
+    item.append(button, remove);
+    el.sessionList.appendChild(item);
   });
 }
 
 function renderMessages() {
+  stopWelcomeSky();
   el.messages.innerHTML = "";
   const display = toDisplayMessages(state.history);
 
@@ -299,7 +338,8 @@ function toDisplayMessages(history) {
 function renderWelcome() {
   el.messages.innerHTML = `
     <div class="welcome">
-      <h3>Selene</h3>
+      <canvas class="welcome-sky" aria-hidden="true"></canvas>
+      <h3 data-text="Selene">Selene</h3>
       <p>A clean local AI chat interface for thinking, tools, and answers in one dark workspace.</p>
       <div class="suggestions">
         <button class="suggestion" type="button" data-prompt="Summarize this project and identify the most important files.">
@@ -326,14 +366,150 @@ function renderWelcome() {
       el.input.focus();
     });
   });
+  startWelcomeSky();
+}
+
+function startWelcomeSky() {
+  stopWelcomeSky();
+  const canvas = el.messages.querySelector(".welcome-sky");
+  const context = canvas?.getContext("2d");
+  if (!canvas || !context || document.hidden) return;
+
+  const now = performance.now();
+  const scene = {
+    canvas,
+    context,
+    width: 0,
+    height: 0,
+    lastFrame: now,
+    shootingStar: null,
+    nextShootingStar: now + randomBetween(14000, 30000),
+    stars: Array.from({ length: 28 }, () => newCanvasStar(now, true))
+  };
+  state.sky.scene = scene;
+
+  const resize = () => {
+    const bounds = canvas.getBoundingClientRect();
+    const ratio = Math.min(window.devicePixelRatio || 1, 2);
+    scene.width = Math.max(1, bounds.width);
+    scene.height = Math.max(1, bounds.height);
+    canvas.width = Math.round(scene.width * ratio);
+    canvas.height = Math.round(scene.height * ratio);
+    context.setTransform(ratio, 0, 0, ratio, 0, 0);
+  };
+  resize();
+  state.sky.resizeObserver = new ResizeObserver(resize);
+  state.sky.resizeObserver.observe(canvas);
+
+  const drawFrame = (timestamp) => {
+    if (!canvas.isConnected || document.hidden || state.sky.scene !== scene) return;
+    const delta = Math.min(34, Math.max(0, timestamp - scene.lastFrame));
+    scene.lastFrame = timestamp;
+    drawWelcomeSky(scene, timestamp, delta);
+    state.sky.frame = requestAnimationFrame(drawFrame);
+  };
+  state.sky.frame = requestAnimationFrame(drawFrame);
+}
+
+function stopWelcomeSky() {
+  if (state.sky.frame !== null) cancelAnimationFrame(state.sky.frame);
+  state.sky.resizeObserver?.disconnect();
+  state.sky.frame = null;
+  state.sky.resizeObserver = null;
+  state.sky.scene = null;
+}
+
+function newCanvasStar(now, initial = false) {
+  return {
+    x: Math.random(),
+    y: Math.random(),
+    radius: randomBetween(.45, 1.25),
+    brightness: randomBetween(.28, .72),
+    born: now + (initial ? randomBetween(-5000, 1200) : randomBetween(350, 2600)),
+    duration: randomBetween(4500, 10000)
+  };
+}
+
+function drawWelcomeSky(scene, now, delta) {
+  const { context, width, height, stars } = scene;
+  context.clearRect(0, 0, width, height);
+
+  stars.forEach((star, index) => {
+    const progress = (now - star.born) / star.duration;
+    if (progress >= 1) {
+      stars[index] = newCanvasStar(now);
+      return;
+    }
+    if (progress < 0) return;
+    const opacity = Math.pow(Math.sin(Math.PI * progress), 1.7) * star.brightness;
+    context.beginPath();
+    context.arc(star.x * width, star.y * height, star.radius, 0, Math.PI * 2);
+    context.fillStyle = `rgba(240, 244, 255, ${opacity})`;
+    context.fill();
+  });
+
+  if (!scene.shootingStar && now >= scene.nextShootingStar) {
+    const angle = randomBetween(14, 27) * Math.PI / 180;
+    const speed = randomBetween(250, 350);
+    scene.shootingStar = {
+      x: randomBetween(width * .02, width * .52),
+      y: randomBetween(height * .04, height * .45),
+      vx: Math.cos(angle) * speed,
+      vy: Math.sin(angle) * speed,
+      age: 0,
+      duration: randomBetween(1.8, 2.5),
+      trail: randomBetween(72, 118)
+    };
+  }
+
+  const shot = scene.shootingStar;
+  if (!shot) return;
+  shot.age += delta / 1000;
+  shot.x += shot.vx * delta / 1000;
+  shot.y += shot.vy * delta / 1000;
+  const speed = Math.hypot(shot.vx, shot.vy);
+  const ux = shot.vx / speed;
+  const uy = shot.vy / speed;
+  const fadeIn = Math.min(1, shot.age / .24);
+  const fadeOut = Math.min(1, Math.max(0, (shot.duration - shot.age) / .9));
+  const opacity = Math.min(fadeIn, fadeOut) * .82;
+  const tailX = shot.x - ux * shot.trail;
+  const tailY = shot.y - uy * shot.trail;
+  const streak = context.createLinearGradient(tailX, tailY, shot.x, shot.y);
+  streak.addColorStop(0, "rgba(255,255,255,0)");
+  streak.addColorStop(.55, `rgba(238,243,255,${opacity * .22})`);
+  streak.addColorStop(1, `rgba(255,255,255,${opacity})`);
+  context.beginPath();
+  context.moveTo(tailX, tailY);
+  context.lineTo(shot.x, shot.y);
+  context.lineWidth = .9;
+  context.strokeStyle = streak;
+  context.stroke();
+  context.beginPath();
+  context.arc(shot.x, shot.y, 1.15, 0, Math.PI * 2);
+  context.fillStyle = `rgba(255,255,255,${opacity})`;
+  context.fill();
+
+  if (shot.age >= shot.duration || shot.x > width + shot.trail || shot.y > height + shot.trail) {
+    scene.shootingStar = null;
+    scene.nextShootingStar = now + randomBetween(24000, 52000);
+  }
+}
+
+function randomBetween(min, max) {
+  return min + Math.random() * (max - min);
 }
 
 function appendUserMessage(text, scroll = true) {
+  stopWelcomeSky();
   el.messages.querySelector(".welcome")?.remove();
   const row = messageShell("user", "You");
   row.stack.appendChild(bubble(text, false));
   el.messages.appendChild(row.root);
-  if (scroll) scrollToBottom(true);
+  if (scroll) {
+    state.followOutput = true;
+    scrollToBottom(true);
+  }
 }
 
 function appendAssistantMessage(message, scroll = true) {
@@ -363,7 +539,14 @@ function messageShell(role, avatarText) {
 
   const avatar = document.createElement("div");
   avatar.className = "avatar";
-  avatar.textContent = avatarText;
+  if (role === "assistant") {
+    const image = document.createElement("img");
+    image.src = "/avatar.png";
+    image.alt = "Selene";
+    avatar.appendChild(image);
+  } else {
+    avatar.textContent = avatarText;
+  }
 
   const stack = document.createElement("div");
   stack.className = "message-stack";
@@ -407,6 +590,7 @@ async function sendMessage() {
 
   closeSlashMenu();
   appendUserMessage(text);
+  if (!text.startsWith("/")) state.history.push({ role: "user", content: text });
   el.input.value = "";
   resizeComposer();
   updateComposerState();
@@ -504,6 +688,12 @@ function handleStreamEvent(event) {
       break;
     case "done":
       if (event.history) state.history = event.history;
+      if (event.active_session_name) state.activeSessionName = event.active_session_name;
+      if (event.saved_sessions) state.savedSessions = event.saved_sessions;
+      el.title.textContent = cleanSessionName(state.activeSessionName);
+      document.title = titleForSession(state.activeSessionName);
+      renderSessions();
+      updateContextMeter();
       finishGeneration();
       break;
   }
@@ -537,6 +727,7 @@ function stopGeneration() {
   state.controller?.abort();
   toast("Generation stopped.");
   finishGeneration();
+  refreshSessions().catch(() => {});
 }
 
 function appendStatus(text) {
@@ -565,6 +756,75 @@ async function clearConversation() {
   } catch {
     toast("Could not clear the conversation.");
   }
+}
+
+async function newConversation() {
+  if (state.isGenerating) stopGeneration();
+  try {
+    const response = await fetch("/api/new-session", { method: "POST" });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    state.history = [];
+    state.activeSessionName = "New conversation";
+    el.title.textContent = "New conversation";
+    document.title = "Selene";
+    state.followOutput = true;
+    renderWelcome();
+    updateContextMeter();
+    await refreshSessions();
+  } catch {
+    toast("Could not start a new conversation.");
+  }
+}
+
+async function deleteSession(name) {
+  if (!window.confirm(`Delete “${cleanSessionName(name)}”? This cannot be undone.`)) return;
+  try {
+    const response = await fetch("/api/delete-session", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name })
+    });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    if (name === state.activeSessionName) {
+      state.history = [];
+      state.activeSessionName = "New conversation";
+      el.title.textContent = "New conversation";
+      document.title = "Selene";
+      renderWelcome();
+      updateContextMeter();
+    }
+    await refreshSessions();
+    toast("Chat deleted.");
+  } catch {
+    toast("Could not delete that chat.");
+  }
+}
+
+async function refreshSessions() {
+  const response = await fetch("/api/settings");
+  if (!response.ok) return;
+  const data = await response.json();
+  state.savedSessions = data.saved_sessions || [];
+  state.activeSessionName = data.active_session_name || state.activeSessionName;
+  renderSessions();
+}
+
+function openSettings() {
+  el.settingsBackdrop.hidden = false;
+  requestAnimationFrame(() => {
+    el.settingsBackdrop.classList.add("open");
+    el.settingsPanel.classList.add("open");
+    el.settingsPanel.setAttribute("aria-hidden", "false");
+  });
+  document.getElementById("settings-close")?.focus();
+}
+
+function closeSettings() {
+  el.settingsBackdrop?.classList.remove("open");
+  el.settingsPanel?.classList.remove("open");
+  el.settingsPanel?.setAttribute("aria-hidden", "true");
+  setTimeout(() => { if (el.settingsBackdrop) el.settingsBackdrop.hidden = true; }, 180);
+  document.getElementById("settings-btn")?.focus();
 }
 
 async function saveSession() {
@@ -753,9 +1013,16 @@ function updateContextMeter(forcedUsed = null, forcedBudget = null) {
 
 function estimatedContextTokens() {
   const historyText = state.history
-    .map((message) => `${message.content || ""}\n${message.thinking || ""}`)
-    .join("\n");
-  return estimateTokens(`${historyText}\n${el.input?.value || ""}`);
+    .filter((message) => message.role !== "system")
+    .map((message) => [
+    message.role || "",
+    message.content || "",
+    message.thinking || "",
+    JSON.stringify(message.tool_calls || "")
+  ].join("\n")).join("\n");
+  const systemPrompt = state.settings.system ||
+    (state.history.find((message) => message.role === "system")?.content || "");
+  return estimateTokens(`${systemPrompt}\n${historyText}\n${el.input?.value || ""}`);
 }
 
 function estimateTokens(text) {
@@ -774,20 +1041,90 @@ function resizeComposer() {
 
 function scrollToBottom(force = false) {
   if (!el.messages) return;
-  const nearBottom = el.messages.scrollHeight - el.messages.scrollTop - el.messages.clientHeight < 160;
-  if (force || nearBottom) el.messages.scrollTop = el.messages.scrollHeight;
+  if (force || state.followOutput) el.messages.scrollTop = el.messages.scrollHeight;
+}
+
+function distanceFromBottom() {
+  if (!el.messages) return 0;
+  return el.messages.scrollHeight - el.messages.scrollTop - el.messages.clientHeight;
 }
 
 function renderMarkdown(text) {
-  const escaped = escapeHTML(text || "");
-  const withCode = escaped.replace(/```([\s\S]*?)```/g, (_, code) => `<pre><code>${code.trim()}</code></pre>`);
-  return withCode
-    .split(/\n{2,}/)
-    .map((chunk) => {
-      if (chunk.startsWith("<pre>")) return chunk;
-      return `<p>${chunk.replace(/\n/g, "<br>")}</p>`;
-    })
-    .join("");
+  const lines = String(text || "").replace(/\r/g, "").split("\n");
+  const output = [];
+  let paragraph = [];
+  let listType = "";
+  let inCode = false;
+  let code = [];
+  let language = "";
+
+  const flushParagraph = () => {
+    if (paragraph.length) output.push(`<p>${inlineMarkdown(paragraph.join("\n")).replace(/\n/g, "<br>")}</p>`);
+    paragraph = [];
+  };
+  const closeList = () => {
+    if (listType) output.push(`</${listType}>`);
+    listType = "";
+  };
+
+  lines.forEach((line) => {
+    const fence = line.match(/^```\s*([\w+-]*)/);
+    if (fence) {
+      if (inCode) {
+        output.push(`<pre><code${language ? ` class="language-${escapeHTML(language)}"` : ""}>${escapeHTML(code.join("\n"))}</code></pre>`);
+        code = []; language = ""; inCode = false;
+      } else {
+        flushParagraph(); closeList(); inCode = true; language = fence[1] || "";
+      }
+      return;
+    }
+    if (inCode) { code.push(line); return; }
+    if (!line.trim()) { flushParagraph(); closeList(); return; }
+
+    const heading = line.match(/^(#{1,6})\s+(.+)$/);
+    if (heading) { flushParagraph(); closeList(); const level = heading[1].length; output.push(`<h${level}>${inlineMarkdown(heading[2])}</h${level}>`); return; }
+    if (/^\s*([-*_])(?:\s*\1){2,}\s*$/.test(line)) { flushParagraph(); closeList(); output.push("<hr>"); return; }
+    const quote = line.match(/^>\s?(.*)$/);
+    if (quote) { flushParagraph(); closeList(); output.push(`<blockquote>${inlineMarkdown(quote[1])}</blockquote>`); return; }
+    const unordered = line.match(/^\s*[-*+]\s+(.+)$/);
+    const ordered = line.match(/^\s*\d+[.)]\s+(.+)$/);
+    if (unordered || ordered) {
+      flushParagraph();
+      const wanted = ordered ? "ol" : "ul";
+      if (listType !== wanted) { closeList(); output.push(`<${wanted}>`); listType = wanted; }
+      output.push(`<li>${inlineMarkdown((unordered || ordered)[1])}</li>`);
+      return;
+    }
+    closeList(); paragraph.push(line);
+  });
+  if (inCode) output.push(`<pre><code>${escapeHTML(code.join("\n"))}</code></pre>`);
+  flushParagraph(); closeList();
+  return output.join("");
+}
+
+function inlineMarkdown(text) {
+  let value = escapeHTML(text);
+  const codeSpans = [];
+  value = value.replace(/`([^`]+)`/g, (_, code) => {
+    codeSpans.push(`<code>${code}</code>`);
+    return `\u0000CODE${codeSpans.length - 1}\u0000`;
+  });
+  value = value
+    .replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>')
+    .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+    .replace(/__([^_]+)__/g, "<strong>$1</strong>")
+    .replace(/~~([^~]+)~~/g, "<del>$1</del>")
+    .replace(/(^|[^*])\*([^*\n]+)\*/g, "$1<em>$2</em>")
+    .replace(/(^|[^_])_([^_\n]+)_/g, "$1<em>$2</em>");
+  return value.replace(/\u0000CODE(\d+)\u0000/g, (_, index) => codeSpans[Number(index)]);
+}
+
+function debounce(fn, delay) {
+  let timer;
+  return (...args) => {
+    clearTimeout(timer);
+    timer = setTimeout(() => fn(...args), delay);
+  };
 }
 
 function formatJSON(value) {
@@ -813,7 +1150,7 @@ function escapeHTML(value) {
 function cleanSessionName(name) {
   const base = String(name || "New conversation").replace(/\.json$/, "");
   return base
-    .replace(/_\d{8}_\d{6}$/, "")
+    .replace(/_\d{8}_\d{6}(?:_\d+)?$/, "")
     .replace(/_/g, " ")
     .replace(/^Active Session$/, "New conversation");
 }
