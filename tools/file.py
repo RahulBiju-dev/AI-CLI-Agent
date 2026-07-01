@@ -9,6 +9,7 @@ DEFAULT_MAX_CHARS = 14000
 DEFAULT_CHUNK_SIZE = 12000
 MAX_CHARS_CAP = 50000
 MAX_QUERY_MATCHES = 12
+MAX_DIRECT_FILE_BYTES = 50 * 1024 * 1024
 BINARY_DOCUMENT_TYPES = {
     ".pdf": "pdf",
     ".docx": "docx",
@@ -144,33 +145,58 @@ def read_file(
 
     ext = os.path.splitext(file_path)[1].lower()
     file_size_bytes = os.path.getsize(file_path)
-
-    if ext == ".pdf":
-        try:
-            from tools.vault_indexer import extract_pdf_with_vision
-            text, info = extract_pdf_with_vision(file_path)
-            if text.startswith("Error reading PDF:"):
-                return _json({"error": text})
-        except Exception as exc:
-            return _json({"error": f"Error reading PDF with vision: {exc}"})
-    else:
-        try:
-            with open(file_path, "r", encoding="utf-8") as f:
-                text = f.read()
-        except UnicodeDecodeError:
-            binary_type = BINARY_DOCUMENT_TYPES.get(ext)
-            hint = "Use read_document for this file type." if binary_type else "This appears to be a binary file."
-            return _json({
-                "error": f"Cannot read file as UTF-8 text: {file_path}",
-                "binary": True,
-                "binary_type": binary_type,
-                "hint": hint,
-            })
-        except Exception as exc:
-            return _json({"error": f"Error reading file: {exc}"})
-
     max_chars_int = _positive_int(max_chars, DEFAULT_MAX_CHARS, minimum=1000, maximum=MAX_CHARS_CAP)
     chunk_size_int = _positive_int(chunk_size, DEFAULT_CHUNK_SIZE, minimum=1000, maximum=MAX_CHARS_CAP)
+    if query is not None:
+        query = str(query).strip()
+        if len(query) > 4000:
+            return _json({"error": "query exceeds the 4000-character limit"})
+
+    if ext in BINARY_DOCUMENT_TYPES:
+        from tools.document import read_document
+        if lines:
+            return _json({"error": "The lines parameter is for text files. Use read_document pages for PDF files."})
+        return read_document(file_path, query=query, chunk=chunk, chunk_size=chunk_size, max_chars=max_chars)
+
+    if lines:
+        try:
+            with open(file_path, "r", encoding="utf-8") as stream:
+                total_lines = sum(1 for _ in stream)
+            line_range = _parse_line_range(lines, total_lines)
+            start_line, end_line = line_range
+            selected = []
+            with open(file_path, "r", encoding="utf-8") as stream:
+                for line_number, value in enumerate(stream, start=1):
+                    if line_number > end_line:
+                        break
+                    if line_number >= start_line:
+                        selected.append(value)
+            display_text = _line_numbered(selected, start_line)
+            truncated = len(display_text) > max_chars_int
+            if truncated:
+                display_text = display_text[:max_chars_int].rstrip() + "\n\n...[Line range truncated. Request fewer lines.]"
+            return _json({
+                "file": file_path, "size_bytes": file_size_bytes, "line_count": total_lines,
+                "mode": "lines", "lines": f"{start_line}-{end_line}", "text": display_text,
+                "returned_chars": len(display_text), "truncated": truncated,
+            })
+        except (OSError, UnicodeDecodeError, ValueError) as exc:
+            return _json({"error": str(exc), "file": file_path, "size_bytes": file_size_bytes})
+
+    if file_size_bytes > MAX_DIRECT_FILE_BYTES:
+        return _json({
+            "error": f"File is too large for direct full/query reading ({file_size_bytes} bytes)",
+            "max_direct_bytes": MAX_DIRECT_FILE_BYTES,
+            "guidance": "Use index_vault and vault_search, or request a specific line range.",
+        })
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            text = f.read()
+    except UnicodeDecodeError:
+        return _json({"error": f"Cannot read file as UTF-8 text: {file_path}", "binary": True, "hint": "This appears to be a binary file."})
+    except OSError as exc:
+        return _json({"error": f"Error reading file: {exc}"})
+
     file_lines = text.splitlines(keepends=True)
 
     base = {
@@ -192,22 +218,6 @@ def read_file(
             })
             return _json(base)
 
-        line_range = _parse_line_range(lines, len(file_lines)) if lines else None
-        if line_range:
-            start_line, end_line = line_range
-            selected_lines = file_lines[start_line - 1:end_line]
-            display_text = _line_numbered(selected_lines, start_line)
-            truncated = len(display_text) > max_chars_int
-            if truncated:
-                display_text = display_text[:max_chars_int].rstrip() + "\n\n...[Line range truncated. Request fewer lines.]"
-            base.update({
-                "mode": "lines",
-                "lines": f"{start_line}-{end_line}",
-                "text": display_text,
-                "returned_chars": len(display_text),
-                "truncated": truncated,
-            })
-            return _json(base)
     except ValueError as exc:
         return _json({"error": str(exc), **base})
 
@@ -276,13 +286,17 @@ def create_file(file_path: str, content: str) -> str:
     )
 
     try:
-        # Resolve the target inside the vaults directory
-        basename = os.path.basename(file_path)
-        VAULTS_DIR = os.path.expanduser("~/.selene-agent/vaults")
+        basename = os.path.basename(str(file_path).strip())
+        if basename in {"", ".", "..", ".vault_aliases.json"}:
+            return _json({"error": "file_path must contain a valid filename"})
+        if not isinstance(content, str):
+            content = str(content)
+        if len(content.encode("utf-8")) > 10 * 1024 * 1024:
+            return _json({"error": "File content exceeds the 10 MiB creation limit"})
         vault_file_path = os.path.join(VAULTS_DIR, basename)
         os.makedirs(VAULTS_DIR, exist_ok=True)
 
-        with open(vault_file_path, "w", encoding="utf-8") as f:
+        with open(vault_file_path, "x", encoding="utf-8") as f:
             f.write(content)
 
         # Derive a collection name from the filename (without extension)
@@ -290,27 +304,33 @@ def create_file(file_path: str, content: str) -> str:
         collection_name = sanitize_collection_name(stem)
 
         # Index the file into its own vault collection
-        index_result = index_vault(
-            vault_path=VAULTS_DIR,
-            file_path=vault_file_path,
-            collection=collection_name,
-        )
-
-        # Register a friendly alias (the original stem, spaces and all)
-        register_vault_alias(
-            alias=stem,
-            collection_name=collection_name,
-            file_path=vault_file_path,
-        )
+        try:
+            index_result = index_vault(
+                vault_path=VAULTS_DIR,
+                file_path=vault_file_path,
+                collection=collection_name,
+            )
+            parsed_index = json.loads(index_result) if isinstance(index_result, str) else index_result
+        except Exception as exc:
+            parsed_index = {"error": str(exc)}
+        index_error = parsed_index.get("error") if isinstance(parsed_index, dict) else None
+        if not index_error:
+            try:
+                register_vault_alias(alias=stem, collection_name=collection_name, file_path=vault_file_path)
+            except Exception as exc:
+                parsed_index = {**parsed_index, "alias_warning": str(exc)}
 
         return _json({
             "success": True,
-            "message": f"Created and indexed file at {vault_file_path}",
+            "indexed": not bool(index_error),
+            "message": f"Created file at {vault_file_path}" + (" but indexing failed" if index_error else " and indexed it"),
             "vault_path": vault_file_path,
             "collection": collection_name,
             "alias": stem,
-            "index_result": json.loads(index_result) if isinstance(index_result, str) else index_result,
+            "index_result": parsed_index,
             "hint": f"Use vault_search with collection='{collection_name}' or reference the alias '{stem}' to search this file.",
         })
+    except FileExistsError:
+        return _json({"error": f"File already exists and was not overwritten: {vault_file_path}"})
     except Exception as exc:
         return _json({"error": f"Error creating file: {exc}"})

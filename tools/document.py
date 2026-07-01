@@ -49,8 +49,13 @@ def _parse_page_spec(pages: str | None, page_count: int) -> list[int]:
     if not pages:
         return []
 
+    if len(pages) > 1000:
+        raise ValueError("Page specification exceeds the 1000-character limit")
+    parts = pages.split(",")
+    if len(parts) > 200:
+        raise ValueError("Page specification contains too many ranges")
     selected: set[int] = set()
-    for part in pages.split(","):
+    for part in parts:
         part = part.strip()
         if not part:
             continue
@@ -63,9 +68,10 @@ def _parse_page_spec(pages: str | None, page_count: int) -> list[int]:
                 raise ValueError(f"Invalid page range: {part}") from exc
             if start > end:
                 start, end = end, start
-            for page in range(start, end + 1):
-                if 1 <= page <= page_count:
-                    selected.add(page - 1)
+            bounded_start = max(1, start)
+            bounded_end = min(page_count, end)
+            if bounded_start <= bounded_end:
+                selected.update(range(bounded_start - 1, bounded_end))
         else:
             try:
                 page = int(part)
@@ -83,7 +89,19 @@ def _chunk_text(text: str, chunk_size: int = DEFAULT_CHUNK_SIZE) -> list[str]:
     chunk_size = _positive_int(chunk_size, DEFAULT_CHUNK_SIZE, minimum=1000, maximum=MAX_CHUNK_SIZE)
     if len(text) <= chunk_size:
         return [text]
-    return [text[start:start + chunk_size] for start in range(0, len(text), chunk_size)]
+    chunks = []
+    start = 0
+    while start < len(text):
+        hard_end = min(len(text), start + chunk_size)
+        end = hard_end
+        if hard_end < len(text):
+            window = text[start:hard_end]
+            boundary = max(window.rfind("\n\n"), window.rfind("\n"), window.rfind(". "))
+            if boundary >= chunk_size // 2:
+                end = start + boundary + 1
+        chunks.append(text[start:end])
+        start = end
+    return chunks
 
 
 def _snippet(text: str, query: str, max_chars: int = 900) -> str:
@@ -156,6 +174,12 @@ def _extract_pdf_segments(file_path: str, pages: str | None = None, preview_char
     preview_limited = False
     with open(file_path, "rb") as f:
         reader = pypdf.PdfReader(f)
+        if reader.is_encrypted:
+            try:
+                if not reader.decrypt(""):
+                    raise ValueError("password required")
+            except Exception as exc:
+                raise ValueError("PDF is encrypted and cannot be read without a password") from exc
         page_count = len(reader.pages)
         selected_pages = _parse_page_spec(pages, page_count) if pages else range(page_count)
         extracted_chars = 0
@@ -184,6 +208,18 @@ def _extract_pdf_segments(file_path: str, pages: str | None = None, preview_char
 
 
 def _iter_docx_blocks(doc) -> Iterable[str]:
+    if hasattr(doc, "iter_inner_content"):
+        for block in doc.iter_inner_content():
+            if hasattr(block, "rows"):
+                for row in block.rows:
+                    cells = [cell.text.strip() for cell in row.cells if cell.text.strip()]
+                    if cells:
+                        yield " | ".join(cells)
+            else:
+                text = block.text.strip()
+                if text:
+                    yield text
+        return
     for paragraph in doc.paragraphs:
         text = paragraph.text.strip()
         if text:
@@ -304,6 +340,10 @@ def read_document(
 
     max_chars_int = _positive_int(max_chars, DEFAULT_MAX_CHARS, minimum=2000, maximum=MAX_CHUNK_SIZE)
     chunk_size_int = _positive_int(chunk_size, DEFAULT_CHUNK_SIZE, minimum=1000, maximum=MAX_CHUNK_SIZE)
+    if query is not None:
+        query = str(query).strip()
+        if len(query) > 4000:
+            return _json({"error": "query exceeds the 4000-character limit"})
     chunk_index = None
     if chunk is not None:
         chunk_index = _positive_int(chunk, 0, minimum=0)

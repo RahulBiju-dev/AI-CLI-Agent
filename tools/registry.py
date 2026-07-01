@@ -17,6 +17,7 @@ from tools.app_launcher import open_app
 from tools.vault_indexer import delete_vault_item, index_vault, list_vault_aliases, list_vaults
 from tools.vault_search import search_vault
 from tools.obsi_vault_writer import create_structured_note
+from tools.vision_describer import describe_image
 from tools.knowledge_graph_builder import knowledge_graph_builder
 from tools.run_simulation import run_simulation
 from tools.api_orchestrator import api_orchestrator
@@ -46,9 +47,9 @@ TOOL_SCHEMAS: list[dict] = [
                         "type": "string",
                         "enum": ["easy", "medium", "hard"],
                         "description": (
-                            "Search depth. 'easy' (3 results) for quick facts "
-                            "with many trusted sources; 'medium' (6 results, default) "
-                            "for general questions; 'hard' (10 results) for deep "
+                            "Search depth. 'easy' (5 results) for quick facts; "
+                            "'medium' (8 results, default) for general questions; "
+                            "'hard' (15 results) for deep "
                             "research or niche/complex queries."
                         ),
                     },
@@ -141,13 +142,13 @@ TOOL_SCHEMAS: list[dict] = [
         "type": "function",
         "function": {
             "name": "create_file",
-            "description": "Create a new file with content at a path. Use only when explicitly asked.",
+            "description": "Create a new, non-overwriting file in Selene's vault, then index it for search. Use only when explicitly asked.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "file_path": {
                         "type": "string",
-                        "description": "Path for the new file.",
+                        "description": "Filename for the new vault file; directory components are ignored.",
                     },
                     "content": {
                         "type": "string",
@@ -223,6 +224,21 @@ TOOL_SCHEMAS: list[dict] = [
     {
         "type": "function",
         "function": {
+            "name": "describe_image",
+            "description": "Describe a local PNG, JPEG, WebP, GIF, or BMP image with the local moondream vision model.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "image_path": {"type": "string", "description": "Path to a local image file (maximum 25 MiB)."},
+                    "prompt": {"type": "string", "description": "Optional focused question or description instruction."}
+                },
+                "required": ["image_path"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "open_app",
             "description": (
                 "Open a desktop application on the user's computer by name (e.g. 'chrome', 'VS Code', 'spotify'). "
@@ -253,9 +269,11 @@ TOOL_SCHEMAS.extend([
                 "type": "object",
                 "properties": {
                     "collection": {"type": "string", "description": "ChromaDB collection name."},
+                    "vault_path": {"type": "string", "description": "Folder to index recursively."},
                     "file_path": {"type": "string", "description": "File to index."},
                     "chunk_size": {"type": "integer", "description": "Chunk size (default 1800)."},
-                    "chunk_overlap": {"type": "integer", "description": "Overlap between chunks (default 250)."}
+                    "chunk_overlap": {"type": "integer", "description": "Overlap between chunks (default 250)."},
+                    "include_vision": {"type": "boolean", "description": "Include moondream page descriptions for PDFs (default true; false is faster for text-only PDFs)."}
                 }
             }
         }
@@ -472,6 +490,7 @@ TOOL_DISPATCH: dict[str, callable] = {
     "spotify_play": spotify_play,
     "open_browser": open_browser,
     "open_app": open_app,
+    "describe_image": describe_image,
 }
 
 # Dispatch RAG tools

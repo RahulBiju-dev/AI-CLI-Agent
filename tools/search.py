@@ -9,7 +9,6 @@ It scales result depth based on the requested difficulty level:
 """
 
 import json
-from ddgs import DDGS
 
 # Map difficulty labels to max result counts.
 _DIFFICULTY_MAP: dict[str, int] = {
@@ -38,23 +37,37 @@ def web_search(query: str, difficulty: str = "medium") -> str:
             dictionary has a 'title' and a 'snippet' representing a search result.
             If an error occurs, it returns a JSON-encoded dictionary with an 'error' key.
     """
-    # Look up the maximum number of results for the given difficulty, defaulting to 5
-    max_results = _DIFFICULTY_MAP.get(difficulty.lower().strip(), 5)
+    query = str(query or "").strip()
+    if not query:
+        return json.dumps({"error": "query is required"}, separators=(",", ":"))
+    if len(query) > 1000:
+        return json.dumps({"error": "query exceeds the 1000-character limit"}, separators=(",", ":"))
+    difficulty_name = str(difficulty or "medium").lower().strip()
+    if difficulty_name not in _DIFFICULTY_MAP:
+        return json.dumps({"error": "difficulty must be easy, medium, or hard"}, separators=(",", ":"))
+    max_results = _DIFFICULTY_MAP[difficulty_name]
 
     try:
+        from ddgs import DDGS
+
         # Initialize DuckDuckGo Search client
         with DDGS() as ddgs:
             # Perform text search and limit results
             raw_results = list(ddgs.text(query, max_results=max_results))
 
         # Extract only the title and body snippet from each result to save space
-        condensed = [
-            {"title": r.get("title", ""), "snippet": r.get("body", "")}
-            for r in raw_results
-        ]
+        condensed = []
+        seen_urls = set()
+        for result in raw_results:
+            url = str(result.get("href") or result.get("url") or "").strip()
+            if url and url in seen_urls:
+                continue
+            if url:
+                seen_urls.add(url)
+            condensed.append({"title": str(result.get("title") or ""), "url": url, "snippet": str(result.get("body") or "")})
 
         # Return results as a compact JSON string
-        return json.dumps(condensed, separators=(",", ":"))
+        return json.dumps(condensed, ensure_ascii=False, separators=(",", ":"))
 
     except Exception as exc:
         # Catch network or parsing errors and return them cleanly in JSON

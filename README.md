@@ -109,7 +109,7 @@ Documents ──→ Chunk ──→ Embed ──→ ChromaDB
 
 2. **Embedding:** Each chunk is converted into a dense vector (a list of floating-point numbers) using an embedding model (`embeddinggemma` by default, running locally via Ollama). This vector captures the *semantic meaning* of the text — chunks about similar topics will have vectors that are close together in the embedding space, regardless of exact wording.
 
-3. **Storage:** Vectors and their source metadata (file path, chunk index, character offsets) are stored in [ChromaDB](https://www.trychroma.com/), a persistent vector database that lives in the project's `.chroma/` directory.
+3. **Storage:** Vectors and their source metadata (file path, chunk index, character offsets) are stored in [ChromaDB](https://www.trychroma.com/). Runtime data lives under `~/.selene-agent/` by default (`.chroma/` for vectors and `vaults/` for files); set `SELENE_DATA_DIR` to relocate both.
 
 4. **Retrieval:** When the agent (or user via `/vault search`) queries the vault, the query text is embedded with the same model, and ChromaDB performs an **approximate nearest neighbour (ANN) search** to find the top-K most semantically similar chunks.
 
@@ -169,7 +169,7 @@ The agent autonomously decides when to call tools based on the user's query:
 | 🌐 **Browser** | Open URLs or search queries in the system's default browser |
 | 💻 **Code Viewer** | Read source files with line numbers; scan directories by extension |
 | 📄 **Document Reader** | Extract text from PDFs (`pypdf`) and Word docs (`python-docx`) with page/chunk/query navigation |
-| 📂 **File Manager** | Read text files with line range and search controls; create new files (auto-vaulted to `vaults/`) |
+| 📂 **File Manager** | Stream line ranges, navigate/search bounded text files, and create non-overwriting files auto-vaulted under `~/.selene-agent/vaults/` |
 | 🎵 **Spotify** | Search and play songs natively on Windows, macOS, and Linux |
 | 👁️ **Vision Describer** | Describes images, diagrams, and slides using the local `moondream` vision model |
 | 🗄️ **Vault Index** | Chunk and embed local files into ChromaDB for semantic search; auto-registers aliases |
@@ -183,6 +183,8 @@ The agent autonomously decides when to call tools based on the user's query:
 | 🧠 **Context Memory Optimizer** | Compact conversations while preserving instructions, recent turns, decisions, constraints, facts, and links |
 | 🧭 **Reasoning Chain Debugger** | Audit explicit claim/evidence graphs for unsupported leaps, missing references, cycles, and confidence problems |
 | ⚙️ **Automated Routine Executor** | Define natural-language workflow macros, preview their actions, and execute approved local commands/apps/URLs |
+
+Legacy tools have also been hardened for current workloads: web results retain source URLs, code scans skip dependency/cache trees and cap traversal, binary documents route through the document reader, PDF vision runs one page at a time, embedding vectors are shape/number validated, and failed re-indexing preserves the previous good vault records. Set `include_vision=false` on `index_vault` for substantially faster text-only PDF indexing.
 
 ### Advanced Tool Safety Model
 
@@ -490,9 +492,9 @@ The vault provides persistent semantic search over your local documents:
 | `physics_notes.md` | `physics_notes` |
 | Folder `/docs/` | `docs` |
 
-**Auto-vaulting on file creation:** Every file created with the `create_file` tool is automatically saved into the `vaults/` directory (using only the file's basename, regardless of the path specified), indexed into its own ChromaDB collection, and registered with a human-friendly alias. This means you can immediately search any file the agent creates for you without manually indexing it.
+**Auto-vaulting on file creation:** Every file created with `create_file` is saved into `~/.selene-agent/vaults/` by default (using only the basename), indexed into its own ChromaDB collection, and registered with a friendly alias. Existing files are never overwritten. If indexing is temporarily unavailable, file creation still succeeds and reports `indexed: false`.
 
-**Vault Aliases:** Vaults are automatically given friendly aliases derived from the filename. When searching, you can use the original name (e.g., `"physics_notes"`) instead of remembering the sanitized ChromaDB collection name. Aliases are stored in `vaults/.vault_aliases.json` and support exact and substring matching.
+**Vault Aliases:** Vaults are automatically given friendly aliases derived from the filename. When searching, you can use the original name (e.g., `"physics_notes"`) instead of remembering the sanitized ChromaDB collection name. Aliases are atomically stored in `~/.selene-agent/vaults/.vault_aliases.json`; substring resolution is used only when it identifies one unique collection.
 
 **Multimodal Support:** For PDFs, the agent uses `moondream` via Ollama to generate visual descriptions of diagrams and slides. This is integrated directly into the vault indexing pipeline. Ensure you have run `ollama pull moondream` and installed `poppler-utils`.
 
@@ -597,10 +599,10 @@ AI-CLI-Agent/
 │
 ├── .agents/                   # Agent configuration
 ├── sessions/                  # Saved session JSON files
-├── vaults/                    # Default vault document storage (also Obsidian vault)
-├── .chroma/                   # ChromaDB persistent vector database
 └── .gitignore
 ```
+
+Runtime vault data is kept outside the checkout in `~/.selene-agent/{vaults,.chroma}` by default. Override the parent directory with `SELENE_DATA_DIR=/your/path`.
 
 ### Key Design Decisions
 

@@ -12,6 +12,13 @@ import shlex
 import shutil
 import subprocess
 import json
+import threading
+import time
+
+
+_APP_CACHE: tuple[float, list[dict]] = (0.0, [])
+_APP_CACHE_LOCK = threading.Lock()
+_APP_CACHE_SECONDS = 30.0
 
 
 # ── Linux Desktop Entry Parser ────────────────────────────────────────
@@ -58,7 +65,7 @@ def _parse_desktop_file(file_path: str) -> dict | None:
             key = key.strip()
             val = val.strip()
             # Only store standard keys we care about
-            if key in ("Name", "Exec", "Terminal", "NoDisplay", "Type"):
+            if key in ("Name", "Exec", "Terminal", "NoDisplay", "Hidden", "TryExec", "Type"):
                 entry_data[key] = val
 
     if entry_data and "Name" in entry_data and "Exec" in entry_data:
@@ -79,10 +86,17 @@ def _get_installed_apps() -> list[dict]:
             'filepath', 'name', 'exec', and 'terminal' properties. Applications
             marked as 'NoDisplay' or not of Type 'Application' are excluded.
     """
-    xdg_dirs = os.environ.get("XDG_DATA_DIRS", "/usr/local/share:/usr/share").split(":")
-    app_dirs = [os.path.join(d, "applications") for d in xdg_dirs]
-    # Add user local applications
-    app_dirs.append(os.path.expanduser("~/.local/share/applications"))
+    global _APP_CACHE
+    with _APP_CACHE_LOCK:
+        cached_at, cached_apps = _APP_CACHE
+        if cached_apps and time.monotonic() - cached_at < _APP_CACHE_SECONDS:
+            return [dict(app) for app in cached_apps]
+
+    xdg_dirs = [part for part in os.environ.get("XDG_DATA_DIRS", "/usr/local/share:/usr/share").split(os.pathsep) if part]
+    # User entries precede system entries because desktop files with the same
+    # ID are user-overridable under the XDG specification.
+    app_dirs = [os.path.expanduser("~/.local/share/applications")]
+    app_dirs.extend(os.path.join(d, "applications") for d in xdg_dirs)
     # Add flatpak applications export directory if not already included
     flatpak_dir = "/var/lib/flatpak/exports/share/applications"
     if flatpak_dir not in app_dirs:
@@ -106,12 +120,15 @@ def _get_installed_apps() -> list[dict]:
                 entry = _parse_desktop_file(file_path)
                 if entry:
                     # Skip applications marked NoDisplay
-                    is_nodisplay = entry.get("NoDisplay", "false").lower() in ("true", "1")
-                    if is_nodisplay:
+                    is_hidden = entry.get("NoDisplay", "false").lower() in ("true", "1") or entry.get("Hidden", "false").lower() in ("true", "1")
+                    if is_hidden:
                         continue
                     
                     app_type = entry.get("Type", "Application")
                     if app_type != "Application":
+                        continue
+                    try_exec = entry.get("TryExec", "").strip()
+                    if try_exec and not (os.path.isfile(os.path.expanduser(try_exec)) or shutil.which(try_exec)):
                         continue
 
                     apps.append({
@@ -123,6 +140,8 @@ def _get_installed_apps() -> list[dict]:
                     })
         except Exception:
             pass
+    with _APP_CACHE_LOCK:
+        _APP_CACHE = (time.monotonic(), [dict(app) for app in apps])
     return apps
 
 
@@ -140,13 +159,15 @@ def _clean_exec_line(exec_str: str) -> list[str]:
     Returns:
         list[str]: A list of clean command-line arguments ready for subprocess execution.
     """
-    # Remove standard desktop placeholders
-    cleaned = re.sub(r'%\s*[fFuUdDnNvVmMkic]', '', exec_str)
+    # Replace literal percent first, then strip standard desktop field codes.
+    sentinel = "\0PERCENT\0"
+    cleaned = exec_str.replace("%%", sentinel)
+    cleaned = re.sub(r"%[fFuUdDnNickvm]", "", cleaned).replace(sentinel, "%")
     try:
         cmd_parts = shlex.split(cleaned)
     except Exception:
         cmd_parts = cleaned.split()
-    return [p for p in cmd_parts if p and not p.startswith("%")]
+    return [part for part in cmd_parts if part]
 
 
 def _find_terminal_emulator() -> str | None:
@@ -206,19 +227,19 @@ def _find_matching_app(query: str, apps: list[dict]) -> tuple[dict | None, list[
         if len(name_substring_matches) == 1:
             return name_substring_matches[0], []
         else:
-            return None, sorted([app["name"] for app in name_substring_matches])
+            return None, sorted({app["name"] for app in name_substring_matches})[:10]
 
     if filename_substring_matches:
         if len(filename_substring_matches) == 1:
             return filename_substring_matches[0], []
         else:
-            return None, sorted([app["name"] for app in filename_substring_matches])
+            return None, sorted({app["name"] for app in filename_substring_matches})[:10]
 
     if exec_substring_matches:
         if len(exec_substring_matches) == 1:
             return exec_substring_matches[0], []
         else:
-            return None, sorted([app["name"] for app in exec_substring_matches])
+            return None, sorted({app["name"] for app in exec_substring_matches})[:10]
 
     return None, []
 
@@ -235,8 +256,11 @@ def open_app(app_name: str) -> str:
     Returns:
         str: A JSON string containing execution status or error.
     """
-    if not app_name:
+    if not app_name or not str(app_name).strip():
         return json.dumps({"error": "No application name provided."})
+    app_name = str(app_name).strip()
+    if len(app_name) > 256 or any(ord(char) < 32 for char in app_name):
+        return json.dumps({"error": "Application name is invalid."})
 
     platform = sys.platform
 
@@ -260,18 +284,12 @@ def open_app(app_name: str) -> str:
     # ── Windows ───────────────────────────────────────────────────────
     elif platform == "win32":
         try:
-            # Run start command in background via shell
-            cmd = f'start /b "" "{app_name}"'
-            subprocess.Popen(
-                cmd,
-                shell=True,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                start_new_session=True
-            )
+            # os.startfile delegates to ShellExecute without interpolating the
+            # user-provided name into a command shell.
+            os.startfile(app_name)  # type: ignore[attr-defined]
             return json.dumps({
                 "success": True,
-                "message": f"Sent launch request for application '{app_name}' via start command."
+                "message": f"Sent launch request for application '{app_name}'."
             })
         except Exception as e:
             return json.dumps({"error": f"Failed to launch '{app_name}' on Windows: {str(e)}"})
