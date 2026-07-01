@@ -391,7 +391,9 @@ Selene can be built into a standalone desktop application using Electron and PyI
    ```bash
    bun run build
    ```
-   The final binaries (AppImage, deb, nsis, etc.) will be output to the `dist-electron/` folder.
+   The Linux build is written to `dist-electron/Selene-1.0.0.AppImage`, replacing any
+   existing artifact at that path. Other platform binaries are also output to the
+   `dist-electron/` folder.
 
 ## Usage
 

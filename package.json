@@ -19,7 +19,8 @@
     },
     "linux": {
       "target": ["AppImage"],
-      "category": "Utility"
+      "category": "Utility",
+      "artifactName": "Selene-1.0.0.${ext}"
     },
     "win": {
       "target": ["nsis"]
