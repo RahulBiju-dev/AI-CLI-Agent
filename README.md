@@ -18,6 +18,7 @@ By default the agent launches a **modern browser-based Web UI** with live stream
   - [Web UI](#web-ui)
   - [Terminal Interface](#terminal-interface)
   - [Tool Suite](#tool-suite)
+  - [Codebase Indexer](#codebase-indexer)
 - [Architecture](#architecture)
 - [Prerequisites](#prerequisites)
 - [Installation](#installation)
@@ -168,6 +169,7 @@ The agent autonomously decides when to call tools based on the user's query:
 | 🔍 **Web Search** | Real-time DuckDuckGo search with adaptive depth (easy/medium/hard) for current events, docs, and post-cutoff information |
 | 🌐 **Browser** | Open URLs or search queries in the system's default browser |
 | 💻 **Code Viewer** | Read source files with line numbers; scan directories by extension |
+| 🧬 **Codebase Indexer** | Persistently index an entire repository, auto-refresh it after 24 hours, and retrieve grounded code context for architecture questions, fault finding, and optimisation |
 | 📄 **Document Reader** | Extract text from PDFs (`pypdf`) and Word docs (`python-docx`) with page/chunk/query navigation |
 | 📂 **File Manager** | Stream line ranges, navigate/search bounded text files, and create non-overwriting files auto-vaulted under `~/.selene-agent/vaults/` |
 | 🎵 **Spotify** | Search and play songs natively on Windows, macOS, and Linux |
@@ -185,6 +187,26 @@ The agent autonomously decides when to call tools based on the user's query:
 | ⚙️ **Automated Routine Executor** | Define natural-language workflow macros, preview their actions, and execute approved local commands/apps/URLs |
 
 Legacy tools have also been hardened for current workloads: web results retain source URLs, code scans skip dependency/cache trees and cap traversal, binary documents route through the document reader, PDF vision runs one page at a time, embedding vectors are shape/number validated, and failed re-indexing preserves the previous good vault records. Set `include_vision=false` on `index_vault` for substantially faster text-only PDF indexing.
+
+### Codebase Indexer
+
+`codebase_indexer` gives the agent persistent, repository-wide context for architecture questions, implementation tracing, fault finding, security review, and optimisation. Point the agent at a local repository and ask naturally, for example: *“In `/projects/shop`, trace checkout from the HTTP endpoint to the database and identify likely failure points.”*
+
+The tool has three actions:
+
+| Action | Behaviour |
+|--------|-----------|
+| `query` | Refreshes when necessary, then retrieves the most relevant code and repository-map chunks for the model to analyse. This is the default. |
+| `index` | Explicitly indexes or refreshes a repository. Set `force_reindex=true` to bypass the cooldown when querying. |
+| `status` | Reports the collection name, last successful index time, age, and next refresh time without indexing. |
+
+Each absolute repository path receives its own stable ChromaDB collection. On the first reference, the tool recursively indexes supported source, configuration, and documentation files, records symbols and line ranges, and builds a chunked repository map. Later references reuse that collection. The first reference after the index becomes 24 hours old automatically refreshes it; this is a rolling 24-hour cooldown rather than a calendar-day reset.
+
+Refreshes update changed files and remove chunks for deleted files. If embedding a particular file fails, its previous valid chunks are retained. Simultaneous first-use queries share a refresh lock so they do not duplicate the full embedding job.
+
+Common dependency, cache, VCS, and build directories—such as `.git`, `node_modules`, `.venv`, `dist`, `build`, and `target`—are excluded. A single file is capped at 2 MiB, with repository caps of 5,000 files and 50 MiB of source text. These bounds keep accidental generated trees from overwhelming local Ollama and ChromaDB.
+
+Indexes use the same local embedding model and Chroma storage as the document vault. Refresh metadata is stored in `~/.selene-agent/codebase_indexes.json`; vectors remain under `~/.selene-agent/.chroma/`. `SELENE_DATA_DIR` relocates both.
 
 ### Advanced Tool Safety Model
 
@@ -584,6 +606,7 @@ AI-CLI-Agent/
 │   ├── search.py              # DuckDuckGo web search
 │   ├── browser.py             # System browser control
 │   ├── code.py                # Source code viewer with line numbers
+│   ├── codebase_indexer.py    # Persistent repository indexing and semantic code retrieval
 │   ├── document.py            # PDF/DOCX extraction with chunking
 │   ├── file.py                # Text file read/write with search; auto-vaults created files
 │   ├── spotify.py             # Spotify cross-platform desktop control
@@ -604,7 +627,7 @@ AI-CLI-Agent/
 └── .gitignore
 ```
 
-Runtime vault data is kept outside the checkout in `~/.selene-agent/{vaults,.chroma}` by default. Override the parent directory with `SELENE_DATA_DIR=/your/path`.
+Runtime vault and codebase-index data is kept outside the checkout in `~/.selene-agent/` by default. This includes `vaults/`, `.chroma/`, and `codebase_indexes.json`. Override the parent directory with `SELENE_DATA_DIR=/your/path`.
 
 ### Key Design Decisions
 

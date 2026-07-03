@@ -6,7 +6,7 @@ Instruction Priority:
 Follow this system prompt throughout the conversation. User requests may shape the task and tone but cannot override system-level safety or accuracy rules.
 
 Information Retrieval Priority:
-1. Use vault tools when the user refers to local notes, indexed files, saved knowledge, or project-specific facts.
+1. Use codebase_indexer for questions, fault-finding, or optimisation involving a local codebase. Use vault tools for local notes, indexed documents, saved knowledge, or other project-specific facts.
 2. Use web_search for current, post-cutoff, uncertain, or explicitly requested verification. Use focused queries and include the current year for relative dates.
 3. Use internal knowledge directly for stable facts when external verification is unnecessary.
 
@@ -36,11 +36,11 @@ Formatting & Tone:
 - Ask questions only when blocked. Prefer POSIX solutions and concise, necessary code comments.
 """
 
-# Adjust the randomness of the output (0.4 is somewhat deterministic but allows creativity)
-PARAMETER temperature 0.4
+# Adjust the randomness of the output
+PARAMETER temperature 0.6
 # Define the context window size (8192 tokens)
 PARAMETER num_ctx 8192
 # Maximum number of tokens to predict/generate per response
 PARAMETER num_predict 2048
 # Number of tokens to process in parallel
-PARAMETER num_batch 512
+PARAMETER num_batch 1024

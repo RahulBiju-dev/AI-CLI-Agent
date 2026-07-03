@@ -24,6 +24,7 @@ from tools.api_orchestrator import api_orchestrator
 from tools.context_memory_optimizer import context_memory_optimizer
 from tools.reasoning_chain_debugger import reasoning_chain_debugger
 from tools.automated_routine_executor import automated_routine_executor
+from tools.codebase_indexer import codebase_indexer
 
 # ── Schema definitions ────────────────────────────────────────────────
 
@@ -260,6 +261,29 @@ TOOL_SCHEMAS: list[dict] = [
 
 # Add RAG tooling: index the vault and search it
 TOOL_SCHEMAS.extend([
+    {
+        "type": "function",
+        "function": {
+            "name": "codebase_indexer",
+            "description": (
+                "Index and deeply inspect a local codebase using a persistent semantic code vault. "
+                "Use for repository architecture, implementation questions, fault finding, security review, or optimisation. "
+                "Query calls automatically reindex on first use after a 24-hour cooldown. Answer from returned context and cite files/lines."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "codebase_path": {"type": "string", "description": "Absolute or relative path to the repository root."},
+                    "query": {"type": "string", "description": "Focused question about the codebase. Required for query action."},
+                    "action": {"type": "string", "enum": ["query", "index", "status"], "description": "Defaults to query."},
+                    "force_reindex": {"type": "boolean", "description": "Ignore the 24-hour cooldown and refresh now."},
+                    "top_k": {"type": "integer", "description": "Relevant code chunks to retrieve (1-20, default 10)."},
+                    "max_chars": {"type": "integer", "description": "Maximum retrieved context size (1000-30000, default 14000)."}
+                },
+                "required": ["codebase_path"]
+            }
+        }
+    },
     {
         "type": "function",
         "function": {
@@ -507,4 +531,5 @@ TOOL_DISPATCH.update({
     "context_memory_optimizer": context_memory_optimizer,
     "reasoning_chain_debugger": reasoning_chain_debugger,
     "automated_routine_executor": automated_routine_executor,
+    "codebase_indexer": codebase_indexer,
 })

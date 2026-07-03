@@ -679,8 +679,40 @@ output {
   border-color: rgba(255, 209, 102, 0.35);
 }
 
+.tool-indicator {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 10px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 9px 11px;
+  background: rgba(255, 255, 255, 0.035);
+  color: var(--muted);
+  font-size: 0.86rem;
+}
+
+.block-body .tool-indicator {
+  margin-top: 12px;
+  margin-bottom: 0;
+  font-family: var(--sans);
+  white-space: normal;
+}
+
+.block-content:empty {
+  display: none;
+}
+
+.block-content:empty + .tool-indicator {
+  margin-top: 0;
+}
+
+.tool-indicator.running {
+  border-color: rgba(255, 209, 102, 0.35);
+}
+
 .composer {
-  padding: 16px min(5vw, 58px) 22px;
+  padding: clamp(10px, 1.8vw, 16px) min(5vw, 58px) clamp(12px, 2.5vw, 22px);
   background: linear-gradient(180deg, transparent, rgba(4, 6, 14, 0.9) 22%);
 }
 
@@ -706,6 +738,12 @@ textarea {
   background: transparent;
   color: var(--text);
   line-height: 1.5;
+}
+
+#chat-input {
+  min-height: clamp(44px, 6vw, 58px);
+  max-height: clamp(132px, 28dvh, 220px);
+  padding: clamp(10px, 1.8vw, 16px) clamp(12px, 2vw, 16px) clamp(6px, 1vw, 8px);
 }
 
 textarea::placeholder {
@@ -982,7 +1020,16 @@ textarea::placeholder {
   }
 
   .composer {
-    padding: 12px;
+    padding: clamp(8px, 3vw, 12px);
+  }
+
+  .composer-footer {
+    padding: 6px 8px 8px 12px;
+  }
+
+  .send-btn {
+    min-width: 68px;
+    padding: 8px 12px;
   }
 
   .message,

@@ -56,6 +56,7 @@ const state = {
     assistantBubble: null,
     assistantText: "",
     thinkingBlock: null,
+    thinkingContent: null,
     thinkingText: "",
     lastToolBlock: null
   },
@@ -139,6 +140,7 @@ function bindEvents() {
     if (document.hidden) stopWelcomeSky();
     else if (el.messages?.querySelector(".welcome")) startWelcomeSky();
   });
+  window.addEventListener("resize", resizeComposer);
 
   el.messages?.addEventListener("wheel", (event) => {
     if (event.deltaY < 0) state.followOutput = false;
@@ -316,19 +318,28 @@ function toDisplayMessages(history) {
       continue;
     }
     if (message.role === "assistant") {
-      const toolResults = [];
       let j = i + 1;
       while (history[j]?.role === "tool") {
-        toolResults.push(history[j]);
         j += 1;
       }
-      display.push({
+      const entry = {
         role: "assistant",
         content: message.content || "",
-        thinking: message.thinking || "",
-        toolCalls: message.tool_calls || [],
-        toolResults
-      });
+        thoughtItems: [
+          ...(message.thinking ? [{ type: "thinking", text: message.thinking }] : []),
+          ...(message.tool_calls || []).map((call) => ({
+            type: "tool",
+            name: call.function?.name || "tool"
+          }))
+        ]
+      };
+      const previous = display[display.length - 1];
+      if (previous?.role === "assistant" && !previous.content) {
+        previous.content = entry.content;
+        previous.thoughtItems.push(...entry.thoughtItems);
+      } else {
+        display.push(entry);
+      }
       i = j - 1;
     }
   }
@@ -515,18 +526,20 @@ function appendUserMessage(text, scroll = true) {
 function appendAssistantMessage(message, scroll = true) {
   el.messages.querySelector(".welcome")?.remove();
   const row = messageShell("assistant", "S");
+  const thoughtItems = message.thoughtItems || [];
 
-  if (message.thinking) {
-    row.stack.appendChild(detailBlock("Thinking", "reasoning", message.thinking, false));
+  if (thoughtItems.length) {
+    const thinkingBlock = detailBlock("Thinking", "reasoning", "", false);
+    const body = thinkingBlock.querySelector(".block-body");
+    thoughtItems.forEach((item) => {
+      if (item.type === "tool") {
+        body?.appendChild(toolIndicator(item.name));
+      } else if (item.text) {
+        body?.appendChild(thinkingContent(item.text));
+      }
+    });
+    row.stack.appendChild(thinkingBlock);
   }
-
-  message.toolCalls?.forEach((call, index) => {
-    const fn = call.function || {};
-    const result = message.toolResults?.[index]?.content || "";
-    const args = formatJSON(fn.arguments || {});
-    const body = `Arguments:\n${args}${result ? `\n\nResult:\n${result}` : ""}`;
-    row.stack.appendChild(detailBlock(fn.name || "tool", "tool", body, false));
-  });
 
   if (message.content) row.stack.appendChild(bubble(message.content, true));
   el.messages.appendChild(row.root);
@@ -576,11 +589,52 @@ function detailBlock(title, label, content, running) {
 
   const body = document.createElement("div");
   body.className = "block-body";
-  body.textContent = content || (running ? "Running..." : "");
 
-  toggle.addEventListener("click", () => block.classList.toggle("open"));
+  const blockContent = thinkingContent(content || (running ? "Running..." : ""));
+
+  toggle.addEventListener("click", () => {
+    const isOpen = block.classList.toggle("open");
+    if (isOpen) scrollThinkingToBottom(block);
+  });
+  body.appendChild(blockContent);
   block.append(toggle, body);
   return block;
+}
+
+function thinkingContent(text = "") {
+  const content = document.createElement("div");
+  content.className = "block-content";
+  content.textContent = text;
+  return content;
+}
+
+function scrollThinkingToBottom(block) {
+  if (!block?.classList.contains("open")) return;
+  const body = block.querySelector(".block-body");
+  if (!body) return;
+  body.scrollTop = body.scrollHeight;
+}
+
+function toolIndicator(name, running = false) {
+  const indicator = document.createElement("div");
+  indicator.className = `tool-indicator${running ? " running" : ""}`;
+
+  const label = document.createElement("span");
+  label.className = "pill";
+  label.textContent = "tool";
+
+  const status = document.createElement("span");
+  status.className = "tool-indicator-status";
+  status.textContent = running ? `Using ${humanizeToolName(name)}…` : `Used ${humanizeToolName(name)}`;
+
+  indicator.append(label, status);
+  return indicator;
+}
+
+function humanizeToolName(name) {
+  return String(name || "tool")
+    .replace(/[_-]+/g, " ")
+    .replace(/\b\w/g, (letter) => letter.toUpperCase());
 }
 
 async function sendMessage() {
@@ -647,13 +701,29 @@ function handleStreamEvent(event) {
       break;
     case "thinking_start":
       ensureAssistantStack();
-      state.stream.thinkingBlock = detailBlock("Thinking", "reasoning", "", true);
-      state.stream.assistantStack.appendChild(state.stream.thinkingBlock);
+      if (state.stream.assistantBubble) {
+        state.stream.assistantBubble = null;
+        state.stream.assistantText = "";
+        state.stream.thinkingBlock = null;
+        state.stream.thinkingContent = null;
+        state.stream.thinkingText = "";
+      }
+      if (!state.stream.thinkingBlock) {
+        state.stream.thinkingBlock = detailBlock("Thinking", "reasoning", "", true);
+        state.stream.thinkingContent = state.stream.thinkingBlock.querySelector(".block-content");
+        state.stream.assistantStack.appendChild(state.stream.thinkingBlock);
+      } else {
+        state.stream.thinkingContent = thinkingContent();
+        state.stream.thinkingBlock.querySelector(".block-body")?.appendChild(state.stream.thinkingContent);
+        state.stream.thinkingBlock.classList.add("open", "running");
+      }
+      state.stream.thinkingText = "";
       scrollToBottom();
       break;
     case "thinking_chunk":
       state.stream.thinkingText += event.text || "";
-      setBlockBody(state.stream.thinkingBlock, state.stream.thinkingText);
+      if (state.stream.thinkingContent) state.stream.thinkingContent.textContent = state.stream.thinkingText;
+      scrollThinkingToBottom(state.stream.thinkingBlock);
       break;
     case "thinking_end":
       state.stream.thinkingBlock?.classList.remove("running");
@@ -661,23 +731,37 @@ function handleStreamEvent(event) {
       break;
     case "tool_start":
       ensureAssistantStack();
-      state.stream.lastToolBlock = detailBlock(event.name || "tool", "tool", `Arguments:\n${formatJSON(event.arguments || {})}`, true);
-      state.stream.assistantStack.appendChild(state.stream.lastToolBlock);
+      if (!state.stream.thinkingBlock) {
+        state.stream.thinkingBlock = detailBlock("Thinking", "reasoning", "", false);
+        state.stream.thinkingContent = state.stream.thinkingBlock.querySelector(".block-content");
+        state.stream.assistantStack.appendChild(state.stream.thinkingBlock);
+      }
+      state.stream.thinkingBlock.classList.add("open", "running");
+      state.stream.lastToolBlock = toolIndicator(event.name || "tool", true);
+      state.stream.thinkingBlock.querySelector(".block-body")?.appendChild(state.stream.lastToolBlock);
+      scrollThinkingToBottom(state.stream.thinkingBlock);
       scrollToBottom();
       break;
     case "tool_end":
       if (state.stream.lastToolBlock) {
         state.stream.lastToolBlock.classList.remove("running");
-        setBlockBody(state.stream.lastToolBlock, `Result:\n${event.result || ""}`);
+        const status = state.stream.lastToolBlock.querySelector(".tool-indicator-status");
+        if (status) status.textContent = `Used ${humanizeToolName(event.name || "tool")}`;
       }
-      resetStream();
+      state.stream.thinkingBlock?.classList.remove("running");
+      state.stream.lastToolBlock = null;
       break;
     case "content_chunk":
       ensureAssistantStack();
       if (!state.stream.assistantBubble) {
+        state.stream.thinkingBlock?.classList.remove("open", "running");
         state.stream.assistantBubble = document.createElement("div");
         state.stream.assistantBubble.className = "bubble";
         state.stream.assistantStack.appendChild(state.stream.assistantBubble);
+        state.stream.thinkingBlock = null;
+        state.stream.thinkingContent = null;
+        state.stream.thinkingText = "";
+        state.stream.lastToolBlock = null;
       }
       state.stream.assistantText += event.text || event.content || "";
       state.stream.assistantBubble.innerHTML = renderMarkdown(state.stream.assistantText);
@@ -712,6 +796,7 @@ function resetStream() {
   state.stream.assistantBubble = null;
   state.stream.assistantText = "";
   state.stream.thinkingBlock = null;
+  state.stream.thinkingContent = null;
   state.stream.thinkingText = "";
   state.stream.lastToolBlock = null;
 }
@@ -736,11 +821,6 @@ function appendStatus(text) {
   status.textContent = text;
   el.messages.appendChild(status);
   scrollToBottom();
-}
-
-function setBlockBody(block, text) {
-  const body = block?.querySelector(".block-body");
-  if (body) body.textContent = text;
 }
 
 async function clearConversation() {
@@ -1036,7 +1116,8 @@ function contextBudget() {
 function resizeComposer() {
   if (!el.input) return;
   el.input.style.height = "auto";
-  el.input.style.height = `${Math.min(el.input.scrollHeight, 220)}px`;
+  const maxHeight = Number.parseFloat(getComputedStyle(el.input).maxHeight) || 220;
+  el.input.style.height = `${Math.min(el.input.scrollHeight, maxHeight)}px`;
 }
 
 function scrollToBottom(force = false) {
@@ -1125,17 +1206,6 @@ function debounce(fn, delay) {
     clearTimeout(timer);
     timer = setTimeout(() => fn(...args), delay);
   };
-}
-
-function formatJSON(value) {
-  if (typeof value === "string") {
-    try {
-      return JSON.stringify(JSON.parse(value), null, 2);
-    } catch {
-      return value;
-    }
-  }
-  return JSON.stringify(value, null, 2);
 }
 
 function escapeHTML(value) {
