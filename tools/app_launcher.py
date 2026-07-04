@@ -14,11 +14,22 @@ import subprocess
 import json
 import threading
 import time
+from pathlib import Path
 
 
 _APP_CACHE: tuple[float, list[dict]] = (0.0, [])
 _APP_CACHE_LOCK = threading.Lock()
 _APP_CACHE_SECONDS = 30.0
+MAX_APPS_PER_REQUEST = 10
+
+# App launching is intentionally not a general process-execution primitive. These
+# programs can turn an innocent-looking app request into arbitrary command access.
+_BLOCKED_EXECUTABLES = {
+    "bash", "cmd", "cmd.exe", "command", "dash", "fish", "gnome-terminal",
+    "konsole", "osascript", "powershell", "powershell.exe", "pwsh", "sh",
+    "terminal", "terminal.app", "wscript", "wscript.exe", "xterm", "zsh",
+}
+_SAFE_APP_NAME = re.compile(r"^[\w .+&'()@#-]+$", flags=re.UNICODE)
 
 
 # ── Linux Desktop Entry Parser ────────────────────────────────────────
@@ -192,6 +203,63 @@ def _normalize_app_name(value: str) -> str:
     return "".join(character for character in value.casefold() if character.isalnum())
 
 
+def _validate_app_name(app_name: object) -> str:
+    """Accept a display name, never a path, URL, or command line."""
+    value = str(app_name or "").strip()
+    if not value:
+        raise ValueError("No application name provided.")
+    if len(value) > 128 or any(ord(char) < 32 for char in value):
+        raise ValueError("Application name is invalid.")
+    if value in {".", ".."}:
+        raise ValueError("Use an application display name, not a filesystem location.")
+    if not _SAFE_APP_NAME.fullmatch(value):
+        raise ValueError("Use an application name only; paths, URLs, and command syntax are not accepted.")
+    if "/" in value or "\\" in value or value.casefold().endswith((".desktop", ".lnk")):
+        raise ValueError("Use the application's display name, not a file path or shortcut path.")
+    if value.casefold() in _BLOCKED_EXECUTABLES:
+        raise ValueError("Shells and terminal applications cannot be launched by this tool.")
+    return value
+
+
+def _is_safe_desktop_entry(app: dict) -> bool:
+    """Reject desktop entries that would expose an interactive command runner."""
+    command = _clean_exec_line(app.get("exec", ""))
+    if not command:
+        return False
+    executable = os.path.basename(command[0]).casefold()
+    return not app.get("terminal", False) and executable not in _BLOCKED_EXECUTABLES
+
+
+def _find_windows_shortcut(query: str) -> tuple[Path | None, list[str]]:
+    """Resolve a display name to an installed Start Menu shortcut."""
+    roots = []
+    for environment_name, suffix in (
+        ("APPDATA", ("Microsoft", "Windows", "Start Menu", "Programs")),
+        ("PROGRAMDATA", ("Microsoft", "Windows", "Start Menu", "Programs")),
+    ):
+        base = os.environ.get(environment_name)
+        if base:
+            roots.append(Path(base).joinpath(*suffix))
+
+    normalized = _normalize_app_name(query)
+    matches = []
+    for root in roots:
+        if not root.is_dir():
+            continue
+        try:
+            shortcuts = root.rglob("*.lnk")
+            for shortcut in shortcuts:
+                if normalized in _name_aliases(shortcut.stem):
+                    matches.append(shortcut)
+        except OSError:
+            continue
+    unique = {str(item).casefold(): item for item in matches}
+    values = list(unique.values())
+    if len(values) == 1:
+        return values[0], []
+    return None, sorted({item.stem for item in values})[:10]
+
+
 def _name_aliases(value: str) -> set[str]:
     """Build compact aliases for names such as ``Visual Studio Code`` -> ``vscode``."""
     words = re.findall(r"[\w]+", value.casefold(), flags=re.UNICODE)
@@ -307,7 +375,7 @@ def _find_matching_app(query: str, apps: list[dict]) -> tuple[dict | None, list[
 
 # ── Public tool function ──────────────────────────────────────────────
 
-def open_app(app_name: str) -> str:
+def open_app(app_name: str, confirmed: bool = False) -> str:
     """
     Open an application on the user's computer.
 
@@ -317,17 +385,30 @@ def open_app(app_name: str) -> str:
     Returns:
         str: A JSON string containing execution status or error.
     """
-    if not app_name or not str(app_name).strip():
-        return json.dumps({"error": "No application name provided."})
-    app_name = str(app_name).strip()
-    if len(app_name) > 256 or any(ord(char) < 32 for char in app_name):
-        return json.dumps({"error": "Application name is invalid."})
+    if confirmed is not True:
+        return json.dumps({
+            "error": "Launching an application requires explicit user approval.",
+            "required": "Call again with confirmed=true only when the user explicitly asked to open the app.",
+        })
+    try:
+        app_name = _validate_app_name(app_name)
+    except ValueError as exc:
+        return json.dumps({"error": str(exc)})
 
     platform = sys.platform
 
     # ── macOS ─────────────────────────────────────────────────────────
     if platform == "darwin":
         try:
+            check = subprocess.run(
+                ["open", "-Ra", app_name],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+                check=False,
+            )
+            if check.returncode != 0:
+                return json.dumps({"error": f"Could not find an installed application named '{app_name}'."})
             # We use `open -a` to start applications on macOS
             subprocess.Popen(
                 ["open", "-a", app_name],
@@ -345,12 +426,18 @@ def open_app(app_name: str) -> str:
     # ── Windows ───────────────────────────────────────────────────────
     elif platform == "win32":
         try:
-            # os.startfile delegates to ShellExecute without interpolating the
-            # user-provided name into a command shell.
-            os.startfile(app_name)  # type: ignore[attr-defined]
+            shortcut, suggestions = _find_windows_shortcut(app_name)
+            if not shortcut:
+                response = {"error": f"Could not find an installed Start Menu application named '{app_name}'."}
+                if suggestions:
+                    response["suggestions"] = suggestions
+                return json.dumps(response)
+            # Only a shortcut discovered beneath a Start Menu directory reaches
+            # ShellExecute; user input itself is never treated as a path.
+            os.startfile(str(shortcut))  # type: ignore[attr-defined]
             return json.dumps({
                 "success": True,
-                "message": f"Sent launch request for application '{app_name}'."
+                "message": f"Sent launch request for application '{shortcut.stem}'."
             })
         except Exception as e:
             return json.dumps({"error": f"Failed to launch '{app_name}' on Windows: {str(e)}"})
@@ -361,24 +448,6 @@ def open_app(app_name: str) -> str:
         matched, suggestions = _find_matching_app(app_name, apps)
 
         if not matched:
-            # If no .desktop files matched, fall back to checking PATH directly
-            binary_path = shutil.which(app_name)
-            if binary_path:
-                try:
-                    subprocess.Popen(
-                        [binary_path],
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                        stdin=subprocess.DEVNULL,
-                        start_new_session=True
-                    )
-                    return json.dumps({
-                        "success": True,
-                        "message": f"Launched binary '{app_name}' from PATH: {binary_path}"
-                    })
-                except Exception as e:
-                    return json.dumps({"error": f"Failed to launch binary '{app_name}' from PATH: {str(e)}"})
-
             if suggestions:
                 return json.dumps({
                     "error": f"Application '{app_name}' not found. Did you mean one of these?",
@@ -386,8 +455,13 @@ def open_app(app_name: str) -> str:
                 })
             else:
                 return json.dumps({
-                    "error": f"Could not find application or binary named '{app_name}' on this system."
+                    "error": f"Could not find an installed desktop application named '{app_name}'."
                 })
+
+        if not _is_safe_desktop_entry(matched):
+            return json.dumps({
+                "error": f"'{matched['name']}' is a terminal or command-runner entry and is blocked by app-launch safety policy."
+            })
 
         # Launching the desktop entry
         # Prefer gtk-launch if available
@@ -414,20 +488,6 @@ def open_app(app_name: str) -> str:
         if not cmd_parts:
             return json.dumps({"error": f"Application '{matched['name']}' has an empty or invalid Exec entry."})
 
-        # Handle Terminal=true apps by wrapping with terminal emulator if possible
-        if matched["terminal"]:
-            terminal = _find_terminal_emulator()
-            if terminal:
-                if terminal == "gnome-terminal":
-                    cmd_parts = ["gnome-terminal", "--"] + cmd_parts
-                elif terminal == "kitty":
-                    cmd_parts = ["kitty"] + cmd_parts
-                else:
-                    cmd_parts = [terminal, "-e"] + cmd_parts
-            else:
-                # Proceed but note to user
-                pass
-
         try:
             subprocess.Popen(
                 cmd_parts,
@@ -436,12 +496,39 @@ def open_app(app_name: str) -> str:
                 stdin=subprocess.DEVNULL,
                 start_new_session=True
             )
-            term_note = " in terminal wrapper" if matched["terminal"] else ""
             return json.dumps({
                 "success": True,
-                "message": f"Launched application '{matched['name']}' directly{term_note} using command: {' '.join(cmd_parts)}"
+                "message": f"Launched application '{matched['name']}'."
             })
         except Exception as e:
             return json.dumps({
                 "error": f"Failed to manually execute application '{matched['name']}': {str(e)}"
             })
+
+
+def launch_apps(app_names: list[str], confirmed: bool = False) -> str:
+    """Launch a small, user-approved set of desktop apps by display name."""
+    if confirmed is not True:
+        return json.dumps({
+            "error": "Launching applications requires explicit user approval.",
+            "required": "Set confirmed=true only for an explicit user launch request or an approved automatic app routine.",
+        })
+    if not isinstance(app_names, list) or not app_names:
+        return json.dumps({"error": "app_names must be a non-empty array."})
+    if len(app_names) > MAX_APPS_PER_REQUEST:
+        return json.dumps({"error": f"At most {MAX_APPS_PER_REQUEST} applications may be launched at once."})
+
+    results = []
+    seen = set()
+    for requested_name in app_names:
+        normalized = _normalize_app_name(str(requested_name))
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        result = json.loads(open_app(requested_name, confirmed=True))
+        results.append({"app_name": str(requested_name), **result})
+
+    return json.dumps({
+        "ok": bool(results) and all(item.get("success") is True for item in results),
+        "results": results,
+    }, ensure_ascii=False)

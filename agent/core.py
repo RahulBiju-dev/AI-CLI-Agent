@@ -426,6 +426,11 @@ def _process_tool_calls(tool_calls: list[dict]) -> list[dict]:
                     _print_status("🚀", f"Opening app: [dim]{fn_args.get('app_name', '')}[/]", "yellow")
                     result = handler(**fn_args)
                     _print_status("✓", "App launch request sent — synthesizing answer…", "green")
+                elif fn_name == "launch_apps":
+                    names = ", ".join(str(value) for value in fn_args.get("app_names", []))
+                    _print_status("🚀", f"Opening apps: [dim]{names}[/]", "yellow")
+                    result = handler(**fn_args)
+                    _print_status("✓", "App launch requests processed — synthesizing answer…", "green")
                 else:
                     _print_status("⚙️", f"Executing {fn_name}…", "yellow")
                     result = handler(**fn_args)

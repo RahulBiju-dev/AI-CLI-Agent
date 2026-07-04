@@ -10,10 +10,13 @@ import time
 import webbrowser
 from pathlib import Path
 
+from tools.app_launcher import open_app
+
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 STORE_PATH = PROJECT_ROOT / ".selene" / "routines.json"
 MAX_ACTIONS = 50
+AUTOMATIC_ACTION_TYPES = {"open_app", "delay"}
 
 
 def _load() -> dict[str, dict]:
@@ -58,11 +61,46 @@ def _validate(routine: dict) -> list[str]:
     for index, item in enumerate(actions):
         if not isinstance(item, dict) or item.get("type") not in {"command", "open_app", "open_url", "delay"}:
             errors.append(f"actions[{index}] has an unsupported type")
-        elif item.get("type") in {"command", "open_app"} and not isinstance(item.get("argv"), list):
+        elif item.get("type") == "command" and not isinstance(item.get("argv"), list):
             errors.append(f"actions[{index}].argv must be an argument array; shell strings are not accepted")
+        elif item.get("type") == "open_app" and not isinstance(item.get("app_name"), str):
+            errors.append(f"actions[{index}].app_name must be an installed application display name")
         elif item.get("type") == "open_url" and not str(item.get("url", "")).startswith(("http://", "https://")):
             errors.append(f"actions[{index}].url must use http or https")
+    if routine.get("allow_automatic") is True:
+        unsafe = sorted({
+            str(item.get("type"))
+            for item in actions
+            if isinstance(item, dict) and item.get("type") not in AUTOMATIC_ACTION_TYPES
+        })
+        if unsafe:
+            errors.append("allow_automatic is limited to open_app and delay actions; found: " + ", ".join(unsafe))
     return errors
+
+
+def _trigger_matches(routine: dict, trigger: str | None) -> bool:
+    normalized = (trigger or "").strip().casefold()
+    return bool(normalized) and any(
+        normalized == str(value).strip().casefold()
+        for value in routine.get("triggers", [])
+    )
+
+
+def _is_safe_automatic_routine(routine: dict) -> bool:
+    """Recheck stored data before bypassing per-run confirmation."""
+    actions = routine.get("actions")
+    if not isinstance(actions, list) or not actions:
+        return False
+    for item in actions:
+        if not isinstance(item, dict) or item.get("type") not in AUTOMATIC_ACTION_TYPES:
+            return False
+        if item.get("type") == "open_app":
+            has_name = isinstance(item.get("app_name"), str) and bool(item["app_name"].strip())
+            legacy_argv = item.get("argv")
+            has_legacy_name = isinstance(legacy_argv, list) and bool(legacy_argv)
+            if not has_name and not has_legacy_name:
+                return False
+    return True
 
 
 def _run_action(item: dict) -> dict:
@@ -73,12 +111,19 @@ def _run_action(item: dict) -> dict:
         return {"type": action_type, "ok": True, "seconds": seconds}
     if action_type == "open_url":
         return {"type": action_type, "ok": bool(webbrowser.open(str(item["url"]), new=2)), "url": item["url"]}
+    if action_type == "open_app":
+        # Legacy argv routines are migrated in memory by keeping only the app
+        # name. Arguments are deliberately ignored: this is not command execution.
+        app_name = item.get("app_name")
+        if not app_name and isinstance(item.get("argv"), list) and item["argv"]:
+            app_name = str(item["argv"][0])
+        if not app_name:
+            raise ValueError("open_app requires app_name; command arguments are not permitted")
+        launch_result = json.loads(open_app(str(app_name), confirmed=True))
+        return {"type": action_type, "ok": launch_result.get("success") is True, "app_name": app_name, "launch": launch_result}
     argv = [str(value) for value in item["argv"]]
     if not argv:
         raise ValueError("argv cannot be empty")
-    if action_type == "open_app":
-        subprocess.Popen(argv, cwd=PROJECT_ROOT, start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        return {"type": action_type, "ok": True, "argv": argv}
     requested_cwd = (PROJECT_ROOT / str(item.get("cwd", "."))).resolve()
     if requested_cwd != PROJECT_ROOT and PROJECT_ROOT not in requested_cwd.parents:
         raise ValueError("Command cwd must stay inside the project workspace")
@@ -95,7 +140,7 @@ def automated_routine_executor(
     dry_run: bool = True,
     confirmed: bool = False,
 ) -> str:
-    """Manage workflow macros; execution requires dry_run=false and confirmed=true."""
+    """Manage workflow macros with per-run or narrowly scoped persistent approval."""
     routines = _load()
     if action == "list":
         items = [{"name": key, "description": value.get("description", ""), "triggers": value.get("triggers", []), "action_count": len(value.get("actions", []))} for key, value in sorted(routines.items())]
@@ -106,9 +151,26 @@ def automated_routine_executor(
         errors = _validate(routine)
         if errors:
             return json.dumps({"error": "Invalid routine", "details": errors})
-        routines[name] = {"description": str(routine.get("description", "")), "triggers": [str(value) for value in routine.get("triggers", [])], "actions": routine["actions"]}
+        wants_automatic = routine.get("allow_automatic") is True
+        if wants_automatic and not confirmed:
+            return json.dumps({
+                "error": "Persistent automatic execution requires confirmed=true after the user approves the preview.",
+                "routine": routine,
+            }, ensure_ascii=False)
+        routines[name] = {
+            "description": str(routine.get("description", "")),
+            "triggers": [str(value) for value in routine.get("triggers", [])],
+            "actions": routine["actions"],
+            "automatic_approved": wants_automatic and confirmed is True,
+        }
         _save(routines)
-        return json.dumps({"ok": True, "defined": name, "action_count": len(routine["actions"]), "store": str(STORE_PATH)})
+        return json.dumps({
+            "ok": True,
+            "defined": name,
+            "action_count": len(routine["actions"]),
+            "automatic_approved": wants_automatic and confirmed is True,
+            "store": str(STORE_PATH),
+        })
     if action == "delete":
         if not confirmed:
             return json.dumps({"error": "Deleting a routine requires confirmed=true"})
@@ -122,9 +184,19 @@ def automated_routine_executor(
     resolved_name, selected = _resolve(routines, name, trigger)
     if not selected:
         return json.dumps({"error": "No unique routine matched", "name": name, "trigger": trigger})
+    automatic_trigger = (
+        selected.get("automatic_approved") is True
+        and _trigger_matches(selected, trigger)
+        and _is_safe_automatic_routine(selected)
+    )
     if action == "show" or dry_run:
-        return json.dumps({"name": resolved_name, "routine": selected, "dry_run": True, "execution_required": "Call run with dry_run=false and confirmed=true after user approval"}, ensure_ascii=False)
-    if not confirmed:
+        requirement = (
+            "This exact trigger is persistently approved; call run with dry_run=false and the trigger."
+            if automatic_trigger
+            else "Call run with dry_run=false and confirmed=true after user approval."
+        )
+        return json.dumps({"name": resolved_name, "routine": selected, "dry_run": True, "execution_required": requirement}, ensure_ascii=False)
+    if not confirmed and not automatic_trigger:
         return json.dumps({"error": "Routine execution requires confirmed=true after the user reviews the preview"})
     results = []
     for index, item in enumerate(selected["actions"]):

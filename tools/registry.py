@@ -13,7 +13,7 @@ from tools.file import read_file, create_file
 from tools.code import view_code
 from tools.spotify import spotify_play
 from tools.browser import open_browser
-from tools.app_launcher import open_app
+from tools.app_launcher import launch_apps, open_app
 from tools.vault_indexer import delete_vault_item, index_vault, list_vault_aliases, list_vaults
 from tools.vault_search import search_vault
 from tools.obsi_vault_writer import create_structured_note
@@ -240,20 +240,29 @@ TOOL_SCHEMAS: list[dict] = [
     {
         "type": "function",
         "function": {
-            "name": "open_app",
+            "name": "launch_apps",
             "description": (
-                "Open a desktop application on the user's computer by name (e.g. 'chrome', 'VS Code', 'spotify'). "
-                "The process will launch detached in the background."
+                "Launch one or more installed desktop applications by display name (for example, "
+                "['Antigravity', 'VS Code']). Use only when the user explicitly asks to open them, "
+                "or while executing a previously approved automatic app routine. This tool cannot "
+                "launch terminals, shells, paths, URLs, or arbitrary command arguments."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "app_name": {
-                        "type": "string",
-                        "description": "The name or command of the application to open.",
-                    }
+                    "app_names": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "minItems": 1,
+                        "maxItems": 10,
+                        "description": "Installed application display names. Do not include paths or command arguments."
+                    },
+                    "confirmed": {
+                        "type": "boolean",
+                        "description": "Must be true only when the user explicitly requested this launch."
+                    },
                 },
-                "required": ["app_name"],
+                "required": ["app_names", "confirmed"],
             },
         },
     }
@@ -486,15 +495,15 @@ TOOL_SCHEMAS.extend([
         "type": "function",
         "function": {
             "name": "automated_routine_executor",
-            "description": "Define, store, list, preview, run, or delete reusable local workflow macros. Always preview first; actual execution requires dry_run=false and confirmed=true after user approval.",
+            "description": "Define, store, list, preview, run, or delete reusable local workflow macros. App-only routines may be persistently approved at definition time; command and URL routines always require confirmation for each run.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "action": {"type": "string", "enum": ["list", "define", "show", "run", "delete"]},
                     "name": {"type": "string"}, "trigger": {"type": "string"},
-                    "routine": {"type": "object", "description": "description, natural-language triggers, and actions. Action types: command/open_app with argv arrays, open_url, delay."},
+                    "routine": {"type": "object", "description": "description, natural-language triggers, and actions. Use {type: open_app, app_name: <display name>} for apps; command uses an argv array. Set allow_automatic=true only for an app/delay-only routine the user explicitly wants to run whenever its trigger is said."},
                     "dry_run": {"type": "boolean", "description": "Defaults true. Keep true to preview."},
-                    "confirmed": {"type": "boolean", "description": "Must be true for execution/deletion after explicit user approval."}
+                    "confirmed": {"type": "boolean", "description": "Must be true for execution/deletion after explicit user approval, and when granting persistent approval to an automatic app-only routine."}
                 },
                 "required": ["action"]
             }
@@ -514,6 +523,7 @@ TOOL_DISPATCH: dict[str, callable] = {
     "spotify_play": spotify_play,
     "open_browser": open_browser,
     "open_app": open_app,
+    "launch_apps": launch_apps,
     "describe_image": describe_image,
 }
 

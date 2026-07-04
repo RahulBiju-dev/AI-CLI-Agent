@@ -185,6 +185,7 @@ The agent autonomously decides when to call tools based on the user's query:
 | 🧠 **Context Memory Optimizer** | Compact conversations while preserving instructions, recent turns, decisions, constraints, facts, and links |
 | 🧭 **Reasoning Chain Debugger** | Audit explicit claim/evidence graphs for unsupported leaps, missing references, cycles, and confidence problems |
 | ⚙️ **Automated Routine Executor** | Define natural-language workflow macros, preview their actions, and execute approved local commands/apps/URLs |
+| 🚀 **App Launcher** | Launch up to ten installed desktop apps by display name, with confirmation and command-injection safeguards |
 
 Legacy tools have also been hardened for current workloads: web results retain source URLs, code scans skip dependency/cache trees and cap traversal, binary documents route through the document reader, PDF vision runs one page at a time, embedding vectors are shape/number validated, and failed re-indexing preserves the previous good vault records. Set `include_vision=false` on `index_vault` for substantially faster text-only PDF indexing.
 
@@ -217,7 +218,8 @@ The advanced tools are deliberately bounded:
 - API credentials are referenced by environment-variable name rather than passed as literal secrets. Retries, timeouts, response sizes, and failover endpoints are capped.
 - Memory optimisation is extractive and reports before/after token estimates. Automatic background compaction uses the same optimizer after generating its factual summary.
 - The reasoning debugger audits supplied claims, dependencies, assumptions, and evidence IDs. It does not expose private model chain-of-thought; it produces an accountable evidence graph and Mermaid diagram.
-- Routines live in gitignored `.selene/routines.json`. Runs default to a dry-run preview and require `dry_run=false` plus `confirmed=true` after user approval. Commands use argument arrays with `shell=False` and remain in the project workspace.
+- Routines live in gitignored `.selene/routines.json`. Command and URL runs default to a dry-run preview and require `dry_run=false` plus `confirmed=true` after user approval. App/delay-only routines can receive persistent approval when defined, allowing an exact saved trigger to run them later without another prompt. Commands use argument arrays with `shell=False` and remain in the project workspace.
+- App actions accept only installed application display names. Shells, terminals, paths, URLs, command flags, and arbitrary PATH binaries are rejected; all launches are detached and shell-free.
 
 Example simulation model:
 
@@ -241,13 +243,14 @@ Example routine definition:
   "action": "define",
   "name": "morning workspace",
   "routine": {
+    "allow_automatic": true,
     "triggers": ["start my morning"],
     "actions": [
-      {"type": "open_app", "argv": ["code", "."]},
-      {"type": "open_url", "url": "https://example.com/dashboard"},
-      {"type": "command", "argv": ["git", "status", "--short"]}
+      {"type": "open_app", "app_name": "Antigravity"},
+      {"type": "open_app", "app_name": "VS Code"}
     ]
-  }
+  },
+  "confirmed": true
 }
 ```
 
