@@ -439,7 +439,7 @@ def _process_tool_calls(tool_calls: list[dict]) -> list[dict]:
                 _print_status("❌", f"Error executing {fn_name}: {e}", "red")
                 result = json.dumps({"error": f"Tool execution failed: {str(e)}"})
 
-        tool_messages.append({"role": "tool", "content": result})
+        tool_messages.append({"role": "tool", "tool_name": fn_name, "content": result})
 
     return tool_messages
 
@@ -1315,10 +1315,26 @@ def run() -> None:
                 history.extend(tool_results)
                 # Trim history to keep follow-up requests within token budget
                 num_ctx = session["options"].get("num_ctx", 8192)
-                messages_to_send = _trim_history(history, num_ctx)
+                reminder = {
+                    "role": "user",
+                    "content": (
+                        "Continue the current turn using the tool result above. Answer this "
+                        "original request directly; do not ask the user to repeat it:\n"
+                        f"{user_input}"
+                    ),
+                }
+                messages_to_send = _trim_history([*history, reminder], num_ctx)
             else:
                 messages_to_send.append(assistant_msg)
                 messages_to_send.extend(tool_results)
+                messages_to_send.append({
+                    "role": "user",
+                    "content": (
+                        "Continue the current turn using the tool result above. Answer this "
+                        "original request directly; do not ask the user to repeat it:\n"
+                        f"{user_input}"
+                    ),
+                })
 
             # Follow-up call after tool results — also streamed
             assistant_msg = _stream_thinking_response(

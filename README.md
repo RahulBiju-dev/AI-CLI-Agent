@@ -1,6 +1,6 @@
 # AI CLI Agent
 
-A modular, tool-augmented local AI agent built with Python and [Ollama](https://ollama.com/). Runs entirely on your machine — no cloud APIs, no telemetry, no subscriptions. The agent wraps a customised [Gemma 4](https://ai.google.dev/gemma) model with an autonomous tool-calling loop, real-time streaming output, and a persistent RAG (Retrieval-Augmented Generation) vault for long-term document memory.
+A modular, tool-augmented local AI agent built with Python and [Ollama](https://ollama.com/). Inference, conversation storage, and document memory stay local; optional integrations such as Google Calendar and Google Tasks contact their provider only after user-authorized OAuth. The agent wraps a customised [Gemma 4](https://ai.google.dev/gemma) model with an autonomous tool-calling loop, real-time streaming output, and a persistent RAG (Retrieval-Augmented Generation) vault for long-term document memory.
 
 By default the agent launches a **modern browser-based Web UI** with live streaming, collapsible thinking panels, and an interactive sidebar. The classic terminal interface is still available via `--cli`.
 
@@ -19,6 +19,7 @@ By default the agent launches a **modern browser-based Web UI** with live stream
   - [Terminal Interface](#terminal-interface)
   - [Tool Suite](#tool-suite)
   - [Codebase Indexer](#codebase-indexer)
+  - [Google Calendar and Tasks](#google-calendar-and-tasks)
 - [Architecture](#architecture)
 - [Prerequisites](#prerequisites)
 - [Installation](#installation)
@@ -157,6 +158,7 @@ The default interface — launch with `python main.py` and the agent opens in yo
   - Real-time sliders for `Temperature`, `Top-P`, and `Top-K`
   - System-prompt override with a one-click reset to default
   - Toggles for conversation history and model thinking
+  - Automatically saved conversations with agent-generated 2–3-word sidebar titles
   - Save / restore named sessions without leaving the browser
 - **Markdown & code highlighting** — responses are rendered with `marked.js` and syntax-highlighted with `highlight.js`.
 - **Responsive layout** — sidebar collapses on narrow viewports; works on desktop and tablet.
@@ -186,6 +188,8 @@ The agent autonomously decides when to call tools based on the user's query:
 | 🧭 **Reasoning Chain Debugger** | Audit explicit claim/evidence graphs for unsupported leaps, missing references, cycles, and confidence problems |
 | ⚙️ **Automated Routine Executor** | Define natural-language workflow macros, preview their actions, and execute approved local commands/apps/URLs |
 | 🚀 **App Launcher** | Launch up to ten installed desktop apps by display name, with confirmation and command-injection safeguards |
+| 📅 **Google Calendar** | List calendars and upcoming events, search a time range, and create or edit events; deletion requires explicit confirmation |
+| ✅ **Google Tasks** | List task lists and tasks, create tasks with notes or due dates, and update status or details; deletion requires explicit confirmation |
 
 Legacy tools have also been hardened for current workloads: web results retain source URLs, code scans skip dependency/cache trees and cap traversal, binary documents route through the document reader, PDF vision runs one page at a time, embedding vectors are shape/number validated, and failed re-indexing preserves the previous good vault records. Set `include_vision=false` on `index_vault` for substantially faster text-only PDF indexing.
 
@@ -209,6 +213,34 @@ Common dependency, cache, VCS, and build directories—such as `.git`, `node_mod
 
 Indexes use the same local embedding model and Chroma storage as the document vault. Refresh metadata is stored in `~/.selene-agent/codebase_indexes.json`; vectors remain under `~/.selene-agent/.chroma/`. `SELENE_DATA_DIR` relocates both.
 
+### Google Calendar and Tasks
+
+The `google_workspace` tool exposes Google Calendar and Google Tasks as two user-facing capabilities through one encrypted OAuth connection.
+
+| Capability | Supported operations |
+|------------|----------------------|
+| **Google Calendar** | Check connection status, list calendars, list/search events by time range, list upcoming birthdays with annual dates normalized into the requested window, create events, edit events, and delete confirmed events |
+| **Google Tasks** | List task lists, list tasks with optional completed items, create tasks, edit titles/notes/due dates/status, and delete confirmed tasks |
+
+Event times accept RFC 3339 date-times or `YYYY-MM-DD` for all-day events. Task due dates accept either form; Google Tasks retains the date portion. Calendar IDs default to `primary`, while task-list IDs default to `@default`. Selene sends attendee updates when an event with guests is created, changed, or deleted.
+
+On first use, Selene opens Google's Desktop OAuth flow in the browser. The OAuth client configuration, access token, and refresh token are stored as AES-GCM ciphertext in `~/.selene-agent/google_oauth.enc` (or `$SELENE_DATA_DIR/google_oauth.enc`). The encryption key is kept in the OS keyring where available, with a mode-`0600` local fallback for headless systems. Refreshed tokens are immediately re-encrypted; credential values are redacted from tool errors.
+
+Setup:
+
+1. Enable the **Google Calendar API** and **Google Tasks API** in a Google Cloud project.
+2. Configure the OAuth consent screen, create a **Desktop app** OAuth client, and download its JSON outside this repository.
+3. Install dependencies with `pip install -r requirements.txt`.
+4. Tell Selene: `Connect my Google account using /absolute/path/to/client_secret.json`.
+5. After Selene confirms the encrypted credential was saved, delete the downloaded source JSON.
+
+Example requests:
+
+- `What is on my primary calendar tomorrow?`
+- `Create a project review on Monday from 2 PM to 3 PM in Asia/Kolkata.`
+- `Show my incomplete Google Tasks.`
+- `Add “submit expense report” to my default task list, due Friday.`
+
 ### Advanced Tool Safety Model
 
 The advanced tools are deliberately bounded:
@@ -218,7 +250,8 @@ The advanced tools are deliberately bounded:
 - API credentials are referenced by environment-variable name rather than passed as literal secrets. Retries, timeouts, response sizes, and failover endpoints are capped.
 - Memory optimisation is extractive and reports before/after token estimates. Automatic background compaction uses the same optimizer after generating its factual summary.
 - The reasoning debugger audits supplied claims, dependencies, assumptions, and evidence IDs. It does not expose private model chain-of-thought; it produces an accountable evidence graph and Mermaid diagram.
-- Routines live in `~/.selene-agent/routines.json` (or `$SELENE_DATA_DIR/routines.json`) so they persist across conversations, application restarts, and upgrades. Existing routines from `.selene/routines.json` are imported automatically. Command and URL runs default to a dry-run preview and require `dry_run=false` plus `confirmed=true` after user approval. App/delay-only routines can receive persistent approval when defined, allowing an exact saved trigger to run them later without another prompt. Commands use argument arrays with `shell=False` and remain in the project workspace.
+- Routines live in `~/.selene-agent/routines.json` (or `$SELENE_DATA_DIR/routines.json`) so they persist across conversations, application restarts, and upgrades. Existing routines from `.selene/routines.json` are imported automatically. Routine actions can invoke registered agent tools; app actions are dispatched through `app_launcher.py`, including batched `launch_apps` calls. Command, URL, and general tool runs default to a dry-run preview and require `dry_run=false` plus `confirmed=true` after user approval. App/delay-only routines can receive persistent approval when defined, allowing an exact saved trigger to run them later without another prompt. Commands use argument arrays with `shell=False` and remain in the project workspace.
+- Google Calendar and Tasks use a first-run Desktop OAuth browser flow. The downloaded client configuration and refresh token are then stored together as AES-GCM ciphertext at `~/.selene-agent/google_oauth.enc` (or under `$SELENE_DATA_DIR`). Selene keeps the encryption key in the OS keyring where available; headless systems fall back to a mode-`0600` key beside the ciphertext. The downloaded source JSON is never copied into the repository and can be deleted after authorization.
 - App actions accept only installed application display names. Shells, terminals, paths, URLs, command flags, and arbitrary PATH binaries are rejected; all launches are detached and shell-free.
 
 Example simulation model:
@@ -302,6 +335,7 @@ Example routine definition:
 
   advanced tools: knowledge graph · simulation · API orchestration
                   context memory · reasoning audit · routine macros
+                  Google Calendar · Google Tasks
 
  Browser (Web UI)
  ┌──────────────────────────────────────────────┐
@@ -623,14 +657,15 @@ AI-CLI-Agent/
 │   ├── api_orchestrator.py    # Resilient authenticated HTTP lifecycle
 │   ├── context_memory_optimizer.py # Long-context compaction
 │   ├── reasoning_chain_debugger.py # Explicit evidence-graph audit
-│   └── automated_routine_executor.py # Persistent preview-first macros
+│   ├── automated_routine_executor.py # Persistent preview-first macros
+│   └── google_workspace.py     # Encrypted Google Calendar/Tasks OAuth integration
 │
 ├── .agents/                   # Agent configuration
 ├── sessions/                  # Saved session JSON files
 └── .gitignore
 ```
 
-Runtime data is kept outside the checkout in `~/.selene-agent/` by default. This includes `routines.json`, `vaults/`, `.chroma/`, and `codebase_indexes.json`. Override the parent directory with `SELENE_DATA_DIR=/your/path`.
+Runtime data is kept outside the checkout in `~/.selene-agent/` by default. This includes conversations, `routines.json`, `google_oauth.enc`, `vaults/`, `.chroma/`, and `codebase_indexes.json`. Override the parent directory with `SELENE_DATA_DIR=/your/path`.
 
 ### Key Design Decisions
 

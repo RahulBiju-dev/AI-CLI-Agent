@@ -13,6 +13,7 @@ import glob
 import sys
 import time
 import socket
+import re
 import webbrowser
 import threading
 from datetime import datetime, timezone
@@ -101,12 +102,9 @@ def autosave_session() -> str | None:
     filename = GLOBAL_STATE.get("active_session_name", "")
     filepath = os.path.join(_SESSIONS_DIR, os.path.basename(filename))
     if filename in ("", "Active Session", "New conversation") or not os.path.isfile(filepath):
-        first_user = next(
-            (m.get("content", "") for m in GLOBAL_STATE["history"] if m.get("role") == "user"),
-            "Conversation",
-        )
-        title = " ".join(first_user.strip().split()[:6]) or "Conversation"
-        return save_session(title[:60])
+        # Use a temporary name until the first response is complete and Selene
+        # can name the conversation from its actual subject.
+        return save_session("")
 
     payload = {
         "saved_at": datetime.now(timezone.utc).isoformat(),
@@ -117,6 +115,114 @@ def autosave_session() -> str | None:
     with open(filepath, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, ensure_ascii=False)
     return filename
+
+
+def save_session_snapshot(
+    filename: str,
+    session_data: dict,
+    history_data: list[dict],
+) -> str:
+    """Persist one conversation without depending on the globally selected chat."""
+    os.makedirs(_SESSIONS_DIR, exist_ok=True)
+    safe_filename = os.path.basename(filename or "")
+    if safe_filename in ("", "Active Session", "New conversation") or not safe_filename.endswith(".json"):
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
+        safe_filename = f"session_{timestamp}.json"
+
+    filepath = os.path.join(_SESSIONS_DIR, safe_filename)
+    payload = {
+        "saved_at": datetime.now(timezone.utc).isoformat(),
+        "model": MODEL_NAME,
+        "session": session_data,
+        "history": history_data,
+    }
+    temporary = f"{filepath}.tmp-{threading.get_ident()}"
+    try:
+        with open(temporary, "w", encoding="utf-8") as stream:
+            json.dump(payload, stream, indent=2, ensure_ascii=False)
+        os.replace(temporary, filepath)
+    finally:
+        try:
+            if os.path.exists(temporary):
+                os.remove(temporary)
+        except OSError:
+            pass
+    return safe_filename
+
+
+def _normalize_agent_title(value: str) -> str:
+    """Constrain model output to a safe, human-readable 2-3 word title."""
+    first_line = next((line.strip() for line in value.splitlines() if line.strip()), "")
+    first_line = re.sub(r"^(?:conversation\s+)?title\s*:\s*", "", first_line, flags=re.I)
+    words = re.findall(r"[^\W_]+(?:['’][^\W_]+)?", first_line, flags=re.UNICODE)[:3]
+    if len(words) == 1:
+        words.append("Discussion" if words[0].casefold() == "chat" else "Chat")
+    if len(words) < 2:
+        return "New Conversation"
+    return " ".join(words)
+
+
+def generate_conversation_title(history: list[dict]) -> str:
+    """Ask the local agent for a short semantic title, with a stable fallback."""
+    first_user = next(
+        (str(message.get("content", "")) for message in history if message.get("role") == "user"),
+        "",
+    )
+    last_assistant = next(
+        (str(message.get("content", "")) for message in reversed(history) if message.get("role") == "assistant"),
+        "",
+    )
+    if not first_user and not last_assistant:
+        return "New Conversation"
+
+    prompt = (
+        "Create a descriptive title for this conversation. Output only the title, "
+        "using exactly 2 or 3 words. Do not output punctuation, quotes, or a label.\n\n"
+        f"User topic:\n{first_user[:1200]}\n\nAssistant response:\n{last_assistant[:1200]}"
+    )
+    try:
+        response = ollama.chat(
+            model=MODEL_NAME,
+            messages=[{"role": "user", "content": prompt}],
+            stream=False,
+            think=False,
+            keep_alive="30m",
+            options={"temperature": 0.2, "num_predict": 12},
+        )
+        message = getattr(response, "message", None)
+        content = getattr(message, "content", "")
+        if isinstance(response, dict):
+            content = response.get("message", {}).get("content", content)
+        return _normalize_agent_title(str(content or ""))
+    except Exception:
+        return "New Conversation"
+
+
+def title_temporary_session(history: list[dict], filename: str | None = None) -> str | None:
+    """Replace a first-turn temporary filename with an agent-generated title."""
+    filename = os.path.basename(filename or GLOBAL_STATE.get("active_session_name", ""))
+    match = re.fullmatch(r"session_(\d{8}_\d{6}(?:_\d{6})?)\.json", filename)
+    if not match:
+        return None
+
+    old_path = os.path.join(_SESSIONS_DIR, filename)
+    if not os.path.isfile(old_path):
+        return None
+
+    title = generate_conversation_title(history)
+    safe_title = "_".join(_normalize_agent_title(title).split())
+    target = f"{safe_title}_{match.group(1)}.json"
+    target_path = os.path.join(_SESSIONS_DIR, target)
+    suffix = 2
+    while os.path.exists(target_path) and target_path != old_path:
+        target = f"{safe_title}_{match.group(1)}_{suffix}.json"
+        target_path = os.path.join(_SESSIONS_DIR, target)
+        suffix += 1
+
+    os.replace(old_path, target_path)
+    if GLOBAL_STATE["active_session_name"] == filename:
+        GLOBAL_STATE["active_session_name"] = target
+    return target
 
 
 def load_session(filename: str) -> None:
@@ -530,7 +636,12 @@ def execute_command_web(cmd: str, session: dict, history: list[dict]) -> str:
 
 # ── Chat Stream Generator ─────────────────────────────────────────────
 
-def generate_chat_events(user_input: str, session_data: dict, history_data: list[dict]):
+def generate_chat_events(
+    user_input: str,
+    session_data: dict,
+    history_data: list[dict],
+    session_name: str | None = None,
+):
     """Generator yielding dictionary objects representing the progress of agent generation.
     
     Supports tool execution and chained follow-up model runs. Yields Server-Sent Events (SSE)
@@ -541,15 +652,77 @@ def generate_chat_events(user_input: str, session_data: dict, history_data: list
         user_input (str): The raw text submitted by the user.
         session_data (dict): The session configuration and state.
         history_data (list[dict]): The conversation history.
+        session_name (str | None): Conversation file that owns this generation.
         
     Yields:
         dict: A dictionary representing an event in the generation process.
     """
+    origin_name = session_name or GLOBAL_STATE.get("active_session_name", "Active Session")
+
     if user_input.startswith('/'):
         output = execute_command_web(user_input, session_data, history_data)
         yield {"type": "content_chunk", "content": output}
         yield {"type": "done"}
         return
+
+    previous_name = origin_name
+    origin_name = save_session_snapshot(origin_name, session_data, history_data)
+    if GLOBAL_STATE.get("active_session_name") == previous_name:
+        GLOBAL_STATE["active_session_name"] = origin_name
+    yield {"type": "conversation_started", "session_name": origin_name}
+
+    # Exact, persistently approved routine triggers are deterministic. Do this
+    # before asking the model so a saved phrase cannot be overlooked by tool
+    # selection, while the routine executor still enforces its safety policy.
+    routine_handler = TOOL_DISPATCH.get("automated_routine_executor")
+    if routine_handler:
+        try:
+            preview = json.loads(routine_handler(action="show", trigger=user_input))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            preview = {}
+        if preview.get("automatic_trigger") is True:
+            routine_name = str(preview.get("name", "routine"))
+            yield {"type": "tool_start", "name": "automated_routine_executor"}
+            try:
+                result = json.loads(routine_handler(
+                    action="run",
+                    trigger=user_input,
+                    dry_run=False,
+                ))
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                result = {"ok": False, "error": str(exc)}
+            yield {
+                "type": "tool_end",
+                "name": "automated_routine_executor",
+                "result": json.dumps(result, ensure_ascii=False),
+            }
+            if result.get("ok") is True:
+                output = f"✓ Routine **{routine_name}** completed."
+            else:
+                detail = result.get("error") or "One or more routine actions failed."
+                output = f"Routine **{routine_name}** failed: {detail}"
+
+            if session_data.get("history", True):
+                history_data.append({"role": "user", "content": user_input})
+                history_data.append({"role": "assistant", "content": output})
+                origin_name = save_session_snapshot(origin_name, session_data, history_data)
+                viewing_origin = GLOBAL_STATE.get("active_session_name") == origin_name
+                titled_name = title_temporary_session(history_data, origin_name)
+                if titled_name:
+                    origin_name = titled_name
+                save_session_snapshot(origin_name, session_data, history_data)
+                if viewing_origin:
+                    GLOBAL_STATE["active_session_name"] = origin_name
+                    GLOBAL_STATE["session"] = session_data
+                    GLOBAL_STATE["history"] = history_data
+            yield {"type": "content_chunk", "content": output}
+            yield {
+                "type": "done",
+                "history": history_data,
+                "active_session_name": origin_name,
+                "saved_sessions": list_saved_sessions(),
+            }
+            return
     # 1. Sync system prompt override
     default_system_prompt = ""
     try:
@@ -597,7 +770,7 @@ def generate_chat_events(user_input: str, session_data: dict, history_data: list
     if session_data.get("history", True):
         history_data.append({"role": "user", "content": user_input})
         # Persist the prompt immediately so stopping a generation cannot lose it.
-        autosave_session()
+        save_session_snapshot(origin_name, session_data, history_data)
         messages_to_send = _trim_history(history_data)
     else:
         messages_to_send = []
@@ -696,11 +869,19 @@ def generate_chat_events(user_input: str, session_data: dict, history_data: list
             
         # If there are no tool calls, this turn is completed
         if not tool_calls:
-            autosave_session()
+            viewing_origin = GLOBAL_STATE.get("active_session_name") == origin_name
+            titled_name = title_temporary_session(history_data, origin_name)
+            if titled_name:
+                origin_name = titled_name
+            save_session_snapshot(origin_name, session_data, history_data)
+            if viewing_origin:
+                GLOBAL_STATE["active_session_name"] = origin_name
+                GLOBAL_STATE["session"] = session_data
+                GLOBAL_STATE["history"] = history_data
             yield {
                 "type": "done",
                 "history": history_data,
-                "active_session_name": GLOBAL_STATE["active_session_name"],
+                "active_session_name": origin_name,
                 "saved_sessions": list_saved_sessions(),
             }
             break
@@ -733,16 +914,33 @@ def generate_chat_events(user_input: str, session_data: dict, history_data: list
             
             tool_results.append({
                 "role": "tool",
+                "tool_name": fn_name,
                 "content": result_str
             })
             
         if session_data.get("history", True):
             history_data.extend(tool_results)
             num_ctx = session_data.get("options", {}).get("num_ctx", 8192)
-            messages_to_send = _trim_history(history_data, num_ctx)
+            reminder = {
+                "role": "user",
+                "content": (
+                    "Continue the current turn using the tool result above. Answer this "
+                    "original request directly; do not ask the user to repeat it:\n"
+                    f"{user_input}"
+                ),
+            }
+            messages_to_send = _trim_history([*history_data, reminder], num_ctx)
         else:
             messages_to_send.append(assistant_msg)
             messages_to_send.extend(tool_results)
+            messages_to_send.append({
+                "role": "user",
+                "content": (
+                    "Continue the current turn using the tool result above. Answer this "
+                    "original request directly; do not ask the user to repeat it:\n"
+                    f"{user_input}"
+                ),
+            })
 
 
 # ── HTTP Handler ──────────────────────────────────────────────────────
@@ -878,6 +1076,24 @@ class AgentHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
             try:
                 body = self.read_json_body()
                 user_input = body.get("message", "").strip()
+                # Pin this request to the conversation that initiated it. The
+                # user may select another chat while this thread is streaming.
+                requested_name = os.path.basename(str(body.get("session_name", "")))
+                current_name = GLOBAL_STATE["active_session_name"]
+                aliases = {"", "Active Session", "New conversation"}
+                if requested_name == current_name or ({requested_name, current_name} <= aliases):
+                    generation_session_name = current_name
+                    generation_session = GLOBAL_STATE["session"]
+                    generation_history = GLOBAL_STATE["history"]
+                else:
+                    requested_path = os.path.join(_SESSIONS_DIR, requested_name)
+                    if not requested_name.endswith(".json") or not os.path.isfile(requested_path):
+                        raise FileNotFoundError("The originating conversation no longer exists")
+                    with open(requested_path, "r", encoding="utf-8") as stream:
+                        requested_session = json.load(stream)
+                    generation_session_name = requested_name
+                    generation_session = requested_session.get("session", {})
+                    generation_history = requested_session.get("history", [])
             except Exception as e:
                 self.send_json_response(400, {"error": "Invalid JSON body"})
                 return
@@ -894,7 +1110,12 @@ class AgentHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             
             try:
-                for event in generate_chat_events(user_input, GLOBAL_STATE["session"], GLOBAL_STATE["history"]):
+                for event in generate_chat_events(
+                    user_input,
+                    generation_session,
+                    generation_history,
+                    generation_session_name,
+                ):
                     data_line = f"data: {json.dumps(event)}\n\n"
                     self.wfile.write(data_line.encode('utf-8'))
                     self.wfile.flush()
@@ -949,6 +1170,7 @@ class AgentHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
                 self.send_json_response(200, {
                     "status": "success",
                     "saved_sessions": list_saved_sessions(),
+                    "active_session_name": GLOBAL_STATE["active_session_name"],
                 })
             except Exception as e:
                 self.send_json_response(404, {"status": "error", "error": str(e)})
@@ -988,13 +1210,27 @@ def start_web_server():
     Attempts to bind to port 5005. If unavailable, falls back to a random free port.
     It will also launch the default web browser automatically.
     """
-    # Restore the most recent autosaved chat when the server is restarted.
+    # Keep the user's latest UI/model preferences without reopening its chat.
+    # Every application launch starts with a blank conversation; previous
+    # conversations remain autosaved and can still be opened from the sidebar.
     saved_sessions = list_saved_sessions()
-    if saved_sessions and not GLOBAL_STATE["history"]:
+    if saved_sessions:
         try:
-            load_session(saved_sessions[0])
-        except (OSError, ValueError, json.JSONDecodeError):
+            filepath = os.path.join(_SESSIONS_DIR, saved_sessions[0])
+            with open(filepath, "r", encoding="utf-8") as stream:
+                saved_session = json.load(stream).get("session", {})
+            GLOBAL_STATE["session"] = {
+                **GLOBAL_STATE["session"],
+                **saved_session,
+                "options": {
+                    **GLOBAL_STATE["session"].get("options", {}),
+                    **saved_session.get("options", {}),
+                },
+            }
+        except (OSError, AttributeError, TypeError, json.JSONDecodeError):
             pass
+    GLOBAL_STATE["history"] = []
+    GLOBAL_STATE["active_session_name"] = "Active Session"
 
     # Attempt to bind to default port 5005 first, then fall back to random port
     host = '127.0.0.1'

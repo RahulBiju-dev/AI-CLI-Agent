@@ -25,6 +25,7 @@ from tools.context_memory_optimizer import context_memory_optimizer
 from tools.reasoning_chain_debugger import reasoning_chain_debugger
 from tools.automated_routine_executor import automated_routine_executor
 from tools.codebase_indexer import codebase_indexer
+from tools.google_workspace import google_workspace
 
 # ── Schema definitions ────────────────────────────────────────────────
 
@@ -273,6 +274,43 @@ TOOL_SCHEMAS.extend([
     {
         "type": "function",
         "function": {
+            "name": "google_workspace",
+            "description": "Connect Google once, then view/create/edit Calendar events and Google Tasks. OAuth tokens and the client configuration are AES-encrypted in Selene's data directory. Use status before authorize; deletions and disconnect require explicit confirmation.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["status", "authorize", "disconnect", "list_calendars", "list_events", "list_birthdays", "create_event", "update_event", "delete_event", "list_task_lists", "list_tasks", "create_task", "update_task", "delete_task"], "description": "Use list_birthdays for upcoming contact birthdays; it normalizes annual recurrences into the current requested window."},
+                    "client_secrets_file": {"type": "string", "description": "Path to a downloaded Google Desktop OAuth client JSON; only needed for authorize."},
+                    "calendar_id": {"type": "string", "description": "Calendar ID; defaults to primary."},
+                    "event_id": {"type": "string"},
+                    "summary": {"type": "string"},
+                    "description": {"type": "string"},
+                    "location": {"type": "string"},
+                    "start": {"type": "string", "description": "RFC3339 date-time, or YYYY-MM-DD for an all-day event."},
+                    "end": {"type": "string", "description": "RFC3339 date-time, or exclusive YYYY-MM-DD end date for an all-day event."},
+                    "timezone": {"type": "string", "description": "IANA timezone such as Asia/Kolkata."},
+                    "days_ahead": {"type": "integer", "description": "Upcoming birthday window in days for list_birthdays; defaults to 90."},
+                    "attendees": {"type": "array", "items": {"type": "string"}},
+                    "time_min": {"type": "string", "description": "RFC3339 lower bound for event listing."},
+                    "time_max": {"type": "string", "description": "RFC3339 upper bound for event listing."},
+                    "query": {"type": "string"},
+                    "tasklist_id": {"type": "string", "description": "Task-list ID; defaults to @default."},
+                    "task_id": {"type": "string"},
+                    "title": {"type": "string"},
+                    "notes": {"type": "string"},
+                    "due": {"type": "string", "description": "YYYY-MM-DD or RFC3339 task due time (Google stores the date portion)."},
+                    "status": {"type": "string", "enum": ["needsAction", "completed"]},
+                    "show_completed": {"type": "boolean"},
+                    "max_results": {"type": "integer", "description": "1-100, default 25."},
+                    "confirmed": {"type": "boolean", "description": "Must be true for delete or disconnect after explicit user approval."}
+                },
+                "required": ["action"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "codebase_indexer",
             "description": (
                 "Index and deeply inspect a local codebase using a persistent semantic code vault. "
@@ -501,7 +539,7 @@ TOOL_SCHEMAS.extend([
                 "properties": {
                     "action": {"type": "string", "enum": ["list", "define", "show", "run", "delete"]},
                     "name": {"type": "string"}, "trigger": {"type": "string"},
-                    "routine": {"type": "object", "description": "description, natural-language triggers, and actions. Use {type: open_app, app_name: <display name>} for apps; command uses an argv array. Set allow_automatic=true only for an app/delay-only routine the user explicitly wants to run whenever its trigger is said."},
+                    "routine": {"type": "object", "description": "description, natural-language triggers, and actions. Use {type: open_app, app_name: <display name>} for one app, or {type: tool, tool_name: launch_apps, arguments: {app_names: [...]}} for several. Other registered tools may also be called with type: tool, but only app-launch tools and delays can run automatically. Set allow_automatic=true only when the user explicitly wants exact triggers to run without another prompt."},
                     "dry_run": {"type": "boolean", "description": "Defaults true. Keep true to preview."},
                     "confirmed": {"type": "boolean", "description": "Must be true for execution/deletion after explicit user approval, and when granting persistent approval to an automatic app-only routine."}
                 },
@@ -542,4 +580,5 @@ TOOL_DISPATCH.update({
     "reasoning_chain_debugger": reasoning_chain_debugger,
     "automated_routine_executor": automated_routine_executor,
     "codebase_indexer": codebase_indexer,
+    "google_workspace": google_workspace,
 })

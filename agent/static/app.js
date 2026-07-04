@@ -51,6 +51,7 @@ const state = {
   isGenerating: false,
   followOutput: true,
   controller: null,
+  generation: null,
   stream: {
     assistantStack: null,
     assistantBubble: null,
@@ -577,7 +578,7 @@ function bubble(content, markdown) {
 
 function detailBlock(title, label, content, running) {
   const block = document.createElement("section");
-  block.className = `detail-block open${running ? " running" : ""}`;
+  block.className = `detail-block${running ? " running" : ""}`;
 
   const toggle = document.createElement("button");
   toggle.type = "button";
@@ -651,6 +652,12 @@ async function sendMessage() {
 
   state.isGenerating = true;
   state.controller = new AbortController();
+  const generation = {
+    controller: state.controller,
+    sessionName: state.activeSessionName,
+    detached: false
+  };
+  state.generation = generation;
   resetStream();
   updateComposerState();
 
@@ -658,20 +665,21 @@ async function sendMessage() {
     const response = await fetch("/api/chat", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ message: text }),
+      body: JSON.stringify({ message: text, session_name: generation.sessionName }),
       signal: state.controller.signal
     });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    await readEventStream(response);
+    await readEventStream(response, generation);
+    if (state.generation === generation) finishGeneration(generation);
   } catch (error) {
     if (error.name !== "AbortError") {
       toast("Selene lost the response stream. Check Ollama and try again.");
-      finishGeneration();
+      finishGeneration(generation);
     }
   }
 }
 
-async function readEventStream(response) {
+async function readEventStream(response, generation) {
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
@@ -686,7 +694,7 @@ async function readEventStream(response) {
     for (const line of lines) {
       if (!line.startsWith("data: ")) continue;
       try {
-        handleStreamEvent(JSON.parse(line.slice(6)));
+        handleStreamEvent(JSON.parse(line.slice(6)), generation);
       } catch {
         // Ignore malformed SSE chunks.
       }
@@ -694,12 +702,23 @@ async function readEventStream(response) {
   }
 }
 
-function handleStreamEvent(event) {
+function handleStreamEvent(event, generation) {
+  const visible = state.generation === generation && !generation.detached;
   switch (event.type) {
+    case "conversation_started":
+      generation.sessionName = event.session_name || generation.sessionName;
+      if (visible) {
+        state.activeSessionName = generation.sessionName;
+        el.title.textContent = cleanSessionName(state.activeSessionName);
+        document.title = titleForSession(state.activeSessionName);
+      }
+      break;
     case "status":
+      if (!visible) break;
       appendStatus(event.message || "");
       break;
     case "thinking_start":
+      if (!visible) break;
       ensureAssistantStack();
       if (state.stream.assistantBubble) {
         state.stream.assistantBubble = null;
@@ -715,34 +734,38 @@ function handleStreamEvent(event) {
       } else {
         state.stream.thinkingContent = thinkingContent();
         state.stream.thinkingBlock.querySelector(".block-body")?.appendChild(state.stream.thinkingContent);
-        state.stream.thinkingBlock.classList.add("open", "running");
+        state.stream.thinkingBlock.classList.add("running");
       }
       state.stream.thinkingText = "";
       scrollToBottom();
       break;
     case "thinking_chunk":
+      if (!visible) break;
       state.stream.thinkingText += event.text || "";
       if (state.stream.thinkingContent) state.stream.thinkingContent.textContent = state.stream.thinkingText;
       scrollThinkingToBottom(state.stream.thinkingBlock);
       break;
     case "thinking_end":
+      if (!visible) break;
       state.stream.thinkingBlock?.classList.remove("running");
       state.stream.thinkingBlock?.classList.remove("open");
       break;
     case "tool_start":
+      if (!visible) break;
       ensureAssistantStack();
       if (!state.stream.thinkingBlock) {
         state.stream.thinkingBlock = detailBlock("Thinking", "reasoning", "", false);
         state.stream.thinkingContent = state.stream.thinkingBlock.querySelector(".block-content");
         state.stream.assistantStack.appendChild(state.stream.thinkingBlock);
       }
-      state.stream.thinkingBlock.classList.add("open", "running");
+      state.stream.thinkingBlock.classList.add("running");
       state.stream.lastToolBlock = toolIndicator(event.name || "tool", true);
       state.stream.thinkingBlock.querySelector(".block-body")?.appendChild(state.stream.lastToolBlock);
       scrollThinkingToBottom(state.stream.thinkingBlock);
       scrollToBottom();
       break;
     case "tool_end":
+      if (!visible) break;
       if (state.stream.lastToolBlock) {
         state.stream.lastToolBlock.classList.remove("running");
         const status = state.stream.lastToolBlock.querySelector(".tool-indicator-status");
@@ -752,6 +775,7 @@ function handleStreamEvent(event) {
       state.stream.lastToolBlock = null;
       break;
     case "content_chunk":
+      if (!visible) break;
       ensureAssistantStack();
       if (!state.stream.assistantBubble) {
         state.stream.thinkingBlock?.classList.remove("open", "running");
@@ -768,17 +792,30 @@ function handleStreamEvent(event) {
       scrollToBottom();
       break;
     case "token_usage":
+      if (!visible) break;
       updateContextMeter(event.total, event.budget);
       break;
     case "done":
-      if (event.history) state.history = event.history;
-      if (event.active_session_name) state.activeSessionName = event.active_session_name;
+      const viewedGeneratingConversation = state.activeSessionName === generation.sessionName;
+      const finishedName = event.active_session_name || generation.sessionName;
       if (event.saved_sessions) state.savedSessions = event.saved_sessions;
-      el.title.textContent = cleanSessionName(state.activeSessionName);
-      document.title = titleForSession(state.activeSessionName);
-      renderSessions();
-      updateContextMeter();
-      finishGeneration();
+      if (visible) {
+        if (event.history) state.history = event.history;
+        state.activeSessionName = finishedName;
+        el.title.textContent = cleanSessionName(state.activeSessionName);
+        document.title = titleForSession(state.activeSessionName);
+        renderSessions();
+        updateContextMeter();
+        finishGeneration(generation);
+      } else {
+        finishGeneration(generation);
+        if (viewedGeneratingConversation) {
+          loadState();
+        } else {
+          renderSessions();
+          toast(`Response ready in “${cleanSessionName(finishedName)}”.`);
+        }
+      }
       break;
   }
 }
@@ -801,19 +838,21 @@ function resetStream() {
   state.stream.lastToolBlock = null;
 }
 
-function finishGeneration() {
+function finishGeneration(generation = state.generation) {
+  if (generation && state.generation !== generation) return;
   state.isGenerating = false;
   state.controller = null;
+  state.generation = null;
   resetStream();
   updateComposerState();
 }
 
-function resetComposer() {
+function resetComposer({ clear = true } = {}) {
   closeSlashMenu();
   if (!el.input) return;
   el.input.disabled = false;
   el.input.readOnly = false;
-  el.input.value = "";
+  if (clear) el.input.value = "";
   resizeComposer();
   updateComposerState();
   requestAnimationFrame(() => el.input?.focus({ preventScroll: true }));
@@ -835,7 +874,7 @@ function appendStatus(text) {
 }
 
 async function clearConversation() {
-  if (state.isGenerating) stopGeneration();
+  if (state.isGenerating) stopGeneration({ refresh: false });
   try {
     await fetch("/api/clear-session", { method: "POST" });
     state.history = [];
@@ -844,15 +883,15 @@ async function clearConversation() {
     document.title = "Selene";
     renderWelcome();
     updateContextMeter();
+    resetComposer();
   } catch {
     toast("Could not clear the conversation.");
+    resetComposer();
   }
 }
 
 async function newConversation() {
-  // The new-session response already contains the updated session list. Avoid
-  // a competing refresh from the cancelled stream restoring stale UI state.
-  if (state.isGenerating) stopGeneration({ refresh: false });
+  if (state.generation) state.generation.detached = true;
   try {
     const response = await fetch("/api/new-session", { method: "POST" });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
@@ -876,6 +915,8 @@ async function newConversation() {
 
 async function deleteSession(name) {
   if (!window.confirm(`Delete “${cleanSessionName(name)}”? This cannot be undone.`)) return;
+  const deletingActiveSession = name === state.activeSessionName;
+  if (deletingActiveSession && state.isGenerating) stopGeneration({ refresh: false });
   try {
     const response = await fetch("/api/delete-session", {
       method: "POST",
@@ -883,18 +924,30 @@ async function deleteSession(name) {
       body: JSON.stringify({ name })
     });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    if (name === state.activeSessionName) {
+    const data = await response.json();
+    state.savedSessions = data.saved_sessions || state.savedSessions.filter((session) => session !== name);
+    const backendStartedNewSession = ["Active Session", "New conversation"].includes(data.active_session_name);
+    if (deletingActiveSession || backendStartedNewSession) {
+      if (state.isGenerating) stopGeneration({ refresh: false });
       state.history = [];
       state.activeSessionName = "New conversation";
       el.title.textContent = "New conversation";
       document.title = "Selene";
+      state.followOutput = true;
+      resetStream();
       renderWelcome();
       updateContextMeter();
+      resetComposer();
     }
-    await refreshSessions();
+    renderSessions();
+    if (!deletingActiveSession && !backendStartedNewSession && !state.isGenerating) {
+      resetComposer({ clear: false });
+    }
     toast("Chat deleted.");
   } catch {
     toast("Could not delete that chat.");
+    if (deletingActiveSession) resetComposer();
+    else if (!state.isGenerating) resetComposer({ clear: false });
   }
 }
 
@@ -943,6 +996,7 @@ async function saveSession() {
 }
 
 async function loadSession(name) {
+  if (state.generation) state.generation.detached = true;
   try {
     const response = await fetch("/api/load-session", {
       method: "POST",

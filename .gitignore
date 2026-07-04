@@ -230,6 +230,11 @@ updates.md
 #Runtime files
 .chroma/
 .selene/
+.selene-agent/
+google_oauth.enc
+.credential-key
+client_secret*.json
+credentials*.json
 
 # Vaults
 vaults/

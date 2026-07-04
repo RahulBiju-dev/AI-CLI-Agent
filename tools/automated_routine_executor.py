@@ -10,9 +10,6 @@ import time
 import webbrowser
 from pathlib import Path
 
-from tools.app_launcher import open_app
-
-
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = Path(
     os.path.abspath(os.path.expanduser(os.environ.get("SELENE_DATA_DIR", "~/.selene-agent")))
@@ -20,7 +17,8 @@ DATA_DIR = Path(
 STORE_PATH = DATA_DIR / "routines.json"
 LEGACY_STORE_PATH = PROJECT_ROOT / ".selene" / "routines.json"
 MAX_ACTIONS = 50
-AUTOMATIC_ACTION_TYPES = {"open_app", "delay"}
+AUTOMATIC_ACTION_TYPES = {"open_app", "delay", "tool"}
+AUTOMATIC_TOOL_NAMES = {"open_app", "launch_apps"}
 
 
 def _load() -> dict[str, dict]:
@@ -75,22 +73,35 @@ def _validate(routine: dict) -> list[str]:
     if len(actions) > MAX_ACTIONS:
         errors.append(f"A routine may contain at most {MAX_ACTIONS} actions")
     for index, item in enumerate(actions):
-        if not isinstance(item, dict) or item.get("type") not in {"command", "open_app", "open_url", "delay"}:
+        if not isinstance(item, dict) or item.get("type") not in {"command", "open_app", "open_url", "delay", "tool"}:
             errors.append(f"actions[{index}] has an unsupported type")
         elif item.get("type") == "command" and not isinstance(item.get("argv"), list):
             errors.append(f"actions[{index}].argv must be an argument array; shell strings are not accepted")
         elif item.get("type") == "open_app" and not isinstance(item.get("app_name"), str):
             errors.append(f"actions[{index}].app_name must be an installed application display name")
+        elif item.get("type") == "tool":
+            if not isinstance(item.get("tool_name"), str) or not item["tool_name"].strip():
+                errors.append(f"actions[{index}].tool_name must be a registered tool name")
+            elif item["tool_name"] == "automated_routine_executor":
+                errors.append(f"actions[{index}] cannot recursively call automated_routine_executor")
+            if not isinstance(item.get("arguments", {}), dict):
+                errors.append(f"actions[{index}].arguments must be an object")
         elif item.get("type") == "open_url" and not str(item.get("url", "")).startswith(("http://", "https://")):
             errors.append(f"actions[{index}].url must use http or https")
     if routine.get("allow_automatic") is True:
         unsafe = sorted({
             str(item.get("type"))
             for item in actions
-            if isinstance(item, dict) and item.get("type") not in AUTOMATIC_ACTION_TYPES
+            if isinstance(item, dict) and (
+                item.get("type") not in AUTOMATIC_ACTION_TYPES
+                or (item.get("type") == "tool" and item.get("tool_name") not in AUTOMATIC_TOOL_NAMES)
+            )
         })
         if unsafe:
-            errors.append("allow_automatic is limited to open_app and delay actions; found: " + ", ".join(unsafe))
+            errors.append(
+                "allow_automatic is limited to app-launch tools and delay actions; found: "
+                + ", ".join(unsafe)
+            )
     return errors
 
 
@@ -116,7 +127,48 @@ def _is_safe_automatic_routine(routine: dict) -> bool:
             has_legacy_name = isinstance(legacy_argv, list) and bool(legacy_argv)
             if not has_name and not has_legacy_name:
                 return False
+        if item.get("type") == "tool":
+            if item.get("tool_name") not in AUTOMATIC_TOOL_NAMES:
+                return False
+            if not isinstance(item.get("arguments", {}), dict):
+                return False
     return True
+
+
+def _run_registered_tool(tool_name: str, arguments: dict, action_type: str = "tool") -> dict:
+    """Call tools through the shared registry used by normal agent tool calls."""
+    if tool_name == "automated_routine_executor":
+        raise ValueError("A routine cannot recursively invoke itself")
+
+    # Imported lazily because registry.py imports this module while constructing
+    # the shared dispatch map.
+    from tools.registry import TOOL_DISPATCH
+
+    handler = TOOL_DISPATCH.get(tool_name)
+    if handler is None:
+        raise ValueError(f"Unknown registered tool: {tool_name}")
+
+    call_arguments = dict(arguments)
+    if tool_name in AUTOMATIC_TOOL_NAMES:
+        call_arguments["confirmed"] = True
+    raw_result = handler(**call_arguments)
+    if isinstance(raw_result, str):
+        try:
+            result = json.loads(raw_result)
+        except json.JSONDecodeError:
+            result = {"output": raw_result}
+    else:
+        result = raw_result
+
+    failed = isinstance(result, dict) and (
+        "error" in result or result.get("success") is False or result.get("ok") is False
+    )
+    return {
+        "type": action_type,
+        "ok": not failed,
+        "tool_name": tool_name,
+        "result": result,
+    }
 
 
 def _run_action(item: dict) -> dict:
@@ -128,15 +180,16 @@ def _run_action(item: dict) -> dict:
     if action_type == "open_url":
         return {"type": action_type, "ok": bool(webbrowser.open(str(item["url"]), new=2)), "url": item["url"]}
     if action_type == "open_app":
-        # Legacy argv routines are migrated in memory by keeping only the app
-        # name. Arguments are deliberately ignored: this is not command execution.
         app_name = item.get("app_name")
         if not app_name and isinstance(item.get("argv"), list) and item["argv"]:
             app_name = str(item["argv"][0])
         if not app_name:
             raise ValueError("open_app requires app_name; command arguments are not permitted")
-        launch_result = json.loads(open_app(str(app_name), confirmed=True))
-        return {"type": action_type, "ok": launch_result.get("success") is True, "app_name": app_name, "launch": launch_result}
+        result = _run_registered_tool("open_app", {"app_name": str(app_name)}, action_type)
+        result["app_name"] = app_name
+        return result
+    if action_type == "tool":
+        return _run_registered_tool(item["tool_name"], item.get("arguments", {}))
     argv = [str(value) for value in item["argv"]]
     if not argv:
         raise ValueError("argv cannot be empty")
@@ -211,7 +264,13 @@ def automated_routine_executor(
             if automatic_trigger
             else "Call run with dry_run=false and confirmed=true after user approval."
         )
-        return json.dumps({"name": resolved_name, "routine": selected, "dry_run": True, "execution_required": requirement}, ensure_ascii=False)
+        return json.dumps({
+            "name": resolved_name,
+            "routine": selected,
+            "dry_run": True,
+            "automatic_trigger": automatic_trigger,
+            "execution_required": requirement,
+        }, ensure_ascii=False)
     if not confirmed and not automatic_trigger:
         return json.dumps({"error": "Routine execution requires confirmed=true after the user reviews the preview"})
     results = []
