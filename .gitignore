@@ -244,3 +244,6 @@ node_modules/
 dist-electron/
 bun.lockb
 bun.lock
+
+# Tests
+tests/
