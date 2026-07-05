@@ -15,6 +15,7 @@ from tools.spotify import spotify_play
 from tools.browser import open_browser
 from tools.app_launcher import launch_apps, open_app
 from tools.terminal_launcher import open_terminal_at_path
+from tools.current_datetime import get_current_datetime
 from tools.vault_indexer import delete_vault_item, index_vault, list_vault_aliases, list_vaults
 from tools.vault_search import search_vault
 from tools.obsi_vault_writer import create_structured_note
@@ -31,6 +32,22 @@ from tools.google_workspace import google_workspace
 # ── Schema definitions ────────────────────────────────────────────────
 
 TOOL_SCHEMAS: list[dict] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_current_datetime",
+            "description": "Get the current date, time, weekday, UTC offset, and Unix timestamp in the computer's local timezone or a requested IANA timezone. Use this for questions involving now, today, or the current time/date.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "timezone": {
+                        "type": "string",
+                        "description": "Optional IANA timezone such as Asia/Kolkata, Europe/London, or America/New_York. Omit for the computer's local timezone."
+                    }
+                }
+            }
+        }
+    },
     {
         "type": "function",
         "function": {
@@ -603,6 +620,7 @@ TOOL_SCHEMAS.extend([
 # Maps function names to their Python callables.
 
 TOOL_DISPATCH: dict[str, callable] = {
+    "get_current_datetime": get_current_datetime,
     "web_search": web_search,
     "read_document": read_document,
     "read_file": read_file,
