@@ -16,6 +16,7 @@ from tools.browser import open_browser
 from tools.app_launcher import launch_apps, open_app
 from tools.terminal_launcher import open_terminal_at_path
 from tools.current_datetime import get_current_datetime
+from tools.spreadsheet import spreadsheet
 from tools.vault_indexer import delete_vault_item, index_vault, list_vault_aliases, list_vaults
 from tools.vault_search import search_vault
 from tools.obsi_vault_writer import create_structured_note
@@ -45,6 +46,48 @@ TOOL_SCHEMAS: list[dict] = [
                         "description": "Optional IANA timezone such as Asia/Kolkata, Europe/London, or America/New_York. Omit for the computer's local timezone."
                     }
                 }
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "spreadsheet",
+            "description": "View spreadsheet metadata/previews, read or query bounded cells, and create .csv, .xls, or .xlsx files. Creation requires explicit confirmation and does not overwrite unless requested.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["view", "read", "create"]},
+                    "file_path": {"type": "string", "description": "Path to a .csv, .xls, or .xlsx file."},
+                    "sheet": {"type": "string", "description": "Optional worksheet name. Read defaults to the first sheet; view defaults to all sheets."},
+                    "cell_range": {"type": "string", "description": "Optional A1 range such as A1:D20 for read/query."},
+                    "query": {"type": "string", "description": "Optional case-insensitive value search for read."},
+                    "sheets": {
+                        "type": "array",
+                        "description": "For create: worksheets with name and rows. Cell values must be strings, numbers, booleans, or null.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "name": {"type": "string"},
+                                "rows": {"type": "array", "items": {"type": "array"}}
+                            },
+                            "required": ["name", "rows"]
+                        }
+                    },
+                    "rows": {
+                        "type": "array",
+                        "items": {"type": "array"},
+                        "description": "Convenience rows for creating a single-sheet workbook, especially CSV. Use sheets for multiple Excel worksheets."
+                    },
+                    "max_rows": {"type": "integer", "description": "Rows returned per preview/read (1-200, default 50)."},
+                    "max_columns": {"type": "integer", "description": "Columns returned per preview/read (1-100, default 30)."},
+                    "data_only": {"type": "boolean", "description": "For .xlsx reads, return cached formula results instead of formulas when available."},
+                    "overwrite": {"type": "boolean", "description": "For create, replace an existing file only when explicitly requested."},
+                    "allow_formulas": {"type": "boolean", "description": "For create, interpret strings beginning with = as formulas. Defaults false."},
+                    "delimiter": {"type": "string", "description": "For CSV, optional delimiter: comma, semicolon, tab (or \\t), or pipe. Reading auto-detects when omitted; writing defaults to comma."},
+                    "confirmed": {"type": "boolean", "description": "Must be true for create after explicit user approval."}
+                },
+                "required": ["action", "file_path"]
             }
         }
     },
@@ -621,6 +664,7 @@ TOOL_SCHEMAS.extend([
 
 TOOL_DISPATCH: dict[str, callable] = {
     "get_current_datetime": get_current_datetime,
+    "spreadsheet": spreadsheet,
     "web_search": web_search,
     "read_document": read_document,
     "read_file": read_file,
