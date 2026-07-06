@@ -1221,6 +1221,78 @@ function distanceFromBottom() {
   return el.messages.scrollHeight - el.messages.scrollTop - el.messages.clientHeight;
 }
 
+const LATEX_UNICODE_SYMBOLS = Object.freeze({
+  alpha: "α", beta: "β", gamma: "γ", delta: "δ", epsilon: "ε", varepsilon: "ϵ",
+  zeta: "ζ", eta: "η", theta: "θ", vartheta: "ϑ", iota: "ι", kappa: "κ",
+  lambda: "λ", mu: "μ", nu: "ν", xi: "ξ", omicron: "ο", pi: "π", varpi: "ϖ",
+  rho: "ρ", varrho: "ϱ", sigma: "σ", varsigma: "ς", tau: "τ", upsilon: "υ",
+  phi: "φ", varphi: "ϕ", chi: "χ", psi: "ψ", omega: "ω",
+  Gamma: "Γ", Delta: "Δ", Theta: "Θ", Lambda: "Λ", Xi: "Ξ", Pi: "Π",
+  Sigma: "Σ", Upsilon: "Υ", Phi: "Φ", Psi: "Ψ", Omega: "Ω",
+
+  plusmn: "±", pm: "±", mp: "∓", times: "×", div: "÷", cdot: "·", ast: "∗",
+  star: "⋆", circ: "∘", bullet: "•", sqrt: "√", sum: "∑", prod: "∏",
+  coprod: "∐", int: "∫", iint: "∬", iiint: "∭", oint: "∮", partial: "∂",
+  nabla: "∇", infinity: "∞", infty: "∞", hbar: "ℏ", ell: "ℓ", degree: "°",
+  oplus: "⊕", ominus: "⊖", otimes: "⊗", oslash: "⊘", odot: "⊙",
+  bigoplus: "⨁", bigotimes: "⨂", bigodot: "⨀", dagger: "†", ddagger: "‡",
+
+  eq: "=", neq: "≠", ne: "≠", equiv: "≡", approx: "≈", sim: "∼", simeq: "≃",
+  cong: "≅", propto: "∝", le: "≤", leq: "≤", ge: "≥", geq: "≥",
+  ll: "≪", gg: "≫", prec: "≺", succ: "≻", preceq: "⪯", succeq: "⪰",
+  lt: "&lt;", gt: "&gt;", parallel: "∥", nparallel: "∦", perp: "⊥", mid: "∣",
+  asymp: "≍", doteq: "≐", models: "⊨", vdots: "⋮", ddots: "⋱", dots: "…",
+  ldots: "…", cdots: "⋯",
+
+  forall: "∀", exists: "∃", nexists: "∄", neg: "¬", lnot: "¬", land: "∧",
+  wedge: "∧", lor: "∨", vee: "∨", therefore: "∴", because: "∵", top: "⊤", bot: "⊥",
+  emptyset: "∅", varnothing: "∅", in: "∈", notin: "∉", ni: "∋", notni: "∌",
+  subset: "⊂", subseteq: "⊆", nsubseteq: "⊈", supset: "⊃", supseteq: "⊇",
+  nsupseteq: "⊉", cup: "∪", cap: "∩", uplus: "⊎", setminus: "∖",
+  bigcup: "⋃", bigcap: "⋂", sqsubset: "⊏", sqsupset: "⊐", sqsubseteq: "⊑",
+  sqsupseteq: "⊒", sqcup: "⊔", sqcap: "⊓",
+
+  leftarrow: "←", gets: "←", rightarrow: "→", to: "→", leftrightarrow: "↔",
+  Leftarrow: "⇐", Rightarrow: "⇒", implies: "⇒", Leftrightarrow: "⇔", iff: "⇔",
+  mapsto: "↦", hookleftarrow: "↩", hookrightarrow: "↪", uparrow: "↑",
+  downarrow: "↓", updownarrow: "↕", Uparrow: "⇑", Downarrow: "⇓",
+  Updownarrow: "⇕", nearrow: "↗", searrow: "↘", swarrow: "↙", nwarrow: "↖",
+  longleftarrow: "⟵", longrightarrow: "⟶", longleftrightarrow: "⟷",
+  Longleftarrow: "⟸", Longrightarrow: "⟹", Longleftrightarrow: "⟺",
+  leftharpoonup: "↼", leftharpoondown: "↽", rightharpoonup: "⇀",
+  rightharpoondown: "⇁", rightleftharpoons: "⇌", rightsquigarrow: "⇝",
+
+  angle: "∠", measuredangle: "∡", triangle: "△", square: "□", diamond: "◇",
+  lozenge: "◊", checkmark: "✓", clubsuit: "♣", diamondsuit: "♦",
+  heartsuit: "♥", spadesuit: "♠", aleph: "ℵ", beth: "ℶ", gimel: "ℷ",
+  Re: "ℜ", Im: "ℑ", wp: "℘", prime: "′", backprime: "‵",
+  copyright: "©", registered: "®", pounds: "£", euro: "€", yen: "¥",
+
+  quad: " ", qquad: "  ", left: "", right: ""
+});
+
+function renderLatexSymbols(text) {
+  let value = String(text || "");
+  // Preserve the contents of common presentation commands without attempting
+  // full TeX layout. Input has already been HTML-escaped by inlineMarkdown.
+  for (let depth = 0; depth < 3; depth += 1) {
+    value = value.replace(
+      /\\(?:text|textrm|textsf|texttt|mathrm|mathbf|mathit|mathsf|mathtt|mathcal)\s*\{([^{}]*)\}/g,
+      "$1"
+    );
+  }
+  value = value.replace(/\\([A-Za-z]+)(?![A-Za-z])/g, (match, command) => (
+    Object.prototype.hasOwnProperty.call(LATEX_UNICODE_SYMBOLS, command)
+      ? LATEX_UNICODE_SYMBOLS[command]
+      : match
+  ));
+  return value
+    .replace(/\\([{}%$#_])/g, "$1")
+    .replace(/\\&amp;/g, "&amp;")
+    .replace(/\\[,;:]/g, " ")
+    .replace(/\\!/g, "");
+}
+
 function renderMarkdown(text) {
   const lines = String(text || "").replace(/\r/g, "").split("\n");
   const output = [];
@@ -1281,6 +1353,7 @@ function inlineMarkdown(text) {
     codeSpans.push(`<code>${code}</code>`);
     return `\u0000CODE${codeSpans.length - 1}\u0000`;
   });
+  value = renderLatexSymbols(value);
   value = value
     .replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>')
     .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
