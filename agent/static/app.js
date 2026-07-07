@@ -150,6 +150,10 @@ function bindEvents() {
   el.messages?.addEventListener("scroll", () => {
     if (distanceFromBottom() < 24) state.followOutput = true;
   }, { passive: true });
+  el.messages?.addEventListener("click", (event) => {
+    const button = event.target.closest(".code-copy-btn");
+    if (button && el.messages.contains(button)) copyCodeBlock(button);
+  });
 
   el.history?.addEventListener("change", () => {
     state.settings.history = el.history.checked;
@@ -1221,6 +1225,174 @@ function distanceFromBottom() {
   return el.messages.scrollHeight - el.messages.scrollTop - el.messages.clientHeight;
 }
 
+const LATEX_UNICODE_SYMBOLS = Object.freeze({
+  alpha: "α", beta: "β", gamma: "γ", delta: "δ", epsilon: "ε", varepsilon: "ϵ",
+  zeta: "ζ", eta: "η", theta: "θ", vartheta: "ϑ", iota: "ι", kappa: "κ",
+  lambda: "λ", mu: "μ", nu: "ν", xi: "ξ", omicron: "ο", pi: "π", varpi: "ϖ",
+  rho: "ρ", varrho: "ϱ", sigma: "σ", varsigma: "ς", tau: "τ", upsilon: "υ",
+  phi: "φ", varphi: "ϕ", chi: "χ", psi: "ψ", omega: "ω",
+  Gamma: "Γ", Delta: "Δ", Theta: "Θ", Lambda: "Λ", Xi: "Ξ", Pi: "Π",
+  Sigma: "Σ", Upsilon: "Υ", Phi: "Φ", Psi: "Ψ", Omega: "Ω",
+
+  plusmn: "±", pm: "±", mp: "∓", times: "×", div: "÷", cdot: "·", ast: "∗",
+  star: "⋆", circ: "∘", bullet: "•", sqrt: "√", sum: "∑", prod: "∏",
+  coprod: "∐", int: "∫", iint: "∬", iiint: "∭", oint: "∮", partial: "∂",
+  nabla: "∇", infinity: "∞", infty: "∞", hbar: "ℏ", ell: "ℓ", degree: "°",
+  oplus: "⊕", ominus: "⊖", otimes: "⊗", oslash: "⊘", odot: "⊙",
+  bigoplus: "⨁", bigotimes: "⨂", bigodot: "⨀", dagger: "†", ddagger: "‡",
+
+  eq: "=", neq: "≠", ne: "≠", equiv: "≡", approx: "≈", sim: "∼", simeq: "≃",
+  cong: "≅", propto: "∝", le: "≤", leq: "≤", ge: "≥", geq: "≥",
+  ll: "≪", gg: "≫", prec: "≺", succ: "≻", preceq: "⪯", succeq: "⪰",
+  lt: "&lt;", gt: "&gt;", parallel: "∥", nparallel: "∦", perp: "⊥", mid: "∣",
+  asymp: "≍", doteq: "≐", models: "⊨", vdots: "⋮", ddots: "⋱", dots: "…",
+  ldots: "…", cdots: "⋯",
+
+  forall: "∀", exists: "∃", nexists: "∄", neg: "¬", lnot: "¬", land: "∧",
+  wedge: "∧", lor: "∨", vee: "∨", therefore: "∴", because: "∵", top: "⊤", bot: "⊥",
+  emptyset: "∅", varnothing: "∅", in: "∈", notin: "∉", ni: "∋", notni: "∌",
+  subset: "⊂", subseteq: "⊆", nsubseteq: "⊈", supset: "⊃", supseteq: "⊇",
+  nsupseteq: "⊉", cup: "∪", cap: "∩", uplus: "⊎", setminus: "∖",
+  bigcup: "⋃", bigcap: "⋂", sqsubset: "⊏", sqsupset: "⊐", sqsubseteq: "⊑",
+  sqsupseteq: "⊒", sqcup: "⊔", sqcap: "⊓",
+
+  leftarrow: "←", gets: "←", rightarrow: "→", to: "→", leftrightarrow: "↔",
+  Leftarrow: "⇐", Rightarrow: "⇒", implies: "⇒", Leftrightarrow: "⇔", iff: "⇔",
+  mapsto: "↦", hookleftarrow: "↩", hookrightarrow: "↪", uparrow: "↑",
+  downarrow: "↓", updownarrow: "↕", Uparrow: "⇑", Downarrow: "⇓",
+  Updownarrow: "⇕", nearrow: "↗", searrow: "↘", swarrow: "↙", nwarrow: "↖",
+  longleftarrow: "⟵", longrightarrow: "⟶", longleftrightarrow: "⟷",
+  Longleftarrow: "⟸", Longrightarrow: "⟹", Longleftrightarrow: "⟺",
+  leftharpoonup: "↼", leftharpoondown: "↽", rightharpoonup: "⇀",
+  rightharpoondown: "⇁", rightleftharpoons: "⇌", rightsquigarrow: "⇝",
+
+  angle: "∠", measuredangle: "∡", triangle: "△", square: "□", diamond: "◇",
+  lozenge: "◊", checkmark: "✓", clubsuit: "♣", diamondsuit: "♦",
+  heartsuit: "♥", spadesuit: "♠", aleph: "ℵ", beth: "ℶ", gimel: "ℷ",
+  Re: "ℜ", Im: "ℑ", wp: "℘", prime: "′", backprime: "‵",
+  copyright: "©", registered: "®", pounds: "£", euro: "€", yen: "¥",
+
+  quad: " ", qquad: "  ", left: "", right: ""
+});
+
+function renderLatexSymbols(text) {
+  let value = String(text || "");
+  // Preserve the contents of common presentation commands without attempting
+  // full TeX layout. Input has already been HTML-escaped by inlineMarkdown.
+  for (let depth = 0; depth < 3; depth += 1) {
+    value = value.replace(
+      /\\(?:text|textrm|textsf|texttt|mathrm|mathbf|mathit|mathsf|mathtt|mathcal)\s*\{([^{}]*)\}/g,
+      "$1"
+    );
+  }
+  value = value.replace(/\\([A-Za-z]+)(?![A-Za-z])/g, (match, command) => (
+    Object.prototype.hasOwnProperty.call(LATEX_UNICODE_SYMBOLS, command)
+      ? LATEX_UNICODE_SYMBOLS[command]
+      : match
+  ));
+  return value
+    .replace(/\\([{}%$#_])/g, "$1")
+    .replace(/\\&amp;/g, "&amp;")
+    .replace(/\\[,;:]/g, " ")
+    .replace(/\\!/g, "");
+}
+
+function splitMarkdownTableRow(line) {
+  const value = String(line || "").trim();
+  const cells = [];
+  let cell = "";
+  let inCode = false;
+  for (let index = 0; index < value.length; index += 1) {
+    const character = value[index];
+    if (character === "`" && value[index - 1] !== "\\") {
+      inCode = !inCode;
+      cell += character;
+    } else if (character === "\\" && value[index + 1] === "|") {
+      cell += "|";
+      index += 1;
+    } else if (character === "|" && !inCode) {
+      cells.push(cell.trim());
+      cell = "";
+    } else {
+      cell += character;
+    }
+  }
+  cells.push(cell.trim());
+  if (value.startsWith("|")) cells.shift();
+  if (value.endsWith("|") && value[value.length - 2] !== "\\") cells.pop();
+  return cells;
+}
+
+function tableAlignments(line) {
+  const cells = splitMarkdownTableRow(line);
+  if (!cells.length || !cells.every((cell) => /^:?-{3,}:?$/.test(cell))) return null;
+  return cells.map((cell) => {
+    if (cell.startsWith(":") && cell.endsWith(":")) return "center";
+    if (cell.endsWith(":")) return "right";
+    return "left";
+  });
+}
+
+function renderTableCell(tag, content, alignment) {
+  return `<${tag} class="align-${alignment}">${inlineMarkdown(content)}</${tag}>`;
+}
+
+function renderMarkdownTable(headers, alignments, rows) {
+  const width = alignments.length;
+  const normalizedHeaders = Array.from({ length: width }, (_, index) => headers[index] || "");
+  const head = normalizedHeaders
+    .map((cell, index) => renderTableCell("th", cell, alignments[index]))
+    .join("");
+  const body = rows.map((row) => {
+    const cells = Array.from({ length: width }, (_, index) => row[index] || "");
+    return `<tr>${cells.map((cell, index) => renderTableCell("td", cell, alignments[index])).join("")}</tr>`;
+  }).join("");
+  return `<div class="table-wrap"><table><thead><tr>${head}</tr></thead>${body ? `<tbody>${body}</tbody>` : ""}</table></div>`;
+}
+
+function renderListItem(content) {
+  const task = String(content || "").match(/^\[([ xX])\]\s+(.+)$/);
+  if (!task) return `<li>${inlineMarkdown(content)}</li>`;
+  const checked = task[1].toLowerCase() === "x";
+  return `<li class="task-list-item"><input type="checkbox" disabled${checked ? " checked" : ""} aria-label="${checked ? "Completed" : "Not completed"}"><span>${inlineMarkdown(task[2])}</span></li>`;
+}
+
+function renderCodeBlock(code, language = "") {
+  const safeLanguage = escapeHTML(language || "");
+  const languageClass = safeLanguage ? ` class="language-${safeLanguage}"` : "";
+  return `<div class="code-block"><div class="code-toolbar"><span>${safeLanguage || "code"}</span><button class="code-copy-btn" type="button" aria-label="Copy code to clipboard">Copy</button></div><pre><code${languageClass}>${escapeHTML(code)}</code></pre></div>`;
+}
+
+async function copyCodeBlock(button) {
+  const code = button.closest(".code-block")?.querySelector("code")?.textContent;
+  if (code == null) return;
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(code);
+    } else {
+      const textarea = document.createElement("textarea");
+      textarea.value = code;
+      textarea.setAttribute("readonly", "");
+      textarea.style.position = "fixed";
+      textarea.style.opacity = "0";
+      document.body.appendChild(textarea);
+      textarea.select();
+      const copied = document.execCommand("copy");
+      textarea.remove();
+      if (!copied) throw new Error("Clipboard command was rejected");
+    }
+    button.textContent = "Copied";
+    button.classList.add("copied");
+    setTimeout(() => {
+      if (!button.isConnected) return;
+      button.textContent = "Copy";
+      button.classList.remove("copied");
+    }, 1400);
+  } catch {
+    toast("Could not copy that code block.");
+  }
+}
+
 function renderMarkdown(text) {
   const lines = String(text || "").replace(/\r/g, "").split("\n");
   const output = [];
@@ -1239,37 +1411,53 @@ function renderMarkdown(text) {
     listType = "";
   };
 
-  lines.forEach((line) => {
+  for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {
+    const line = lines[lineIndex];
     const fence = line.match(/^```\s*([\w+-]*)/);
     if (fence) {
       if (inCode) {
-        output.push(`<pre><code${language ? ` class="language-${escapeHTML(language)}"` : ""}>${escapeHTML(code.join("\n"))}</code></pre>`);
+        output.push(renderCodeBlock(code.join("\n"), language));
         code = []; language = ""; inCode = false;
       } else {
         flushParagraph(); closeList(); inCode = true; language = fence[1] || "";
       }
-      return;
+      continue;
     }
-    if (inCode) { code.push(line); return; }
-    if (!line.trim()) { flushParagraph(); closeList(); return; }
+    if (inCode) { code.push(line); continue; }
+    if (!line.trim()) { flushParagraph(); closeList(); continue; }
+
+    const alignments = lineIndex + 1 < lines.length ? tableAlignments(lines[lineIndex + 1]) : null;
+    const headers = alignments && line.includes("|") ? splitMarkdownTableRow(line) : null;
+    if (headers && headers.length === alignments.length) {
+      flushParagraph(); closeList();
+      const rows = [];
+      lineIndex += 2;
+      while (lineIndex < lines.length && lines[lineIndex].trim() && lines[lineIndex].includes("|")) {
+        rows.push(splitMarkdownTableRow(lines[lineIndex]));
+        lineIndex += 1;
+      }
+      lineIndex -= 1;
+      output.push(renderMarkdownTable(headers, alignments, rows));
+      continue;
+    }
 
     const heading = line.match(/^(#{1,6})\s+(.+)$/);
-    if (heading) { flushParagraph(); closeList(); const level = heading[1].length; output.push(`<h${level}>${inlineMarkdown(heading[2])}</h${level}>`); return; }
-    if (/^\s*([-*_])(?:\s*\1){2,}\s*$/.test(line)) { flushParagraph(); closeList(); output.push("<hr>"); return; }
+    if (heading) { flushParagraph(); closeList(); const level = heading[1].length; output.push(`<h${level}>${inlineMarkdown(heading[2])}</h${level}>`); continue; }
+    if (/^\s*([-*_])(?:\s*\1){2,}\s*$/.test(line)) { flushParagraph(); closeList(); output.push("<hr>"); continue; }
     const quote = line.match(/^>\s?(.*)$/);
-    if (quote) { flushParagraph(); closeList(); output.push(`<blockquote>${inlineMarkdown(quote[1])}</blockquote>`); return; }
+    if (quote) { flushParagraph(); closeList(); output.push(`<blockquote>${inlineMarkdown(quote[1])}</blockquote>`); continue; }
     const unordered = line.match(/^\s*[-*+]\s+(.+)$/);
     const ordered = line.match(/^\s*\d+[.)]\s+(.+)$/);
     if (unordered || ordered) {
       flushParagraph();
       const wanted = ordered ? "ol" : "ul";
       if (listType !== wanted) { closeList(); output.push(`<${wanted}>`); listType = wanted; }
-      output.push(`<li>${inlineMarkdown((unordered || ordered)[1])}</li>`);
-      return;
+      output.push(renderListItem((unordered || ordered)[1]));
+      continue;
     }
     closeList(); paragraph.push(line);
-  });
-  if (inCode) output.push(`<pre><code>${escapeHTML(code.join("\n"))}</code></pre>`);
+  }
+  if (inCode) output.push(renderCodeBlock(code.join("\n"), language));
   flushParagraph(); closeList();
   return output.join("");
 }
@@ -1281,6 +1469,7 @@ function inlineMarkdown(text) {
     codeSpans.push(`<code>${code}</code>`);
     return `\u0000CODE${codeSpans.length - 1}\u0000`;
   });
+  value = renderLatexSymbols(value);
   value = value
     .replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>')
     .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")

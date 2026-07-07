@@ -160,7 +160,8 @@ The default interface — launch with `python main.py` and the agent opens in yo
   - Toggles for conversation history and model thinking
   - Automatically saved conversations with agent-generated 2–3-word sidebar titles
   - Save / restore named sessions without leaving the browser
-- **Markdown & code highlighting** — responses are rendered with `marked.js` and syntax-highlighted with `highlight.js`.
+- **Markdown rendering** — responses support headings, emphasis, links, blockquotes, lists, task lists, fenced code with copy buttons, and responsive GFM-style tables.
+- **LaTeX symbol rendering** — common commands such as `\oplus`, `\alpha`, `\subseteq`, and `\Rightarrow` render as Unicode outside code spans and fenced code.
 - **Responsive layout** — sidebar collapses on narrow viewports; works on desktop and tablet.
 
 ### Tool Suite
@@ -173,6 +174,7 @@ The agent autonomously decides when to call tools based on the user's query:
 | 💻 **Code Viewer** | Read source files with line numbers; scan directories by extension |
 | 🧬 **Codebase Indexer** | Persistently index an entire repository, auto-refresh it after 24 hours, and retrieve grounded code context for architecture questions, fault finding, and optimisation |
 | 📄 **Document Reader** | Extract text from PDFs (`pypdf`) and Word docs (`python-docx`) with page/chunk/query navigation |
+| 📊 **Spreadsheet Tool** | View, read, search, and create bounded `.csv`, `.xls`, and `.xlsx` files with sheet and A1-range controls |
 | 📂 **File Manager** | Stream line ranges, navigate/search bounded text files, and create non-overwriting files auto-vaulted under `~/.selene-agent/vaults/` |
 | 🎵 **Spotify** | Search and play songs natively on Windows, macOS, and Linux |
 | 👁️ **Vision Describer** | Describes images, diagrams, and slides using the local `moondream` vision model |
@@ -194,6 +196,27 @@ The agent autonomously decides when to call tools based on the user's query:
 | ✅ **Google Tasks** | List task lists and tasks, create tasks with notes or due dates, and update status or details; deletion requires explicit confirmation |
 
 Legacy tools have also been hardened for current workloads: web results retain source URLs, code scans skip dependency/cache trees and cap traversal, binary documents route through the document reader, PDF vision runs one page at a time, embedding vectors are shape/number validated, and failed re-indexing preserves the previous good vault records. Set `include_vision=false` on `index_vault` for substantially faster text-only PDF indexing.
+
+### Spreadsheet Tool
+
+Use `spreadsheet` with `action=view` for metadata and bounded previews, `action=read` for a worksheet, A1 range, or value query, and `action=create` to write a new `.csv`, `.xls`, or `.xlsx` file from JSON rows. CSV is treated as one worksheet, supports delimiter detection/selection, and can use the top-level `rows` convenience argument. Creation requires `confirmed=true`, is non-overwriting by default, and treats formula-looking strings as text unless `allow_formulas=true` is explicitly requested.
+
+```json
+{
+  "action": "create",
+  "file_path": "reports/scores.xlsx",
+  "sheets": [
+    {"name": "Scores", "rows": [["Name", "Score"], ["Ada", 10], ["Lin", 9]]}
+  ],
+  "confirmed": true
+}
+```
+
+For CSV, pass rows directly and optionally choose a delimiter:
+
+```json
+{"action": "create", "file_path": "reports/scores.csv", "rows": [["Name", "Score"], ["Ada", 10]], "delimiter": ",", "confirmed": true}
+```
 
 ### Codebase Indexer
 

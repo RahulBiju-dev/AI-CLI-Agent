@@ -14,6 +14,7 @@ BINARY_DOCUMENT_TYPES = {
     ".pdf": "pdf",
     ".docx": "docx",
 }
+SPREADSHEET_TYPES = {".csv", ".xls", ".xlsx"}
 
 
 def _json(data: dict) -> str:
@@ -157,6 +158,14 @@ def read_file(
         if lines:
             return _json({"error": "The lines parameter is for text files. Use read_document pages for PDF files."})
         return read_document(file_path, query=query, chunk=chunk, chunk_size=chunk_size, max_chars=max_chars)
+
+    if ext in SPREADSHEET_TYPES:
+        if lines or chunk is not None:
+            return _json({
+                "error": "Use the spreadsheet tool with a sheet name and A1 cell_range for spreadsheet files."
+            })
+        from tools.spreadsheet import spreadsheet
+        return spreadsheet(action="read", file_path=file_path, query=query)
 
     if lines:
         try:

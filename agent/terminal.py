@@ -456,6 +456,77 @@ _LATEX_SYMBOLS = {
     r"\right": "",
 }
 
+# Keep the CLI's symbol coverage aligned with the browser renderer. The base
+# table above includes terminal-specific function names and arrows; these are
+# the additional Greek variants, operators, relations, sets, and symbols used
+# by the webview's Unicode pass.
+_LATEX_SYMBOLS.update({
+    r"\varepsilon": "ϵ",
+    r"\vartheta": "ϑ",
+    r"\varpi": "ϖ",
+    r"\varrho": "ϱ",
+    r"\varsigma": "ς",
+    r"\varphi": "ϕ",
+    r"\omicron": "ο",
+    r"\coprod": "∐",
+    r"\ominus": "⊖",
+    r"\oslash": "⊘",
+    r"\odot": "⊙",
+    r"\bigoplus": "⨁",
+    r"\bigotimes": "⨂",
+    r"\bigodot": "⨀",
+    r"\dagger": "†",
+    r"\ddagger": "‡",
+    r"\ne": "≠",
+    r"\cong": "≅",
+    r"\le": "≤",
+    r"\ge": "≥",
+    r"\prec": "≺",
+    r"\succ": "≻",
+    r"\preceq": "⪯",
+    r"\succeq": "⪰",
+    r"\nparallel": "∦",
+    r"\mid": "∣",
+    r"\asymp": "≍",
+    r"\doteq": "≐",
+    r"\models": "⊨",
+    r"\nexists": "∄",
+    r"\therefore": "∴",
+    r"\because": "∵",
+    r"\top": "⊤",
+    r"\bot": "⊥",
+    r"\varnothing": "∅",
+    r"\ni": "∋",
+    r"\notni": "∌",
+    r"\nsubseteq": "⊈",
+    r"\nsupseteq": "⊉",
+    r"\uplus": "⊎",
+    r"\bigcup": "⋃",
+    r"\bigcap": "⋂",
+    r"\sqsubset": "⊏",
+    r"\sqsupset": "⊐",
+    r"\sqsubseteq": "⊑",
+    r"\sqsupseteq": "⊒",
+    r"\sqcup": "⊔",
+    r"\sqcap": "⊓",
+    r"\gets": "←",
+    r"\measuredangle": "∡",
+    r"\lozenge": "◊",
+    r"\aleph": "ℵ",
+    r"\beth": "ℶ",
+    r"\gimel": "ℷ",
+    r"\Re": "ℜ",
+    r"\Im": "ℑ",
+    r"\wp": "℘",
+    r"\prime": "′",
+    r"\backprime": "‵",
+    r"\copyright": "©",
+    r"\registered": "®",
+    r"\pounds": "£",
+    r"\euro": "€",
+    r"\yen": "¥",
+})
+
 # Pre-sorted symbol keys (longest first) to avoid re-sorting on every call
 _SORTED_LATEX_KEYS = sorted(_LATEX_SYMBOLS.keys(), key=lambda s: -len(s))
 
@@ -723,6 +794,20 @@ _RE_INLINE_LATEX = re.compile(r"(?<!\\)\$(.+?)(?<!\\)\$")
 _RE_SUP = re.compile(r"\^(\{.*?\}|.)")
 _RE_SUB = re.compile(r"_(\{.*?\}|.)")
 _RE_COLLAPSE_WS = re.compile(r"\s+")
+_RE_MARKDOWN_CODE = re.compile(r"(```[\s\S]*?```|`[^`\n]*`)")
+_RE_LATEX_COMMAND = re.compile(r"\\[A-Za-z]+")
+_RE_TASK_ITEM = re.compile(r"(?m)^(\s*[-*+]\s+)\[([ xX])\]\s+")
+
+
+def _render_bare_latex_symbols(text: str) -> str:
+    """Convert known commands outside math delimiters without changing prose."""
+    text = _RE_LATEX_COMMAND.sub(
+        lambda match: _LATEX_SYMBOLS.get(match.group(0), match.group(0)),
+        text,
+    )
+    for latex, replacement in _LATEX_SPACING.items():
+        text = text.replace(latex, replacement)
+    return text
 
 
 def _render_terminal_markdown(text: str) -> str:
@@ -744,6 +829,17 @@ def _render_terminal_markdown(text: str) -> str:
     def replace_inline(match: re.Match[str]) -> str:
         return _render_latex_math(match.group(1))
 
-    text = _RE_BLOCK_LATEX.sub(replace_block, text)
-    text = _RE_INLINE_LATEX.sub(replace_inline, text)
-    return text.replace(r"\$", "$")
+    def render_prose(segment: str) -> str:
+        segment = _RE_BLOCK_LATEX.sub(replace_block, segment)
+        segment = _RE_INLINE_LATEX.sub(replace_inline, segment)
+        segment = _render_bare_latex_symbols(segment)
+        segment = _RE_TASK_ITEM.sub(
+            lambda match: f"{match.group(1)}{'☑' if match.group(2).lower() == 'x' else '☐'} ",
+            segment,
+        )
+        return segment.replace(r"\$", "$")
+
+    # Code examples must remain literal, including their backslashes. Capturing
+    # delimiters keeps fenced and inline code in the split result unchanged.
+    parts = _RE_MARKDOWN_CODE.split(text)
+    return "".join(part if index % 2 else render_prose(part) for index, part in enumerate(parts))
