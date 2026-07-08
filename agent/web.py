@@ -30,6 +30,8 @@ from agent.core import (
     guarded_options_for_call,
     load_default_system_prompt,
     prepare_messages_for_model,
+    _duplicate_routine_result,
+    _routine_run_key,
 )
 from agent.tool_runner import (
     MAX_PARALLEL_TOOL_WORKERS,
@@ -791,6 +793,7 @@ def generate_chat_events(
         messages_to_send = prepare_messages_for_model(messages_to_send, session_data, tools=TOOL_SCHEMAS)
         
     # 4. Stream response loop (supports tool execution and model chain-calling)
+    executed_routine_runs: set[str] = set()
     while True:
         runtime_tools = compact_tool_schemas(TOOL_SCHEMAS)
         try:
@@ -921,15 +924,35 @@ def generate_chat_events(
             
         # Execute tool calls
         yield {"type": "tool_calls_start", "calls": tool_calls}
-        
+
         tool_results_by_index = {}
-        for can_parallel, batch in build_execution_batches(normalize_tool_calls(tool_calls)):
+        calls_to_execute = []
+        original_index_by_call_id = {}
+        for index, call in enumerate(tool_calls):
+            routine_key = _routine_run_key(call)
+            if routine_key and routine_key in executed_routine_runs:
+                skipped = _duplicate_routine_result(call)
+                tool_results_by_index[index] = skipped
+                yield {
+                    "type": "tool_end",
+                    "id": index,
+                    "name": skipped["tool_name"],
+                    "result": skipped["content"],
+                }
+                continue
+            if routine_key:
+                executed_routine_runs.add(routine_key)
+            original_index_by_call_id[id(call)] = index
+            calls_to_execute.append(call)
+
+        for can_parallel, batch in build_execution_batches(normalize_tool_calls(calls_to_execute)):
             if not can_parallel:
                 for spec in batch:
-                    yield {"type": "tool_start", "id": spec.index, "name": spec.name, "arguments": spec.arguments}
+                    original_index = original_index_by_call_id[id(spec.raw)]
+                    yield {"type": "tool_start", "id": original_index, "name": spec.name, "arguments": spec.arguments}
                     result = execute_tool_call(spec)
-                    yield {"type": "tool_end", "id": result.spec.index, "name": spec.name, "result": result.content}
-                    tool_results_by_index[spec.index] = result.as_tool_message()
+                    yield {"type": "tool_end", "id": original_index, "name": spec.name, "result": result.content}
+                    tool_results_by_index[original_index] = result.as_tool_message()
                 continue
 
             yield {
@@ -938,15 +961,17 @@ def generate_chat_events(
                 "names": [spec.name for spec in batch],
             }
             for spec in batch:
-                yield {"type": "tool_start", "id": spec.index, "name": spec.name, "arguments": spec.arguments}
+                original_index = original_index_by_call_id[id(spec.raw)]
+                yield {"type": "tool_start", "id": original_index, "name": spec.name, "arguments": spec.arguments}
 
             worker_count = min(MAX_PARALLEL_TOOL_WORKERS, len(batch))
             with ThreadPoolExecutor(max_workers=worker_count) as executor:
                 futures = {executor.submit(execute_tool_call, spec): spec for spec in batch}
                 for future in as_completed(futures):
                     result = future.result()
-                    yield {"type": "tool_end", "id": result.spec.index, "name": result.spec.name, "result": result.content}
-                    tool_results_by_index[result.spec.index] = result.as_tool_message()
+                    original_index = original_index_by_call_id[id(result.spec.raw)]
+                    yield {"type": "tool_end", "id": original_index, "name": result.spec.name, "result": result.content}
+                    tool_results_by_index[original_index] = result.as_tool_message()
 
         tool_results = [tool_results_by_index[index] for index in sorted(tool_results_by_index)]
             

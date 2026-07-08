@@ -755,6 +755,63 @@ def _process_tool_calls(tool_calls: list[dict]) -> list[dict]:
     return [result.as_tool_message() for result in results]
 
 
+def _routine_run_key(call: dict) -> str | None:
+    """Return a stable per-turn key for routine run calls."""
+    function = call.get("function") or {}
+    if function.get("name") != "automated_routine_executor":
+        return None
+    arguments = function.get("arguments") or {}
+    if arguments.get("action") != "run":
+        return None
+    name = str(arguments.get("name") or "").strip().casefold()
+    trigger = str(arguments.get("trigger") or "").strip().casefold()
+    if name:
+        return f"name:{name}"
+    if trigger:
+        return f"trigger:{trigger}"
+    return "routine-run"
+
+
+def _duplicate_routine_result(call: dict) -> dict:
+    function = call.get("function") or {}
+    arguments = function.get("arguments") or {}
+    name = str(arguments.get("name") or arguments.get("trigger") or "routine")
+    content = json.dumps({
+        "ok": True,
+        "already_executed": True,
+        "name": name,
+        "guidance": (
+            "This routine was already executed during the current user turn. "
+            "Do not call automated_routine_executor for it again; continue with the final answer."
+        ),
+    }, ensure_ascii=False)
+    return {"role": "tool", "tool_name": "automated_routine_executor", "content": content}
+
+
+def _process_tool_calls_with_turn_guard(tool_calls: list[dict], executed_routines: set[str]) -> list[dict]:
+    """Execute tool calls while preventing duplicate routine runs in one turn."""
+    pending_calls: list[dict] = []
+    pending_positions: list[int] = []
+    results_by_index: dict[int, dict] = {}
+
+    for index, call in enumerate(tool_calls):
+        routine_key = _routine_run_key(call)
+        if routine_key and routine_key in executed_routines:
+            results_by_index[index] = _duplicate_routine_result(call)
+            continue
+        if routine_key:
+            executed_routines.add(routine_key)
+        pending_positions.append(index)
+        pending_calls.append(call)
+
+    if pending_calls:
+        pending_results = _process_tool_calls(pending_calls)
+        for index, result in zip(pending_positions, pending_results):
+            results_by_index[index] = result
+
+    return [results_by_index[index] for index in sorted(results_by_index)]
+
+
 # ── Slash commands ────────────────────────────────────────────────────
 
 _COMMANDS_HELP = f"""
@@ -1613,8 +1670,10 @@ def run() -> None:
             history.append(assistant_msg)
 
         # ── Tool-call loop (iterative, in case of chained calls) ──────
+        executed_routine_runs: set[str] = set()
         while assistant_msg.get("tool_calls"):
-            tool_results = _process_tool_calls(assistant_msg["tool_calls"])
+            tool_results = _process_tool_calls_with_turn_guard(assistant_msg["tool_calls"], executed_routine_runs)
+
             if session["history"]:
                 history.extend(tool_results)
                 # Trim history to keep follow-up requests within token budget
