@@ -151,9 +151,17 @@ def _normalize_session_settings(session: dict, *, fallback: dict | None = None) 
     return merged
 
 
+def _active_system_prompt(session: dict | None = None) -> tuple[str, str]:
+    """Return (default, active) system prompts used for model calls and UI meters."""
+    default_prompt = load_default_system_prompt() or ""
+    override = str((session or {}).get("system") or "").strip()
+    return default_prompt, (override or default_prompt)
+
+
 def _runtime_payload(session: dict) -> dict:
     runtime = get_runtime_config(session)
     paths = get_runtime_paths()
+    default_system_prompt, active_system_prompt = _active_system_prompt(session)
     return {
         "requested_profile": runtime.requested_profile.value,
         "profile": runtime.profile.value,
@@ -161,6 +169,10 @@ def _runtime_payload(session: dict) -> dict:
         "warnings": list(runtime.warnings),
         "effective_options": runtime.ollama_options(),
         "storage": paths.report(),
+        # Frontend context meter needs the prompt actually sent to the model.
+        # Session ``system`` is only an override; empty means Modelfile default.
+        "default_system_prompt": default_system_prompt,
+        "active_system_prompt": active_system_prompt,
     }
 
 
@@ -323,6 +335,20 @@ def save_session_snapshot(
             return safe_filename
 
 
+# Temporary first-turn files look like:
+#   session_YYYYMMDD_HHMMSS.json
+#   session_YYYYMMDD_HHMMSS_ffffff.json
+#   session_YYYYMMDD_HHMMSS_ffffff_<8 hex>.json  (current uniqueness suffix)
+# After the first completed reply they are renamed to Title_Words_<stamp>.json.
+_TEMPORARY_SESSION_RE = re.compile(
+    r"^session_"
+    r"(?P<stamp>\d{8}_\d{6}(?:_\d{1,6})?)"
+    r"(?:_[0-9a-f]{8})?"
+    r"\.json$",
+    re.IGNORECASE,
+)
+
+
 def _normalize_agent_title(value: str) -> str:
     """Constrain model output to a safe, human-readable 2-3 word title."""
     first_line = next((line.strip() for line in value.splitlines() if line.strip()), "")
@@ -333,6 +359,11 @@ def _normalize_agent_title(value: str) -> str:
     if len(words) < 2:
         return "New Conversation"
     return " ".join(words)
+
+
+def is_temporary_session_filename(filename: str | None) -> bool:
+    """Return True when *filename* is still awaiting agent title renaming."""
+    return bool(_TEMPORARY_SESSION_RE.fullmatch(os.path.basename(filename or "")))
 
 
 def generate_conversation_title(
@@ -397,9 +428,10 @@ def title_temporary_session(
 ) -> str | None:
     """Replace a first-turn temporary filename with an agent-generated title."""
     filename = os.path.basename(filename or GLOBAL_STATE.get("active_session_name", ""))
-    match = re.fullmatch(r"session_(\d{8}_\d{6}(?:_\d{6})?)\.json", filename)
+    match = _TEMPORARY_SESSION_RE.fullmatch(filename)
     if not match:
         return None
+    stamp = match.group("stamp")
 
     old_path = os.path.join(_SESSIONS_DIR, filename)
     if not os.path.isfile(old_path):
@@ -419,11 +451,11 @@ def title_temporary_session(
     with _session_lock(filename):
         if not os.path.isfile(old_path):
             return None
-        target = f"{safe_title}_{match.group(1)}.json"
+        target = f"{safe_title}_{stamp}.json"
         target_path = os.path.join(_SESSIONS_DIR, target)
         suffix = 2
         while os.path.exists(target_path) and target_path != old_path:
-            target = f"{safe_title}_{match.group(1)}_{suffix}.json"
+            target = f"{safe_title}_{stamp}_{suffix}.json"
             target_path = os.path.join(_SESSIONS_DIR, target)
             suffix += 1
         rebound = False

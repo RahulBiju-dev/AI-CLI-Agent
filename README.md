@@ -27,6 +27,7 @@ By default the agent launches a **modern browser-based Web UI** with live stream
 - [Prerequisites](#prerequisites)
 - [Installation](#installation)
 - [Diagnostics](#diagnostics)
+- [Building the Desktop App (Electron)](#building-the-desktop-app-electron)
 - [Usage](#usage)
   - [Web UI (Default)](#web-ui-default)
   - [Terminal CLI](#terminal-cli)
@@ -84,9 +85,9 @@ When the model decides a tool is needed, it emits a structured JSON object inste
 }
 ```
 
-The agent intercepts this, dispatches to the corresponding Python function via a **dispatch table** (`TOOL_DISPATCH`), and feeds the return value back to the model as a `tool` role message. The model never executes code directly — it only emits structured requests that the agent mediates.
+The agent intercepts this and routes execution through **`agent/tool_runner.py`**, using schemas, dispatch, and `ToolMetadata` from `tools/registry.py`. Metadata covers side effects, parallel safety, resource weight, cancellation, timeouts, output bounds, platform support, and optional dependencies. The model never executes code directly — it only emits structured requests that the agent mediates.
 
-When the model emits multiple independent read-only tool calls in the same response, Selene runs the safe calls concurrently and feeds the results back in the original order. Side-effecting tools and dependency-sensitive chains, such as current-date preflights before web search or scraping, remain ordered.
+When the model emits multiple independent read-only tool calls in the same response, Selene runs the safe calls concurrently and feeds the results back in the original order. Side-effecting tools and dependency-sensitive chains, such as current-date preflights before web search or scraping, remain ordered. A non-idempotent side-effect failure or timeout blocks later side effects in the same batch.
 
 **Why this matters:** The model's training data has a knowledge cutoff. Tool calling allows it to bridge that gap with real-time data, local filesystem access, and system integration — all while keeping execution sandboxed in Python handlers.
 
@@ -139,7 +140,7 @@ The **context window** (`num_ctx`) is the maximum number of tokens the model can
 
 The agent manages this automatically:
 
-- **Default `num_ctx` is 8192** — sized to fit the model + KV cache entirely in GPU VRAM on consumer GPUs (4-8GB).
+- **Conservative default `num_ctx` is 4096** under the low-VRAM profile (the safe default when VRAM cannot be measured or is ~4 GiB). The balanced profile raises this to **8192** on larger GPUs. Override with `SELENE_NUM_CTX` or `/set parameter num_ctx`.
 - **System prompt persistence** keeps the active model system prompt in every model request. Selene reads the local `Modelfile` system prompt first, then falls back to Ollama's built-model prompt, then to `~/.selene-agent/system_prompt_cache.txt` (or `$SELENE_DATA_DIR/system_prompt_cache.txt`). This makes prompt edits effective at runtime even before the model is rebuilt, while still keeping a durable fallback.
 - **System reminder anchoring** adds a compact runtime system reminder near the active user turn while preserving the full system prompt at the front. This helps long conversations retain tool/evidence rules even when the beginning of the context is far away.
 - **History trimming and compaction** keep the prompt within the active token budget. Near 75% usage, older turns are summarized and passed through the context optimizer while system instructions and recent exchanges remain intact; hard trimming remains the final bound.
@@ -166,6 +167,8 @@ The default interface — launch with `python main.py` and the agent opens in yo
 - **Enhanced 3D Elements** — realistic layered shadows (`--shadow-subtle`, `--shadow-heavy`) and tactile hover/active states that simulate physical lift for cards and message bubbles.
 - **Context window usage indicators** — visual tracking of the model's context capacity in real time.
 - **Live SSE streaming** — tokens and thinking blocks are pushed to the browser in real-time via Server-Sent Events; no polling, no page reloads.
+- **Generation ownership** — each browser tab sends an `X-Selene-Client-ID`. Unsaved chats are isolated per tab; a **saved** session allows only one active generation across tabs. Each run has a generation ID and ends in exactly one terminal SSE state: `completed`, `cancelled`, or `failed`.
+- **Safe cancellation** — stop an in-flight reply without tearing down the server; cancellation tokens cover model work and tool execution.
 - **Smart generation states** — dynamic site behaviour that intelligently adapts while a response is actively generating.
 - **Collapsible thinking panel** — while the model reasons, a dedicated magenta panel shows the chain-of-thought with animated dots. After completion it collapses into a togglable bar (DeepSeek/Gemini style).
 - **Interactive tool cards** — each tool invocation renders a visual card: `⟳ Running [tool]` → `✓ Executed [tool]`. Click the header to expand raw JSON parameters and output.
@@ -205,9 +208,9 @@ The agent autonomously decides when to call tools based on the user's query:
 | 🧠 **Context Memory Optimizer** | Compact conversations while preserving instructions, recent turns, decisions, constraints, facts, and links |
 | 🧭 **Reasoning Chain Debugger** | Audit explicit claim/evidence graphs for unsupported leaps, missing references, cycles, and confidence problems |
 | ⚙️ **Automated Routine Executor** | Define natural-language workflow macros, preview their actions, and execute approved local commands/apps/URLs |
-| 🚀 **App Launcher** | Launch up to ten installed desktop apps by display name, with confirmation and command-injection safeguards |
+| 🚀 **App Launcher** | Launch up to ten installed desktop apps by display name (Linux desktop entries; Windows Start Menu shortcuts with target validation), with confirmation and command-injection safeguards |
 | 🕒 **Current Date & Time** | Return the current local date/time or convert it to a requested IANA timezone |
-| 💻 **Terminal Launcher** | Open a supported terminal at an existing directory, with explicit confirmation and no command execution |
+| 💻 **Terminal Launcher** | Open a supported terminal at an existing directory only (no command execution): GNOME/KDE/Xfce on Linux; Windows Terminal / PowerShell / cmd on Windows |
 | 📅 **Google Calendar** | List calendars and upcoming events, search a time range, and create or edit events; deletion requires explicit confirmation |
 | ✅ **Google Tasks** | List task lists and tasks, create tasks with notes or due dates, and update status or details; deletion requires explicit confirmation |
 
@@ -293,7 +296,7 @@ The advanced tools are deliberately bounded:
 - The reasoning debugger audits supplied claims, dependencies, assumptions, and evidence IDs. It does not expose private model chain-of-thought; it produces an accountable evidence graph and Mermaid diagram.
 - Routines live in `~/.selene-agent/routines.json` (or `$SELENE_DATA_DIR/routines.json`) so they persist across conversations, application restarts, and upgrades. Existing routines from `.selene/routines.json` are imported automatically. Routine actions can invoke registered agent tools; app actions are dispatched through `app_launcher.py`, including batched `launch_apps` calls. Use `action=show` (or `dry_run=true`) for the required preview of command, URL, and general tool runs, then use `action=run` with `confirmed=true` after user approval. App/delay-only routines can receive persistent approval when defined, allowing an exact saved trigger to run them later without another prompt. Commands use argument arrays with `shell=False` and remain in the project workspace.
 - Google Calendar and Tasks use a first-run Desktop OAuth browser flow. The downloaded client configuration and refresh token are then stored together as AES-GCM ciphertext at `~/.selene-agent/google_oauth.enc` (or under `$SELENE_DATA_DIR`). Selene keeps the encryption key in the OS keyring where available; headless systems fall back to a mode-`0600` key beside the ciphertext. The downloaded source JSON is never copied into the repository and can be deleted after authorization.
-- App actions accept only installed application display names. Shells, terminals, paths, URLs, command flags, and arbitrary PATH binaries are rejected; all launches are detached and shell-free.
+- App actions accept only installed application display names. Shells, terminals, paths, URLs, command flags, uninstallers, and arbitrary PATH binaries are rejected; all launches are detached and shell-free. On Windows, discovery uses bounded Start Menu `.lnk` resolution with target validation.
 
 Example simulation model:
 
@@ -341,74 +344,64 @@ Example routine definition:
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                          main.py                                │
-│          (entry point — model init, CLI/Web routing)            │
-└────────────────────┬──────────────────────┬─────────────────────┘
-                     │  --cli flag          │  default
-                     ▼                      ▼
-        ┌────────────────────┐   ┌─────────────────────────────┐
-        │   agent/core.py    │   │       agent/web.py           │
-        │  (Terminal CLI)    │   │  (Threaded HTTP + SSE)       │
-        │  Chat Loop         │   │  /api/chat   → SSE stream    │
-        │  /commands         │   │  /api/session/*  → JSON      │
-        │  Streaming         │   │  /static/*   → HTML/CSS/JS   │
-        │  Session Mgmt      │   └──────────────┬──────────────┘
-        └────────┬───────────┘                  │
-                 │                              │
-                 └──────────────┬───────────────┘
-                                ▼
-               ┌────────────────────────────────┐
-               │         tools/registry          │
-               │  TOOL_SCHEMAS   TOOL_DISPATCH   │
-               └────────────────┬───────────────┘
-                                │
-     ┌──────┬──────┬────────┬───┴──┬─────────┬───────────┐
-     ▼      ▼      ▼        ▼      ▼         ▼           ▼
-  search  web      browser  file  document spotify   vision     vault
-  .py     scraper  .py      .py   .py      .py    describer  (index/search/
-          .py                                      .py        embeddings)
-                                    obsi_vault          │
-                                    _writer.py           ▼
-                                                  ┌──────────┐
-                                                  │ ChromaDB │
-                                                  │ (.chroma)│
-                                                  └──────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│  main.py  ·  --doctor | profile select | managed model | CLI/Web │
+└───────────────┬──────────────────────────────┬───────────────────┘
+                │ --cli                        │ default
+                ▼                              ▼
+     ┌──────────────────┐           ┌──────────────────────────────┐
+     │  agent/core.py   │           │ agent/web.py + web_runtime   │
+     │  Terminal loop   │           │ Threaded HTTP + SSE          │
+     │  /commands       │           │ generation ownership         │
+     │  session save    │           │ /api/chat · /api/session/*   │
+     └────────┬─────────┘           └──────────────┬───────────────┘
+              │                                    │
+              └────────────────┬───────────────────┘
+                               ▼
+              ┌────────────────────────────────────┐
+              │ agent/ollama_runtime.py            │
+              │ shared coordinator (chat/title/    │
+              │ summary/embed/vision) + keep-alive │
+              └────────────────┬───────────────────┘
+                               │
+              ┌────────────────┼────────────────────┐
+              ▼                ▼                    ▼
+   agent/tool_runner.py   tools/registry.py   agent/platform_runtime.py
+   ordered/parallel       schemas·dispatch    paths·process·desktop
+   cancel + timeouts      ·ToolMetadata       terminals·browser
+              │
+              ▼
+         tools/* handlers  ──► optional Chroma / Ollama / OS APIs
 
-  advanced tools: knowledge graph · simulation · API orchestration
-                  context memory · reasoning audit · routine macros
-                  Google Calendar · Google Tasks
+ Supporting modules: runtime_config · model_lifecycle · diagnostics ·
+ persistence · cancellation
 
- Browser (Web UI)
- ┌──────────────────────────────────────────────┐
- │  index.html  +  style.css  +  app.js          │
- │  ┌──────────┐  ┌─────────────────────────┐   │
- │  │ Sidebar  │  │  Chat Panel              │   │
- │  │ Sliders  │  │  SSE token stream        │   │
- │  │ Toggles  │  │  Thinking block          │   │
- │  │ Sessions │  │  Tool cards              │   │
- │  └──────────┘  └─────────────────────────┘   │
- └──────────────────────────────────────────────┘
+ Electron desktop (optional): electron/main.js spawns selene-backend,
+ waits for stdout port announce, single-instance lock, owned shutdown
 ```
+
+Authoritative module map for contributors: [AGENTS.md](AGENTS.md).
 
 ### Data Flow — Web UI
 
 1. Browser opens automatically at `http://localhost:5005` (or next free port)
-2. User message is `POST`ed to `/api/chat`
-3. `web.py` builds the Ollama request with the current session's parameters, history, and tool schemas
-4. If the model returns tool calls, `web.py` executes them via `TOOL_DISPATCH` and yields SSE `tool_*` events to the browser
-5. Thinking tokens arrive as `thinking` SSE events; content tokens as `token` events
-6. `app.js` renders tokens in real time, assembles the thinking panel, and builds tool cards
-7. On completion a `done` SSE event is fired and the response is added to history
+2. User message is `POST`ed to `/api/chat` with client and generation identity headers
+3. `web_runtime` leases generation ownership (one active generation per saved session; unsaved chats isolated per tab)
+4. `web.py` builds the Ollama request via the shared coordinator with session parameters, trimmed history, and compact tool schemas
+5. Tool calls run through `tool_runner` (metadata-aware parallelism, cancellation, bounds); SSE `tool_*` events stream to the browser
+6. Thinking tokens arrive as `thinking` SSE events; content tokens as `token` events
+7. `app.js` renders tokens in real time, assembles the thinking panel, and builds tool cards
+8. The stream ends in exactly one terminal state (`completed`, `cancelled`, or `failed`) and history is updated when appropriate
 
 ### Data Flow — Terminal CLI
 
 1. **User input** enters the chat loop in `agent/core.py`
 2. Slash commands (`/help`, `/save`, `/vault`, etc.) are intercepted and handled locally — they never touch the LLM
-3. Natural language input is sent to Ollama with the full tool schema list and (trimmed) conversation history
-4. If the model returns tool calls, the dispatch table routes them to the appropriate Python handler
+3. Natural language input is sent through the shared Ollama coordinator with compact tool schemas and (trimmed) conversation history
+4. Tool calls go through `tool_runner` → registry dispatch → Python handlers
 5. Tool results are appended to the conversation and the model is called again
 6. Final text output is streamed through the terminal renderer with Markdown and LaTeX processing
+7. `Ctrl+\` cancels the active generation while keeping partial context; `Ctrl+C` exits the process
 
 ---
 
@@ -431,11 +424,14 @@ Selection order (no silent migration or copy):
    - Linux: XDG data/state/config/cache under the Selene app name
    - Windows: `%LOCALAPPDATA%\Selene`
 
+Critical JSON (sessions, aliases, routines metadata, and similar) is written with **atomic temp + fsync + replace**. Malformed files are preserved rather than silently overwritten. Selene never starts a second Ollama server and never stops an external Ollama process it did not own.
+
 ### Spotify / PDF notes
 
 - **Fedora:** Spotify uses MPRIS over DBus (`dbus-python` is Linux-only in `requirements.txt`).
 - **Windows:** Spotify uses a URI launch backend and never claims confirmed playback.
 - **PDF text** works with `pypdf` alone. **PDF-to-image** needs Poppler (`poppler-utils` on Fedora; set `POPPLER_PATH` / `SELENE_POPPLER_PATH` on Windows if needed).
+- Optional packages (Google APIs, Chroma, vision/PDF image tooling, `dbus-python`) fail with capability errors for those features only — they must not block core import or startup.
 
 ---
 
@@ -522,41 +518,48 @@ Selene can be built into a standalone desktop application using Electron and PyI
 
 > **Note**: The Ollama engine and models (like Gemma 4) are **not** bundled in the app to keep the file size reasonable. Users must have Ollama installed and running on their system.
 
+### Scripts (`package.json`)
+
+| Script | Purpose |
+|--------|---------|
+| `bun run build:backend` | PyInstaller via `selene-backend.spec` → `dist/selene-backend` (or `.exe`) |
+| `bun run build:desktop` | `electron/build_desktop.py` helper (Electron's bundled Node + electron-builder) |
+| `bun run build:appimage` | Linux AppImage only |
+| `bun run build` | Backend + Linux AppImage |
+| `bun run build:windows` | Backend + Windows NSIS (run on a Windows host) |
+| `bun start` | Electron development shell against a local/backend setup |
+
 ### Step-by-Step Build Instructions
 
 1. **Install Node.js & Python dependencies**:
-   Ensure you have Node.js installed. Then, install the required packages:
+   Ensure you have Bun (or Node) installed. Then:
    ```bash
    bun install
-   pip install pyinstaller
+   pip install -r requirements-dev.txt   # includes PyInstaller
    ```
 
 2. **Build the Python Backend**:
-   First, compile the Python code into a standalone executable using the provided PyInstaller spec:
    ```bash
    bun run build:backend
    ```
-   This creates the backend executable inside the `dist/` folder.
+   This creates the backend executable inside the `dist/` folder (`selene-backend` on Linux, `selene-backend.exe` on Windows). The spec keeps `console=True` so Electron can read the **stdout port announcement**; Windows Electron hides that console via spawn flags.
 
 3. **Test in Development Mode (Optional)**:
-   You can run the Electron app locally to ensure the backend spawns correctly:
    ```bash
    bun start
    ```
+   Electron takes a single-instance lock, spawns only the Selene-owned backend, waits for the port line on stdout, and shuts that process tree down on quit (`/api/shutdown` with owner token, then SIGTERM/`taskkill /T` if needed). External Ollama is never stopped.
 
 4. **Build the Electron App**:
-   Package the application for your operating system:
    ```bash
    bun run build          # backend + Linux AppImage
    bun run build:windows  # backend + Windows NSIS (on Windows hosts)
    ```
-   Artifacts use the version from `package.json` (for example
-   `dist-electron/Selene-2.2.0.AppImage` or `Selene-2.2.0-Setup.exe`). The
-   packaging helper always forces `--publish never`. NSIS uninstall leaves user
-   runtime data intact.
+   Artifact names follow `package.json` `version` (currently **1.0.0**):
+   - Linux: `dist-electron/Selene-1.0.0.AppImage`
+   - Windows: `dist-electron/Selene-1.0.0-Setup.exe`
 
-   The PyInstaller backend keeps a console for Electron's stdout port-readiness
-   contract; Electron launches it with a hidden console on Windows.
+   `electron/build_desktop.py` always forces `--publish never`. NSIS uninstall leaves user runtime data intact (`deleteAppDataOnUninstall: false`).
 
 ## Usage
 
@@ -665,6 +668,13 @@ The vault provides persistent semantic search over your local documents:
 
 ### Runtime Configuration
 
+Settings resolve in this order (highest wins):
+
+1. Session / slash-command override (`/set …`)
+2. Environment variables (`SELENE_*`)
+3. Selected hardware profile (`auto`, `low-vram`, `balanced`, `manual`)
+4. Conservative defaults (4 GiB-safe low-VRAM profile)
+
 All model parameters can be adjusted without restarting:
 
 ```bash
@@ -680,21 +690,34 @@ All model parameters can be adjusted without restarting:
 
 Available parameters: `temperature`, `top_p`, `top_k`, `num_ctx`, `num_predict`, `repeat_penalty`, `presence_penalty`, `frequency_penalty`, `min_p`, `tfs_z`, `repeat_last_n`, `seed`, `num_gpu`, `num_thread`, `num_keep`.
 
+Common environment overrides (see `agent/runtime_config.py` for the full list):
+
+| Variable | Effect |
+|----------|--------|
+| `SELENE_RUNTIME_PROFILE` | `auto` · `low-vram` · `balanced` · `manual` |
+| `SELENE_NUM_CTX` / `SELENE_NUM_PREDICT` / `SELENE_NUM_BATCH` | Context, output ceiling, prefill batch |
+| `SELENE_TEMPERATURE` / `SELENE_TOP_P` / `SELENE_TOP_K` | Sampling |
+| `SELENE_KEEP_ALIVE` | Ollama keep-alive (`10m`, `30m`, `0`, `-1`, …) |
+| `SELENE_MODEL_CONCURRENCY` / `SELENE_TOOL_WORKERS` | Coordinator and tool-pool limits |
+| `SELENE_CHAT_MODEL` / `SELENE_EMBEDDING_MODEL` / `SELENE_VISION_MODEL` | Model names |
+| `SELENE_DATA_DIR` | Runtime data root |
+
 ---
 
 ## Performance Tuning
 
-Selene selects a **hardware profile** at startup (`auto`, `low-vram`, `balanced`, `manual`). When VRAM cannot be measured, or a ~4 GiB class GPU is detected, the conservative **low-vram** profile is used:
+Selene selects a **hardware profile** at startup (`auto`, `low-vram`, `balanced`, `manual`). When VRAM cannot be measured, or a ~4 GiB class GPU is detected, the conservative **low-vram** profile is used. All chat, title, summary, embedding, and vision work shares one Ollama coordinator; low-VRAM mode serializes model-heavy work without serializing ordinary tools.
 
-| Setting | low-vram (default safeguard) | Purpose |
-|---------|------------------------------|---------|
-| `num_ctx` | 4096 | Context window — keeps first-turn tool schemas viable on 4 GiB |
-| `num_predict` | 768 | Output ceiling |
-| `num_batch` | 128 | Prefill batch size |
-| model slots | 1 | Serializes chat/embed/vision under the Ollama coordinator |
-| tool workers | 2 | Bounded parallel tool execution |
+| Setting | low-vram (default safeguard) | balanced (larger GPU) | Purpose |
+|---------|------------------------------|------------------------|---------|
+| `num_ctx` | 4096 | 8192 | Context window |
+| `num_predict` | 768 | 1536 | Output ceiling |
+| `num_batch` | 128 | 512 | Prefill batch size |
+| model slots | 1 | 2 | Concurrent model-heavy ops under the coordinator |
+| tool workers | 2 | 4 | Bounded parallel tool execution |
+| keep-alive | 10m | 30m | How long Ollama retains weights in memory |
 
-These are **safeguards**, not a claim of measured optimality for every RTX 3050 Ti 4 GB host. Override via environment (`SELENE_PROFILE`, `SELENE_NUM_CTX`, …) or session `/set` commands after reading `python main.py --doctor`.
+These are **safeguards**, not a claim of measured optimality for every host. Override via environment (`SELENE_RUNTIME_PROFILE`, `SELENE_NUM_CTX`, …) or session `/set` commands after reading `python main.py --doctor`.
 
 ### Ollama Environment Variables
 
@@ -730,63 +753,68 @@ Exact VRAM use depends on model weights, quantization, and concurrent workloads.
 
 ```
 AI-CLI-Agent/
-├── main.py                    # Entry point — model init, --cli flag, web launch
+├── main.py                    # Entry — doctor, profile, managed model, CLI/Web routing
 ├── Modelfile                  # Ollama model definition (system prompt, parameters)
-├── requirements.txt           # Python dependencies
+├── package.json               # Electron packaging; version drives artifact names
+├── selene-backend.spec        # PyInstaller backend bundle
+├── requirements.txt           # Runtime Python deps (dbus-python Linux-only marker)
+├── requirements-dev.txt       # Dev extras (PyInstaller, …)
+├── AGENTS.md                  # Contributor / coding-agent architecture rules
+├── docs/
+│   └── platform-support.md    # Tool + platform capability matrix
 │
 ├── agent/
-│   ├── __init__.py
-│   ├── core.py                # Terminal chat loop, tool dispatch, streaming, session mgmt
-│   ├── tool_runner.py         # Shared ordered/parallel tool-call execution
-│   ├── terminal.py            # ANSI helpers, spinner, LaTeX renderer, Markdown
-│   ├── web.py                 # Threaded HTTP server, SSE generator, session/API routes
-│   └── static/
-│       ├── index.html         # Web UI layout — sidebar, chat panel, modals
-│       ├── style.css          # Design system — dark mode, glassmorphism, animations
-│       └── app.js             # Browser controller — SSE stream, tool cards, Markdown render
+│   ├── core.py                # Terminal chat loop, slash commands, sessions
+│   ├── web.py                 # Threaded HTTP server, SSE generator, API routes
+│   ├── web_runtime.py         # Client/session generation ownership leases
+│   ├── tool_runner.py         # Metadata-aware ordered/parallel tool execution
+│   ├── ollama_runtime.py      # Shared Ollama coordinator + API client
+│   ├── model_lifecycle.py     # Staged alias build → inspect → publish
+│   ├── runtime_config.py      # Hardware profiles and SELENE_* resolution
+│   ├── platform_runtime.py    # Paths, process trees, desktop open helpers
+│   ├── persistence.py         # Atomic JSON write helpers
+│   ├── cancellation.py        # Cooperative cancellation tokens
+│   ├── diagnostics.py         # python main.py --doctor
+│   ├── terminal.py            # ANSI helpers, spinner, LaTeX, Markdown
+│   └── static/                # Web UI (index.html, style.css, app.js)
 │
 ├── tools/
-│   ├── __init__.py
-│   ├── registry.py            # Tool JSON schemas + dispatch table
-│   ├── search.py              # DuckDuckGo web search with optional top-result scraping
-│   ├── web_scraper.py         # Bounded public web page text extraction
-│   ├── browser.py             # System browser control
-│   ├── code.py                # Source code viewer with line numbers
-│   ├── codebase_indexer.py    # Persistent repository indexing and semantic code retrieval
-│   ├── document.py            # PDF/DOCX extraction with chunking
-│   ├── file.py                # Text file read/write with search; auto-vaults created files
-│   ├── spotify.py             # Spotify cross-platform desktop control
-│   ├── vision_describer.py    # Multimodal image description via moondream
-│   ├── obsi_vault_writer.py   # Obsidian-optimised structured note creation
-│   ├── vault_indexer.py       # Document chunking, ChromaDB indexing, alias registry
-│   ├── vault_search.py        # Vector similarity search with alias resolution
-│   ├── vault_embeddings.py    # Ollama embedding API helpers
-│   ├── knowledge_graph_builder.py # Typed semantic graph inference
-│   ├── run_simulation.py      # Safe dynamic and Monte Carlo models
-│   ├── api_orchestrator.py    # Resilient authenticated HTTP lifecycle
-│   ├── context_memory_optimizer.py # Long-context compaction
-│   ├── reasoning_chain_debugger.py # Explicit evidence-graph audit
-│   ├── automated_routine_executor.py # Persistent preview-first macros
-│   └── google_workspace.py     # Encrypted Google Calendar/Tasks OAuth integration
+│   ├── registry.py            # TOOL_SCHEMAS, TOOL_DISPATCH, TOOL_METADATA
+│   ├── search.py · web_scraper.py · browser.py · code.py · codebase_indexer.py
+│   ├── document.py · file.py · spreadsheet.py · spotify.py · vision_describer.py
+│   ├── vault_*.py · obsi_vault_writer.py · app_launcher.py · terminal_launcher.py
+│   ├── current_datetime.py · knowledge_graph_builder.py · run_simulation.py
+│   ├── api_orchestrator.py · context_memory_optimizer.py · reasoning_chain_debugger.py
+│   ├── automated_routine_executor.py · google_workspace.py
+│   └── …
 │
-├── .agents/                   # Agent configuration
-├── sessions/                  # Saved session JSON files
+├── electron/
+│   ├── main.js                # Spawn backend, port wait, single-instance, shutdown
+│   ├── preload.js
+│   └── build_desktop.py       # electron-builder via Electron's Node; --publish never
+│
+├── tests/                     # unittest suite (no live GPU/OAuth/Spotify)
+├── .github/workflows/ci.yml   # Linux + Windows CI matrices
 └── .gitignore
 ```
 
-Runtime data is kept outside the checkout in `~/.selene-agent/` by default. This includes conversations, `routines.json`, `system_prompt_cache.txt`, `google_oauth.enc`, `vaults/`, `.chroma/`, and `codebase_indexes.json`. Override the parent directory with `SELENE_DATA_DIR=/your/path`.
+Runtime data is kept outside the checkout (see [Runtime data paths](#runtime-data-paths)). Default contents include conversations, `routines.json`, `system_prompt_cache.txt`, `google_oauth.enc`, `vaults/`, `.chroma/`, and `codebase_indexes.json`.
 
 ### Key Design Decisions
 
-- **Web UI is the default** — `python main.py` starts the browser interface; the terminal CLI is opt-in via `--cli`. This keeps the richer interface front-and-centre without breaking existing workflows.
-- **SSE over WebSockets** — Server-Sent Events are used for token streaming because they need only a standard HTTP connection, require no upgrade handshake, and reconnect automatically on drop.
-- **`ThreadingMixIn` HTTP server** — `web.py` uses Python's `socketserver.ThreadingMixIn` so each request (including long-lived SSE connections) runs in its own daemon thread, preventing a slow generation from blocking the session API.
-- **Shared `GLOBAL_STATE`** — a single in-process dict holds history and session parameters, making state trivially accessible across request handlers without an external store.
-- **Tool schemas are compacted at runtime** to minimise prompt token overhead — detailed descriptions stay in the system prompt/docs, while the schemas sent with each LLM call keep only the callable structure needed for tool calling.
-- **Streaming is throttled** at ~12 FPS in the terminal to avoid CPU-bound Markdown re-rendering from bottlenecking the token pipeline. The Web UI receives every token immediately via SSE.
-- **All regex patterns are pre-compiled** at module load time in `terminal.py`, not on each rendering pass.
-- **History is trimmed** using a conservative serialized-message token heuristic (roughly 1 token ≈ 4 characters plus role/tool overhead), with response headroom reserved before every Ollama request.
-- **Vault embeddings** use the local `embeddinggemma` model via Ollama's HTTP API, falling back to the Python client if the HTTP endpoint changes.
+- **Web UI is the default** — `python main.py` starts the browser interface; the terminal CLI is opt-in via `--cli`.
+- **Shared Ollama coordinator** — chat, titles, summaries, embeddings, and vision share one queue/slot policy so low-VRAM hosts stay stable.
+- **Managed model lifecycle** — rebuilds stage under a temporary alias, inspect, then publish to `selene`; the live alias is never pre-deleted.
+- **SSE over WebSockets** — token streaming uses standard HTTP with automatic reconnect behaviour and no upgrade handshake.
+- **`ThreadingMixIn` HTTP server** — long-lived SSE connections do not block session APIs.
+- **Generation ownership** — `web_runtime` isolates unsaved tabs and serializes generations on a saved session name; terminal SSE state is exclusive.
+- **`GLOBAL_STATE` + client stores** — in-process session/history defaults remain for the primary view, while per-client unsaved state and generation leases prevent cross-tab races.
+- **Tool schemas are compacted at runtime** — detailed prose stays in the system prompt/docs; model-facing schemas keep callable structure only.
+- **All normal tool execution goes through `tool_runner`** — CLI, web, slash commands, and routines share timeouts, cancellation, and side-effect batching rules.
+- **Platform adapters own OS specifics** — paths, process groups/`taskkill /T`, terminals, browsers, and app launch live in `platform_runtime` rather than ad-hoc `os.system` calls.
+- **Streaming is throttled** at ~12 FPS in the terminal; the Web UI receives every token immediately via SSE.
+- **History is trimmed** with a conservative serialized-message heuristic and preflight output reservation before every Ollama request.
+- **Vault embeddings** use local `embeddinggemma` via Ollama's HTTP API, with a Python-client fallback if the endpoint changes.
 
 ---
 

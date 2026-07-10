@@ -1,6 +1,6 @@
 {
   "name": "selene-agent",
-  "version": "2.2.0",
+  "version": "1.0.0",
   "description": "Selene AI Agent",
   "author": "Rahul Biju <rahulbiju@example.com>",
   "main": "electron/main.js",

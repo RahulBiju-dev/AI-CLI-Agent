@@ -462,5 +462,96 @@ class TestBackendShutdownOwnership(unittest.TestCase):
         thread.start.assert_called_once_with()
 
 
+class TestConversationTitleRename(unittest.TestCase):
+    def test_temporary_session_patterns_include_uuid_suffix(self):
+        from agent import web
+
+        self.assertTrue(web.is_temporary_session_filename("session_20260711_012208.json"))
+        self.assertTrue(web.is_temporary_session_filename("session_20260711_012208_123456.json"))
+        self.assertTrue(
+            web.is_temporary_session_filename("session_20260711_012208_123456_a1b2c3d4.json")
+        )
+        self.assertFalse(web.is_temporary_session_filename("Python_Tips_20260711_012208.json"))
+        self.assertFalse(web.is_temporary_session_filename("Active Session"))
+
+    def test_title_temporary_session_renames_uuid_temp_files(self):
+        from agent import web
+
+        with tempfile.TemporaryDirectory() as directory:
+            temp_name = "session_20260711_012208_123456_a1b2c3d4.json"
+            old_path = Path(directory) / temp_name
+            old_path.write_text("{}", encoding="utf-8")
+            history = [
+                {"role": "user", "content": "How do I fix a Python import cycle?"},
+                {"role": "assistant", "content": "Break the cycle with a local import."},
+            ]
+            with (
+                patch.object(web, "_SESSIONS_DIR", directory),
+                patch.object(web, "generate_conversation_title", return_value="Python Imports"),
+            ):
+                renamed = web.title_temporary_session(
+                    history,
+                    temp_name,
+                    generation_id=None,
+                    client_id="client-one",
+                )
+
+            self.assertEqual(renamed, "Python_Imports_20260711_012208_123456.json")
+            self.assertFalse(old_path.exists())
+            self.assertTrue((Path(directory) / renamed).is_file())
+
+
+class TestRuntimeSystemPromptPayload(unittest.TestCase):
+    def test_runtime_payload_exposes_default_and_active_system_prompt(self):
+        from agent import web
+
+        session = {
+            "runtime_profile": "low-vram",
+            "options": {},
+            "system": "",
+            "history": True,
+            "think": True,
+            "verbose": False,
+            "wordwrap": True,
+            "format": "",
+        }
+        with (
+            patch.object(web, "load_default_system_prompt", return_value="DEFAULT SYSTEM POLICY"),
+            patch.object(web, "get_runtime_config") as runtime_config,
+            patch.object(web, "get_runtime_paths") as runtime_paths,
+        ):
+            runtime_config.return_value = SimpleNamespace(
+                requested_profile=SimpleNamespace(value="auto"),
+                profile=SimpleNamespace(value="low-vram"),
+                selection_reason="test",
+                warnings=[],
+                ollama_options=lambda: {"num_ctx": 4096},
+            )
+            runtime_paths.return_value = SimpleNamespace(report=lambda: {"data_dir": "/tmp"})
+            payload = web._runtime_payload(session)
+
+        self.assertEqual(payload["default_system_prompt"], "DEFAULT SYSTEM POLICY")
+        self.assertEqual(payload["active_system_prompt"], "DEFAULT SYSTEM POLICY")
+
+        session["system"] = "  custom override  "
+        with (
+            patch.object(web, "load_default_system_prompt", return_value="DEFAULT SYSTEM POLICY"),
+            patch.object(web, "get_runtime_config") as runtime_config,
+            patch.object(web, "get_runtime_paths") as runtime_paths,
+        ):
+            runtime_config.return_value = SimpleNamespace(
+                requested_profile=SimpleNamespace(value="auto"),
+                profile=SimpleNamespace(value="low-vram"),
+                selection_reason="test",
+                warnings=[],
+                ollama_options=lambda: {"num_ctx": 4096},
+            )
+            runtime_paths.return_value = SimpleNamespace(report=lambda: {"data_dir": "/tmp"})
+            overridden = web._runtime_payload(session)
+
+        self.assertEqual(overridden["default_system_prompt"], "DEFAULT SYSTEM POLICY")
+        self.assertEqual(overridden["active_system_prompt"], "custom override")
+
+
 if __name__ == "__main__":
     unittest.main()

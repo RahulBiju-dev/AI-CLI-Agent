@@ -317,6 +317,8 @@ function persistSettings() {
       const data = await response.json();
       state.runtime = data.runtime || state.runtime;
       reportRuntimeWarnings(state.runtime);
+      // Refresh meter after server returns active/default system prompt text.
+      updateContextMeter();
     } catch {
       toast("Settings could not be saved.");
     }
@@ -1265,7 +1267,7 @@ function closeSlashMenu() {
 function updateContextMeter(forcedUsed = null, forcedBudget = null) {
   const budget = forcedBudget || contextBudget();
   const used = forcedUsed ?? estimatedContextTokens();
-  const pct = Math.min(100, Math.round((used / budget) * 100));
+  const pct = budget > 0 ? Math.min(100, Math.round((used / budget) * 100)) : 0;
 
   if (el.contextLabel) el.contextLabel.textContent = `${used} / ${budget}`;
   if (el.contextFill) el.contextFill.style.width = `${pct}%`;
@@ -1275,22 +1277,57 @@ function updateContextMeter(forcedUsed = null, forcedBudget = null) {
   }
 }
 
+function activeSystemPromptText() {
+  // Match backend: session system override, else Modelfile/default system prompt.
+  const override = String(state.settings.system || "").trim();
+  if (override) return override;
+  const fromHistory = state.history.find((message) => message.role === "system")?.content;
+  if (fromHistory) return String(fromHistory);
+  return String(
+    state.runtime?.active_system_prompt
+      || state.runtime?.default_system_prompt
+      || ""
+  );
+}
+
 function estimatedContextTokens() {
+  // Count system once (filtered out of history below) so the meter reflects the
+  // same baseline the model always receives, even on an empty new chat.
+  const systemPrompt = activeSystemPromptText();
+  let total = 0;
+  if (systemPrompt) {
+    // Role/message framing overhead mirrors agent.core._estimate_message_tokens.
+    total += estimateTokens(JSON.stringify({ role: "system", content: systemPrompt })) + 4;
+  }
+
   const historyText = state.history
     .filter((message) => message.role !== "system")
     .map((message) => [
-    message.role || "",
-    message.content || "",
-    message.thinking || "",
-    JSON.stringify(message.tool_calls || "")
-  ].join("\n")).join("\n");
-  const systemPrompt = state.settings.system ||
-    (state.history.find((message) => message.role === "system")?.content || "");
-  return estimateTokens(`${systemPrompt}\n${historyText}\n${el.input?.value || ""}`);
+      message.role || "",
+      message.content || "",
+      message.thinking || "",
+      JSON.stringify(message.tool_calls || "")
+    ].join("\n"))
+    .join("\n");
+  total += estimateTokens(historyText);
+
+  const draft = el.input?.value || "";
+  if (draft) total += estimateTokens(draft);
+
+  return total;
 }
 
 function estimateTokens(text) {
-  return Math.max(0, Math.ceil(String(text || "").length / 4));
+  // Align with agent.core._estimate_tokens: ~4 ASCII chars/token, ~1 non-ASCII.
+  const value = String(text || "");
+  if (!value) return 0;
+  let ascii = 0;
+  let nonAscii = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    if (value.charCodeAt(index) < 128) ascii += 1;
+    else nonAscii += 1;
+  }
+  return Math.floor(ascii / 4) + nonAscii + 1;
 }
 
 function contextBudget() {
@@ -1591,11 +1628,18 @@ function escapeHTML(value) {
 }
 
 function cleanSessionName(name) {
-  const base = String(name || "New conversation").replace(/\.json$/, "");
-  return base
-    .replace(/_\d{8}_\d{6}(?:_\d+)?$/, "")
+  // Files are either temporary (session_<timestamp>[_uuid].json) or agent-titled
+  // (Title_Words_<timestamp>.json). Strip stamp/uuid so the sidebar shows the title.
+  let base = String(name || "New conversation").replace(/\.json$/i, "");
+  base = base
+    .replace(/_[0-9a-f]{8}$/i, "")
+    // Drop stamp and any numeric collision suffix (…_YYYYMMDD_HHMMSS[_us][_n]).
+    .replace(/_\d{8}_\d{6}(?:_\d+)*$/u, "")
+    .replace(/^session$/i, "New conversation")
     .replace(/_/g, " ")
-    .replace(/^Active Session$/, "New conversation");
+    .replace(/^Active Session$/i, "New conversation")
+    .trim();
+  return base || "New conversation";
 }
 
 function titleForSession(name) {
