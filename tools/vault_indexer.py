@@ -11,6 +11,10 @@ from typing import Optional
 
 import chromadb
 
+from agent.cancellation import CancellationToken, OperationCancelled
+from agent.persistence import PersistenceError, atomic_write_json, read_json_preserved
+from agent.platform_runtime import get_runtime_paths
+
 from tools.document import extract_document_text
 from tools.vault_embeddings import DEFAULT_EMBED_MODEL, embed_texts
 
@@ -25,7 +29,7 @@ SUPPORTED_INDEX_EXTENSIONS = {
 DEFAULT_CHUNK_SIZE = 1800
 DEFAULT_CHUNK_OVERLAP = 250
 DEFAULT_BATCH_SIZE = 16
-DATA_DIR = os.path.abspath(os.path.expanduser(os.environ.get("SELENE_DATA_DIR", "~/.selene-agent")))
+DATA_DIR = str(get_runtime_paths().data_dir)
 CHROMA_DIR = os.path.join(DATA_DIR, ".chroma")
 VAULTS_DIR = os.path.join(DATA_DIR, "vaults")
 _ALIAS_LOCK = threading.RLock()
@@ -144,7 +148,10 @@ def _strip_frontmatter(text: str) -> str:
     return text[match.end():].lstrip() if match else text
 
 
-def extract_pdf_with_vision(path: str) -> tuple[str, dict]:
+def extract_pdf_with_vision(
+    path: str,
+    cancellation_token: CancellationToken | None = None,
+) -> tuple[str, dict]:
     """Extract PDF text and page images without retaining image batches in RAM."""
     try:
         import pypdf
@@ -157,6 +164,8 @@ def extract_pdf_with_vision(path: str) -> tuple[str, dict]:
             reader = pypdf.PdfReader(f)
             total_pages = len(reader.pages)
             for page_num, page in enumerate(reader.pages, start=1):
+                if cancellation_token:
+                    cancellation_token.raise_if_cancelled()
                 try:
                     page_text = page.extract_text() or ""
                     if page_text.strip():
@@ -168,6 +177,8 @@ def extract_pdf_with_vision(path: str) -> tuple[str, dict]:
         # write directly to a temporary directory instead of creating PIL images.
         with tempfile.TemporaryDirectory(prefix="selene-pdf-") as image_dir:
             for page_num in range(1, total_pages + 1):
+                if cancellation_token:
+                    cancellation_token.raise_if_cancelled()
                 try:
                     image_paths = convert_from_path(
                         path, first_page=page_num, last_page=page_num, dpi=140,
@@ -176,24 +187,39 @@ def extract_pdf_with_vision(path: str) -> tuple[str, dict]:
                     )
                     if not image_paths:
                         continue
-                    description = describe_image(str(image_paths[0]))
+                    description = describe_image(
+                        str(image_paths[0]),
+                        cancellation_token=cancellation_token,
+                    )
                     if description and not description.startswith("Error"):
                         text_stream.append(f"--- Page {page_num} Visual Description ---\n{description}\n")
                     elif description:
                         warnings.append(f"Page {page_num} vision skipped: {description}")
+                except OperationCancelled:
+                    raise
                 except Exception as exc:
                     warnings.append(f"Page {page_num} visual extraction failed: {exc}")
 
         text = "\n".join(text_stream)
         return text, {"document_type": "pdf", "page_count": total_pages, "char_count": len(text), "warnings": warnings[:20], "warning_count": len(warnings)}
+    except OperationCancelled:
+        raise
     except Exception as exc:
         raise RuntimeError(f"Error reading PDF: {exc}") from exc
 
 
-def _read_text_for_index(path: str, include_vision: bool = True) -> tuple[str, dict]:
+def _read_text_for_index(
+    path: str,
+    include_vision: bool = True,
+    cancellation_token: CancellationToken | None = None,
+) -> tuple[str, dict]:
     ext = os.path.splitext(path)[1].lower()
     if ext == ".pdf":
-        return extract_pdf_with_vision(path) if include_vision else extract_document_text(path)
+        return (
+            extract_pdf_with_vision(path, cancellation_token)
+            if include_vision
+            else extract_document_text(path)
+        )
             
     if ext in {".pdf", ".docx"}:
         return extract_document_text(path)
@@ -223,6 +249,7 @@ def index_vault(
     file_path: Optional[str] = None,
     collection: Optional[str] = None,
     include_vision: bool = True,
+    cancellation_token: CancellationToken | None = None,
 ):
     """
     Index either a vault folder or a single file into a ChromaDB collection.
@@ -287,6 +314,8 @@ def index_vault(
     skipped_files: list[dict] = []
 
     for path in candidates:
+        if cancellation_token:
+            cancellation_token.raise_if_cancelled()
         if not os.path.exists(path):
             skipped_files.append({"file": path, "error": "file not found"})
             continue
@@ -299,10 +328,16 @@ def index_vault(
             continue
 
         try:
-            text, info = _read_text_for_index(path, include_vision=bool(include_vision))
+            text, info = _read_text_for_index(
+                path,
+                include_vision=bool(include_vision),
+                cancellation_token=cancellation_token,
+            )
         except UnicodeDecodeError:
             skipped_files.append({"file": path, "error": "not UTF-8 text; use PDF/DOCX or plain text"})
             continue
+        except OperationCancelled:
+            raise
         except Exception as exc:
             skipped_files.append({"file": path, "error": str(exc)})
             continue
@@ -336,13 +371,21 @@ def index_vault(
         prepared_batches = []
         try:
             for start in range(0, len(file_docs), batch_size):
+                if cancellation_token:
+                    cancellation_token.raise_if_cancelled()
                 batch_docs = file_docs[start:start + batch_size]
                 prepared_batches.append((
                     file_ids[start:start + batch_size],
                     batch_docs,
                     file_metadatas[start:start + batch_size],
-                    embed_texts(batch_docs, model=model),
+                    embed_texts(
+                        batch_docs,
+                        model=model,
+                        cancellation_token=cancellation_token,
+                    ),
                 ))
+        except OperationCancelled:
+            raise
         except Exception as exc:
             skipped_files.append({"file": path, "error": f"embedding failed; previous index preserved: {exc}"})
             continue
@@ -355,10 +398,14 @@ def index_vault(
 
         try:
             for batch_ids, batch_docs, batch_metadata, batch_embeddings in prepared_batches:
+                if cancellation_token:
+                    cancellation_token.raise_if_cancelled()
                 collection_obj.upsert(ids=batch_ids, documents=batch_docs, embeddings=batch_embeddings, metadatas=batch_metadata)
             stale_ids = previous_ids - set(file_ids)
             if stale_ids:
                 collection_obj.delete(ids=sorted(stale_ids))
+        except OperationCancelled:
+            raise
         except Exception as exc:
             skipped_files.append({"file": path, "error": f"index write failed: {exc}"})
             continue
@@ -505,30 +552,16 @@ _ALIAS_FILE = os.path.join(VAULTS_DIR, ".vault_aliases.json")
 def _load_aliases() -> dict:
     """Load the alias registry from disk."""
     with _ALIAS_LOCK:
-        if os.path.isfile(_ALIAS_FILE):
-            try:
-                with open(_ALIAS_FILE, "r", encoding="utf-8") as f:
-                    value = json.load(f)
-                return value if isinstance(value, dict) else {}
-            except (json.JSONDecodeError, OSError):
-                pass
-    return {}
+        try:
+            return read_json_preserved(_ALIAS_FILE, expected_type=dict)
+        except FileNotFoundError:
+            return {}
 
 
 def _save_aliases(aliases: dict) -> None:
     """Persist the alias registry to disk."""
     with _ALIAS_LOCK:
-        os.makedirs(VAULTS_DIR, exist_ok=True)
-        handle, temporary = tempfile.mkstemp(prefix="aliases-", suffix=".json", dir=VAULTS_DIR)
-        try:
-            with os.fdopen(handle, "w", encoding="utf-8") as stream:
-                json.dump(aliases, stream, indent=2, ensure_ascii=False)
-                stream.flush()
-                os.fsync(stream.fileno())
-            os.replace(temporary, _ALIAS_FILE)
-        finally:
-            if os.path.exists(temporary):
-                os.unlink(temporary)
+        atomic_write_json(_ALIAS_FILE, aliases)
 
 
 def register_vault_alias(alias: str, collection_name: str, file_path: str | None = None) -> None:
@@ -575,7 +608,10 @@ def resolve_vault_alias(name: str) -> str:
 
 def list_vault_aliases() -> str:
     """Return a JSON listing of all registered vault aliases."""
-    aliases = _load_aliases()
+    try:
+        aliases = _load_aliases()
+    except PersistenceError as exc:
+        return _json({"error": str(exc), "alias_file": _ALIAS_FILE, "preserved": True})
     entries = []
     for _key, entry in sorted(aliases.items()):
         entries.append({
@@ -598,12 +634,22 @@ def rename_vault(old_name: str, new_name: str) -> str:
 
     Returns a JSON string with the result.
     """
+    clean_new_name = str(new_name or "").strip()
+    if not clean_new_name:
+        return _json({"error": "new_name is required."})
     old_collection = sanitize_collection_name(old_name)
-    new_collection = sanitize_collection_name(new_name)
+    new_collection = sanitize_collection_name(clean_new_name)
 
     if old_collection == new_collection:
         return _json({"error": "Old and new names resolve to the same collection name.",
                        "old": old_collection, "new": new_collection})
+
+    # Read critical metadata before any collection mutation. If the file is
+    # malformed, preserve both it and the original Chroma collection.
+    try:
+        aliases = _load_aliases()
+    except PersistenceError as exc:
+        return _json({"error": str(exc), "alias_file": _ALIAS_FILE, "preserved": True})
 
     try:
         client = get_chroma_client()
@@ -646,28 +692,55 @@ def rename_vault(old_name: str, new_name: str) -> str:
             pass
         return _json({"error": f"Rename copy failed; original collection was preserved: {exc}"})
 
-    client.delete_collection(name=old_collection)
+    # Commit alias metadata before deleting the original collection. A full or
+    # locked disk must never leave aliases pointing at a collection we already
+    # destroyed. Reload under the alias lock so unrelated concurrent aliases are
+    # merged instead of overwritten by the earlier preflight snapshot.
+    try:
+        with _ALIAS_LOCK:
+            aliases = _load_aliases()
+            updated_aliases = []
+            for key, entry in aliases.items():
+                if entry.get("collection") == old_collection:
+                    entry["collection"] = new_collection
+                    updated_aliases.append(entry.get("alias", key))
+            aliases[clean_new_name.casefold()] = {
+                "alias": clean_new_name,
+                "collection": new_collection,
+                "file_path": None,
+            }
+            _save_aliases(aliases)
+    except (OSError, PersistenceError, ValueError) as exc:
+        try:
+            client.delete_collection(name=new_collection)
+        except Exception:
+            pass
+        return _json({
+            "error": f"Rename metadata update failed; original collection was preserved: {exc}",
+            "alias_file": _ALIAS_FILE,
+            "preserved": True,
+        })
 
-    # Update aliases that referenced the old collection
-    aliases = _load_aliases()
-    updated_aliases = []
-    for key, entry in aliases.items():
-        if entry.get("collection") == old_collection:
-            entry["collection"] = new_collection
-            updated_aliases.append(entry.get("alias", key))
-    if updated_aliases:
-        _save_aliases(aliases)
+    try:
+        client.delete_collection(name=old_collection)
+        original_retained = False
+    except Exception as exc:
+        # Both complete collections are safer than deleting either after the
+        # copy and metadata commit succeeded.
+        original_retained = True
+        deletion_warning = str(exc)
 
-    # Register the new name as an alias too
-    register_vault_alias(new_name, new_collection)
-
-    return _json({
+    result = {
         "renamed": True,
         "old_collection": old_collection,
         "new_collection": new_collection,
         "chunks_moved": count,
         "updated_aliases": updated_aliases,
-    })
+        "original_retained": original_retained,
+    }
+    if original_retained:
+        result["warning"] = f"The new collection is active, but the original could not be removed: {deletion_warning}"
+    return _json(result)
 
 
 if __name__ == "__main__":

@@ -14,8 +14,9 @@ import subprocess
 import time
 import shutil
 import re
-import sys
 import urllib.parse
+
+from agent.platform_runtime import open_native_target, platform_family, spawn_detached
 
 
 # ── Spotify launch helpers ────────────────────────────────────────────
@@ -51,16 +52,29 @@ def _find_spotify_command() -> list[str]:
     return []
 
 
+def _spotify_backend(platform_name: str | None = None) -> str:
+    """Return the truthful native capability used on the current platform."""
+    family = platform_family(platform_name)
+    if family == "linux":
+        return "linux-mpris-dbus"
+    if family == "windows":
+        return "windows-uri-handler"
+    if family == "macos":
+        return "macos-automation"
+    return "unsupported"
+
+
 def _is_spotify_running() -> bool:
     """Check if Spotify is currently running."""
     try:
-        if sys.platform == "win32":
+        family = platform_family()
+        if family == "windows":
             result = subprocess.run(
                 ["tasklist", "/FI", "IMAGENAME eq Spotify.exe", "/NH"],
                 capture_output=True, text=True, timeout=5,
             )
             return "Spotify.exe" in result.stdout
-        elif sys.platform == "darwin":
+        elif family == "macos":
             result = subprocess.run(
                 ["pgrep", "-x", "Spotify"],
                 capture_output=True, text=True, timeout=5,
@@ -82,29 +96,23 @@ def _launch_spotify() -> bool:
         return True
 
     try:
-        if sys.platform == "win32":
-            subprocess.Popen(
-                ["cmd", "/c", "start", "spotify:"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-        elif sys.platform == "darwin":
-            subprocess.Popen(
-                ["open", "-a", "Spotify"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
+        family = platform_family()
+        if family == "windows":
+            # ShellExecute handles registered URI schemes without cmd.exe or
+            # an interpolated command string. Acceptance is not proof of load.
+            return open_native_target(
+                "spotify:",
+                platform_name="windows",
+                allowed_uri_schemes={"spotify"},
+            ).ok
+        elif family == "macos":
+            spawn_detached(["open", "-a", "Spotify"], platform_name="macos")
         else:
             cmd = _find_spotify_command()
             if not cmd:
                 return False
 
-            subprocess.Popen(
-                cmd,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                start_new_session=True,
-            )
+            spawn_detached(cmd, platform_name="linux")
 
         # Poll briefly instead of imposing a fixed startup sleep.
         deadline = time.monotonic() + 12
@@ -164,8 +172,11 @@ def _get_spotify_properties():
 def _is_spotify_uri(text: str) -> bool:
     """Check if the text is a Spotify URI or URL."""
     return bool(
-        re.match(r"^spotify:(track|album|playlist|artist|show|episode):", text)
-        or re.match(r"^https?://open\.spotify\.com/", text)
+        re.fullmatch(r"spotify:(track|album|playlist|artist|show|episode):[a-zA-Z0-9]+", text)
+        or re.fullmatch(
+            r"https?://open\.spotify\.com/(track|album|playlist|artist|show|episode)/[a-zA-Z0-9]+(?:\?[^\s]*)?",
+            text,
+        )
     )
 
 
@@ -176,9 +187,9 @@ def _url_to_uri(url: str) -> str:
         https://open.spotify.com/track/4uLU6hMCjMI75M1A2tKUQC
         → spotify:track:4uLU6hMCjMI75M1A2tKUQC
     """
-    match = re.match(
+    match = re.fullmatch(
         r"https?://open\.spotify\.com/(track|album|playlist|artist|show|episode)/([a-zA-Z0-9]+)",
-        url,
+        url.split("?", 1)[0],
     )
     if match:
         return f"spotify:{match.group(1)}:{match.group(2)}"
@@ -191,7 +202,10 @@ def _search_spotify_uri(query: str) -> str | None:
     Queries ddgs directly to access the href field from results,
     which contains the actual Spotify URL.
     """
-    from ddgs import DDGS
+    try:
+        from ddgs import DDGS
+    except ImportError:
+        return None
 
     search_query = f"site:open.spotify.com/track {query}"
     try:
@@ -238,13 +252,10 @@ def spotify_play(query: str) -> str:
             return json.dumps({"error": "A Spotify URI, URL, or search query is required."})
         if len(query) > 500:
             return json.dumps({"error": "Spotify query exceeds the 500-character limit."})
-        # Step 1: Ensure Spotify is running
-        if not _launch_spotify():
-            return json.dumps({
-                "error": "Could not launch Spotify. Is it installed?"
-            })
-
-        # Step 2: Resolve the URI
+        if any(ord(character) < 32 for character in query):
+            return json.dumps({"error": "Spotify query contains invalid control characters."})
+        # Resolve the URI before launching so Windows performs one native URI
+        # request instead of opening Spotify twice.
         if _is_spotify_uri(query):
             uri = _url_to_uri(query) if query.startswith("http") else query
         else:
@@ -253,36 +264,79 @@ def spotify_play(query: str) -> str:
                 # Fallback: open Spotify's own search
                 uri = f"spotify:search:{urllib.parse.quote(query, safe='')}"
 
-        # Step 3: Play via OS-specific mechanism
-        if sys.platform == "win32":
-            completed = subprocess.run(["cmd", "/c", "start", "", uri], capture_output=True, timeout=10)
-            if completed.returncode != 0:
-                return json.dumps({"error": "Spotify rejected the playback request on Windows."})
+        backend = _spotify_backend()
+        if backend == "windows-uri-handler":
+            launch = open_native_target(
+                uri,
+                platform_name="windows",
+                allowed_uri_schemes={"spotify"},
+            )
+            if not launch.ok:
+                return json.dumps({
+                    **launch.as_dict(),
+                    "supported": False,
+                    "capability": "uri-launch-only",
+                    "error": launch.error or "No Windows application accepted the Spotify URI.",
+                })
             return json.dumps({
                 "success": True,
-                "message": f"Opened Spotify with URI: {uri}",
+                "backend": backend,
+                "supported": True,
+                "capability": "uri-launch-only",
+                "launch_requested": True,
+                "playback_confirmed": False,
+                "message": f"Windows accepted a Spotify URI launch request for {uri}; playback was not verified.",
                 "uri": uri,
             })
-        elif sys.platform == "darwin":
+        if backend == "macos-automation":
             script = 'on run argv\ntell application "Spotify" to play track (item 1 of argv)\nend run'
             completed = subprocess.run(["osascript", "-e", script, "--", uri], capture_output=True, timeout=10)
             if completed.returncode != 0:
                 return json.dumps({"error": "Spotify rejected the playback request on macOS."})
             return json.dumps({
                 "success": True,
+                "backend": backend,
                 "message": f"Opened Spotify with URI: {uri}",
                 "uri": uri,
             })
-        else:
-            player = _get_spotify_dbus()
+        if backend == "linux-mpris-dbus":
+            if not _launch_spotify():
+                return json.dumps({
+                    "error": "Could not launch Spotify through a native package, Flatpak, or Snap installation.",
+                    "backend": backend,
+                    "supported": False,
+                })
+            try:
+                player = _get_spotify_dbus()
+            except (ImportError, ModuleNotFoundError):
+                return json.dumps({
+                    "error": "Spotify playback control requires dbus-python on Linux.",
+                    "backend": backend,
+                    "supported": False,
+                    "missing_dependency": "dbus-python",
+                })
+            except Exception as exc:
+                return json.dumps({
+                    "error": f"The Fedora/Linux MPRIS session bus is unavailable: {exc}",
+                    "backend": backend,
+                    "supported": False,
+                })
             if player:
                 try:
                     player.OpenUri(uri)
-                    time.sleep(1)
+                except Exception as exc:
+                    return json.dumps({
+                        "error": f"Spotify rejected the MPRIS playback request: {exc}",
+                        "backend": backend,
+                        "supported": True,
+                    })
 
-                    # Get current track info for confirmation
+                time.sleep(1)
+                # Metadata confirms playback when available, but its absence
+                # must not turn an accepted OpenUri request into false failure.
+                try:
                     props = _get_spotify_properties()
-                    if props:
+                    if props is not None:
                         metadata = props.Get(
                             "org.mpris.MediaPlayer2.Player", "Metadata"
                         )
@@ -293,24 +347,39 @@ def spotify_play(query: str) -> str:
 
                         return json.dumps({
                             "success": True,
+                            "backend": backend,
+                            "playback_confirmed": True,
                             "message": f"Now playing: {title} by {artist}",
                             "track": title,
                             "artist": artist,
                             "album": album,
                             "uri": uri,
                         })
-
-                    return json.dumps({
-                        "success": True,
-                        "message": f"Opened Spotify with URI: {uri}",
-                        "uri": uri,
-                    })
                 except Exception:
+                    # The playback request was accepted; only confirmation
+                    # metadata failed, so report that distinction truthfully.
                     pass
 
+                return json.dumps({
+                    "success": True,
+                    "backend": backend,
+                    "supported": True,
+                    "playback_confirmed": False,
+                    "message": f"Spotify accepted an MPRIS OpenUri request for {uri}; playback metadata was not available.",
+                    "uri": uri,
+                })
+
             return json.dumps({
-                "error": "Could not connect to Spotify via D-Bus. Is Spotify running?"
+                "error": "Could not connect to Spotify via the Fedora/Linux MPRIS D-Bus backend.",
+                "backend": backend,
+                "supported": False,
             })
+
+        return json.dumps({
+            "error": "Spotify control is not supported on this platform.",
+            "backend": backend,
+            "supported": False,
+        })
 
     except Exception as exc:
         return json.dumps({"error": f"Spotify error: {str(exc)}"})

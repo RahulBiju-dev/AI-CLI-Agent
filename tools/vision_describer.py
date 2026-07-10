@@ -1,11 +1,23 @@
 """Tool for multimodal vision support using Ollama moondream model."""
 
 import os
+import threading
+import time
+
+from agent.cancellation import CancellationToken, OperationCancelled
+from agent.ollama_runtime import OllamaService, OperationKind
+from agent.runtime_config import get_runtime_config
 
 SUPPORTED_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
 MAX_IMAGE_BYTES = 25 * 1024 * 1024
+_RUNTIME_CONFIG = get_runtime_config()
+_VISION_SERVICE = OllamaService(_RUNTIME_CONFIG)
 
-def describe_image(image_path: str, prompt: str = "Please provide a highly detailed description of this technical diagram, flowchart, or architecture slide.") -> str:
+def describe_image(
+    image_path: str,
+    prompt: str = "Please provide a highly detailed description of this technical diagram, flowchart, or architecture slide.",
+    cancellation_token: CancellationToken | None = None,
+) -> str:
     """
     Send an image to the local moondream model and return its description.
 
@@ -33,21 +45,35 @@ def describe_image(image_path: str, prompt: str = "Please provide a highly detai
     prompt = str(prompt or "Describe this image.").strip()[:4000]
     
     try:
-        import ollama
-        response = ollama.chat(
-            model="moondream",
+        thread_id = threading.get_ident()
+        coordinator = _VISION_SERVICE.coordinator
+        owner = (
+            f"tool:{thread_id}"
+            if coordinator.is_owned_by_current_context()
+            else f"vision:{thread_id}:{time.monotonic_ns()}"
+        )
+        response = _VISION_SERVICE.chat(
+            kind=OperationKind.VISION,
+            owner=owner,
+            model=_RUNTIME_CONFIG.vision_model,
+            cancellation_token=cancellation_token,
+            operation_timeout=_RUNTIME_CONFIG.vision_timeout_seconds,
             messages=[
                 {
                     "role": "user",
                     "content": prompt,
                     "images": [image_path]
                 }
-            ]
+            ],
+            stream=False,
+            think=False,
         )
         message = response.get("message") if isinstance(response, dict) else getattr(response, "message", None)
         content = message.get("content") if isinstance(message, dict) else getattr(message, "content", None)
         if not content:
             return "Error describing image: Ollama returned an empty response"
         return str(content)
+    except OperationCancelled:
+        raise
     except Exception as e:
         return f"Error describing image: {str(e)}"

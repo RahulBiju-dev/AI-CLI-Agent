@@ -5,8 +5,10 @@ This module provides a unified tool for opening URLs and performing web searches
 in the user's default web browser.
 """
 import urllib.parse
-import webbrowser
 import re
+import json
+
+from agent.platform_runtime import open_url_native
 
 
 # Web apps do not have an OS-level metadata registry like Linux .desktop files.
@@ -93,14 +95,8 @@ def open_browser(query: str) -> str:
         encoded_query = urllib.parse.quote_plus(query)
         url = f"https://duckduckgo.com/?q={encoded_query}"
         
-    try:
-        # Attempt to open the formulated URL in the default web browser
-        # webbrowser.open returns a boolean indicating success
-        success = webbrowser.open(url)
-        if success:
-            return f"Successfully opened browser with URL: {url}"
-        else:
-            return f"Failed to open browser with URL: {url}"
-    except Exception as e:
-        # Catch and return any unexpected exceptions during the browser launch
-        return f"Error opening browser: {str(e)}"
+    result = open_url_native(url).as_dict()
+    result["url"] = url
+    # A successful native request is deliberately not reported as proof that
+    # the browser loaded the destination.
+    return json.dumps(result, ensure_ascii=False)

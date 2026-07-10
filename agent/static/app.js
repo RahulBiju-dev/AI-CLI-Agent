@@ -1,7 +1,10 @@
 "use strict";
 
 const DEFAULT_SETTINGS = {
-  options: { temperature: 0.7, top_p: 0.9, top_k: 40, num_ctx: 8192 },
+  // Explicit per-session overrides only. Effective values come from the
+  // backend-selected hardware profile.
+  options: {},
+  runtime_profile: "auto",
   verbose: false,
   wordwrap: true,
   system: "",
@@ -10,12 +13,49 @@ const DEFAULT_SETTINGS = {
   think: true
 };
 
+const FALLBACK_MODEL_OPTIONS = {
+  temperature: 0.25,
+  top_p: 0.85,
+  top_k: 40,
+  repeat_penalty: 1.08,
+  num_ctx: 4096,
+  num_predict: 768,
+  num_batch: 128
+};
+
+function createRuntimeId(prefix) {
+  const random = globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  return `${prefix}:${random}`;
+}
+
+function browserClientId() {
+  const key = "selene-client-id";
+  try {
+    const existing = sessionStorage.getItem(key);
+    if (existing) return existing;
+    const created = createRuntimeId("tab");
+    sessionStorage.setItem(key, created);
+    return created;
+  } catch {
+    return createRuntimeId("tab");
+  }
+}
+
+const CLIENT_ID = browserClientId();
+
+function apiHeaders(json = false) {
+  const headers = { "X-Selene-Client-ID": CLIENT_ID };
+  if (json) headers["Content-Type"] = "application/json";
+  return headers;
+}
+
 const SLASH_COMMANDS = [
   { command: "/help", description: "Show available commands" },
   { command: "/clear", description: "Clear conversation history" },
   { command: "/save ", description: "Save current session with an optional name" },
   { command: "/load ", description: "Load a saved session by name or index" },
   { command: "/set parameter ", description: "Set a model parameter, e.g. temperature 0.7" },
+  { command: "/set profile ", description: "Select auto, low-vram, balanced, or manual" },
   { command: "/set system \"\"", description: "Set the system prompt for this session" },
   { command: "/set history", description: "Enable conversation history" },
   { command: "/set nohistory", description: "Disable conversation history" },
@@ -45,6 +85,7 @@ const SLASH_COMMANDS = [
 const state = {
   history: [],
   settings: cloneSettings(DEFAULT_SETTINGS),
+  runtime: { effective_options: { ...FALLBACK_MODEL_OPTIONS } },
   savedSessions: [],
   activeSessionName: "New conversation",
   modelName: "selene",
@@ -52,6 +93,7 @@ const state = {
   followOutput: true,
   controller: null,
   generation: null,
+  clientId: CLIENT_ID,
   stream: {
     assistantStack: null,
     assistantBubble: null,
@@ -72,6 +114,15 @@ const state = {
     scene: null
   }
 };
+let settingsWriteChain = Promise.resolve();
+let lastRuntimeWarning = "";
+
+function reportRuntimeWarnings(runtime) {
+  const warnings = Array.isArray(runtime?.warnings) ? runtime.warnings : [];
+  const signature = warnings.join("\n");
+  if (signature && signature !== lastRuntimeWarning) toast(warnings[0]);
+  lastRuntimeWarning = signature;
+}
 
 const el = {};
 
@@ -190,13 +241,15 @@ function bindEvents() {
 
 async function loadState() {
   try {
-    const response = await fetch("/api/settings");
+    const response = await fetch("/api/settings", { headers: apiHeaders() });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const data = await response.json();
 
     state.history = data.history || [];
     state.savedSessions = data.saved_sessions || [];
     state.settings = mergeSettings(data.settings || {});
+    state.runtime = data.runtime || state.runtime;
+    reportRuntimeWarnings(state.runtime);
     state.activeSessionName = data.active_session_name || "New conversation";
     state.modelName = data.model_name || "selene";
 
@@ -217,10 +270,7 @@ function mergeSettings(settings) {
   return {
     ...DEFAULT_SETTINGS,
     ...settings,
-    options: {
-      ...DEFAULT_SETTINGS.options,
-      ...(settings.options || {})
-    }
+    options: { ...(settings.options || {}) }
   };
 }
 
@@ -233,7 +283,11 @@ function syncSettingsUI() {
   if (el.think) el.think.checked = state.settings.think !== false;
   if (el.system) el.system.value = state.settings.system || "";
 
-  const temp = Number(state.settings.options?.temperature ?? 0.7);
+  const temp = Number(
+    state.settings.options?.temperature
+      ?? state.runtime?.effective_options?.temperature
+      ?? FALLBACK_MODEL_OPTIONS.temperature
+  );
   if (el.temperature) el.temperature.value = String(temp);
   if (el.temperatureValue) el.temperatureValue.textContent = temp.toFixed(2);
 
@@ -250,16 +304,24 @@ function syncSettingsUI() {
   }
 }
 
-async function persistSettings() {
-  try {
-    await fetch("/api/settings", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(state.settings)
-    });
-  } catch {
-    toast("Settings could not be saved.");
-  }
+function persistSettings() {
+  const snapshot = cloneSettings(state.settings);
+  settingsWriteChain = settingsWriteChain.then(async () => {
+    try {
+      const response = await fetch("/api/settings", {
+        method: "POST",
+        headers: apiHeaders(true),
+        body: JSON.stringify(snapshot)
+      });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const data = await response.json();
+      state.runtime = data.runtime || state.runtime;
+      reportRuntimeWarnings(state.runtime);
+    } catch {
+      toast("Settings could not be saved.");
+    }
+  });
+  return settingsWriteChain;
 }
 
 function renderSessions() {
@@ -658,6 +720,7 @@ async function sendMessage() {
   state.controller = new AbortController();
   const generation = {
     controller: state.controller,
+    id: createRuntimeId("generation"),
     sessionName: state.activeSessionName,
     detached: false
   };
@@ -668,8 +731,13 @@ async function sendMessage() {
   try {
     const response = await fetch("/api/chat", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ message: text, session_name: generation.sessionName }),
+      headers: apiHeaders(true),
+      body: JSON.stringify({
+        message: text,
+        session_name: generation.sessionName,
+        generation_id: generation.id,
+        client_id: state.clientId
+      }),
       signal: state.controller.signal
     });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
@@ -890,6 +958,15 @@ function resetComposer({ clear = true } = {}) {
 }
 
 function stopGeneration({ refresh = true } = {}) {
+  const generation = state.generation;
+  if (generation?.id) {
+    void fetch("/api/cancel-generation", {
+      method: "POST",
+      headers: apiHeaders(true),
+      body: JSON.stringify({ generation_id: generation.id, client_id: state.clientId }),
+      keepalive: true
+    }).catch(() => {});
+  }
   state.controller?.abort();
   toast("Generation stopped.");
   finishGeneration(state.generation, { interrupted: true });
@@ -907,7 +984,7 @@ function appendStatus(text) {
 async function clearConversation() {
   if (state.isGenerating) stopGeneration({ refresh: false });
   try {
-    await fetch("/api/clear-session", { method: "POST" });
+    await fetch("/api/clear-session", { method: "POST", headers: apiHeaders() });
     state.history = [];
     state.activeSessionName = "New conversation";
     el.title.textContent = "New conversation";
@@ -926,7 +1003,7 @@ async function newConversation() {
   // detached keeps isGenerating=true and makes the fresh tab act locked.
   if (state.isGenerating || state.generation) stopGeneration({ refresh: false });
   try {
-    const response = await fetch("/api/new-session", { method: "POST" });
+    const response = await fetch("/api/new-session", { method: "POST", headers: apiHeaders() });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const data = await response.json();
     state.history = [];
@@ -955,7 +1032,7 @@ async function deleteSession(name) {
   try {
     const response = await fetch("/api/delete-session", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: apiHeaders(true),
       body: JSON.stringify({ name })
     });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
@@ -987,7 +1064,7 @@ async function deleteSession(name) {
 }
 
 async function refreshSessions() {
-  const response = await fetch("/api/settings");
+  const response = await fetch("/api/settings", { headers: apiHeaders() });
   if (!response.ok) return;
   const data = await response.json();
   state.savedSessions = data.saved_sessions || [];
@@ -1019,7 +1096,7 @@ async function saveSession() {
   try {
     const response = await fetch("/api/save-session", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: apiHeaders(true),
       body: JSON.stringify({ name })
     });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
@@ -1035,7 +1112,7 @@ async function loadSession(name) {
   try {
     const response = await fetch("/api/load-session", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: apiHeaders(true),
       body: JSON.stringify({ name })
     });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
@@ -1217,7 +1294,11 @@ function estimateTokens(text) {
 }
 
 function contextBudget() {
-  return Number(state.settings.options?.num_ctx || 8192);
+  return Number(
+    state.settings.options?.num_ctx
+      ?? state.runtime?.effective_options?.num_ctx
+      ?? FALLBACK_MODEL_OPTIONS.num_ctx
+  );
 }
 
 function resizeComposer() {

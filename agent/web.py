@@ -10,15 +10,17 @@ import socketserver
 import json
 import os
 import glob
+import hmac
 import sys
 import time
 import socket
 import re
-import webbrowser
+import signal
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import uuid
+from copy import deepcopy
 from datetime import datetime, timezone
-import ollama
+from urllib.parse import parse_qs, urlsplit
 
 # Import agent configurations and helpers from core
 from agent.core import (
@@ -28,42 +30,165 @@ from agent.core import (
     MAX_TOOL_CALL_ROUNDS,
     TOOL_CONTINUATION_PROMPT,
     _check_and_compact_history,
-    compact_tool_schemas,
+    effective_session_model_options,
     guarded_options_for_call,
     load_default_system_prompt,
     prepare_messages_for_model,
+    tool_schemas_for_model,
     _tool_call_turn_key,
 )
 from agent.tool_runner import (
-    MAX_PARALLEL_TOOL_WORKERS,
     build_execution_batches,
     execute_tool_call,
+    execute_tool_calls,
     normalize_tool_calls,
+    shutdown_tool_runner,
 )
-from tools.registry import TOOL_DISPATCH, TOOL_SCHEMAS
+from agent.cancellation import CancellationToken, OperationCancelled
+from agent.ollama_runtime import OllamaService, OperationKind, get_ollama_coordinator
+from agent.persistence import PersistenceError, atomic_write_json, read_json_preserved
+from agent.platform_runtime import get_runtime_paths, open_url_native, resource_path
+from agent.runtime_config import (
+    RuntimeConfigurationError,
+    RuntimeConfig,
+    get_runtime_config,
+)
+from agent.web_runtime import (
+    ClientSessionStore,
+    GenerationConflict,
+    GenerationOwnershipError,
+    GenerationRegistry,
+    LEGACY_CLIENT_ID,
+    TerminalState,
+    normalize_runtime_id,
+)
+from tools.registry import TOOL_DISPATCH, TOOL_SCHEMAS, get_tool_metadata
 
 # Setup directories
-STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
-_SESSIONS_DIR = os.path.expanduser("~/.selene-agent/sessions")
+STATIC_DIR = str(resource_path("agent/static"))
+_SESSIONS_DIR = str(get_runtime_paths().data_dir / "sessions")
 
-# Global Application State
-GLOBAL_STATE = {
-    "history": [],
-    "session": {
-        "options": {
-            "temperature": 0.7,
-            "top_p": 0.9,
-            "top_k": 40
-        },
+
+def _session_from_runtime(runtime: RuntimeConfig) -> dict:
+    return {
+        # Explicit per-session overrides only. Effective values are resolved
+        # from the selected profile for every model request.
+        "options": {},
+        "runtime_profile": runtime.requested_profile.value,
         "verbose": False,
         "wordwrap": True,
         "system": "",
         "history": True,
         "format": "",
         "think": True,
-    },
+    }
+
+
+_BASE_RUNTIME_CONFIG = get_runtime_config()
+
+# Global Application State
+GLOBAL_STATE = {
+    "history": [],
+    "session": _session_from_runtime(_BASE_RUNTIME_CONFIG),
     "active_session_name": "Active Session"
 }
+_GLOBAL_STATE_LOCK = threading.RLock()
+_SESSION_LIFECYCLE_LOCK = threading.RLock()
+_SESSION_LOCKS_GUARD = threading.Lock()
+_SESSION_LOCKS: dict[str, threading.RLock] = {}
+_SESSION_RENAMES: dict[str, str] = {}
+CLIENT_SESSIONS = ClientSessionStore(GLOBAL_STATE["session"])
+ACTIVE_GENERATIONS = GenerationRegistry()
+
+
+def _session_lock(filename: str) -> threading.RLock:
+    safe_name = os.path.basename(filename)
+    with _SESSION_LOCKS_GUARD:
+        return _SESSION_LOCKS.setdefault(safe_name, threading.RLock())
+
+
+def _resolved_session_filename(filename: str) -> str:
+    safe_name = os.path.basename(filename)
+    with _SESSION_LOCKS_GUARD:
+        seen: set[str] = set()
+        while safe_name in _SESSION_RENAMES and safe_name not in seen:
+            seen.add(safe_name)
+            safe_name = _SESSION_RENAMES[safe_name]
+    return safe_name
+
+
+def _normalize_session_settings(session: dict, *, fallback: dict | None = None) -> dict:
+    if not isinstance(session, dict):
+        raise RuntimeConfigurationError("Session settings must be a JSON object")
+    base = deepcopy(fallback or GLOBAL_STATE.get("session") or _session_from_runtime(_BASE_RUNTIME_CONFIG))
+    merged = {
+        **base,
+        **deepcopy(session),
+        "options": {
+            **base.get("options", {}),
+            **deepcopy(session.get("options", {})),
+        },
+    }
+    options = merged.get("options", {})
+    if not isinstance(options, dict):
+        raise RuntimeConfigurationError("Session options must be a JSON object")
+    allowed_options = set(_BASE_RUNTIME_CONFIG.ollama_options())
+    unknown_options = set(options) - allowed_options
+    if unknown_options:
+        raise RuntimeConfigurationError(
+            f"Unknown model option(s): {', '.join(sorted(unknown_options))}"
+        )
+    runtime = get_runtime_config({**merged, "options": options})
+    merged["options"] = deepcopy(options)
+    merged["runtime_profile"] = runtime.requested_profile.value
+    for field in ("verbose", "wordwrap", "history", "think"):
+        if not isinstance(merged.get(field), bool):
+            raise RuntimeConfigurationError(f"{field} must be true or false")
+    if not isinstance(merged.get("system", ""), str):
+        raise RuntimeConfigurationError("system must be text")
+    if merged.get("format") not in ("", "json"):
+        raise RuntimeConfigurationError("format must be empty or 'json'")
+    return merged
+
+
+def _runtime_payload(session: dict) -> dict:
+    runtime = get_runtime_config(session)
+    paths = get_runtime_paths()
+    return {
+        "requested_profile": runtime.requested_profile.value,
+        "profile": runtime.profile.value,
+        "selection_reason": runtime.selection_reason,
+        "warnings": list(runtime.warnings),
+        "effective_options": runtime.ollama_options(),
+        "storage": paths.report(),
+    }
+
+
+def _read_session_snapshot(filename: str) -> tuple[dict, list[dict]]:
+    requested_name = os.path.basename(filename)
+    if not requested_name.endswith(".json"):
+        raise FileNotFoundError("Session file not found")
+    while True:
+        safe_name = _resolved_session_filename(requested_name)
+        filepath = os.path.join(_SESSIONS_DIR, safe_name)
+        with _session_lock(safe_name):
+            if _resolved_session_filename(requested_name) != safe_name:
+                continue
+            data = read_json_preserved(filepath, expected_type=dict)
+            break
+    session = data.get("session", {})
+    history = data.get("history", [])
+    if (
+        not isinstance(session, dict)
+        or not isinstance(history, list)
+        or any(not isinstance(message, dict) for message in history)
+    ):
+        raise ValueError("Saved session has an invalid structure")
+    normalized = _normalize_session_settings(
+        session,
+        fallback=_session_from_runtime(_BASE_RUNTIME_CONFIG),
+    )
+    return deepcopy(normalized), deepcopy(history)
 
 # ── Session Management Functions ──────────────────────────────────────
 
@@ -80,7 +205,12 @@ def list_saved_sessions() -> list[str]:
     return [os.path.basename(f) for f in files]
 
 
-def save_session(name: str) -> str:
+def save_session(
+    name: str,
+    session_data: dict | None = None,
+    history_data: list[dict] | None = None,
+    client_id: str = LEGACY_CLIENT_ID,
+) -> str:
     """Persist current state to a JSON file.
     
     Args:
@@ -90,83 +220,107 @@ def save_session(name: str) -> str:
         str: The filename of the saved session.
     """
     os.makedirs(_SESSIONS_DIR, exist_ok=True)
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
+    unique_suffix = uuid.uuid4().hex[:8]
     if name:
         # Sanitize name
         safe_name = "".join(c if c.isalnum() or c in ("_", "-") else "_" for c in name)
-        filename = f"{safe_name}_{timestamp}.json"
+        filename = f"{safe_name}_{timestamp}_{unique_suffix}.json"
     else:
-        filename = f"session_{timestamp}.json"
+        filename = f"session_{timestamp}_{unique_suffix}.json"
         
     filepath = os.path.join(_SESSIONS_DIR, filename)
-    payload = {
-        "saved_at": datetime.now(timezone.utc).isoformat(),
-        "model": MODEL_NAME,
-        "session": GLOBAL_STATE["session"],
-        "history": GLOBAL_STATE["history"],
-    }
-    
-    with open(filepath, "w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2, ensure_ascii=False)
-        
-    GLOBAL_STATE["active_session_name"] = filename
+    if session_data is None or history_data is None:
+        with _GLOBAL_STATE_LOCK:
+            session_data = deepcopy(GLOBAL_STATE["session"])
+            history_data = deepcopy(GLOBAL_STATE["history"])
+    save_session_snapshot(filename, session_data, history_data)
+    CLIENT_SESSIONS.select(client_id, filename, session_data, history_data)
+    if client_id == LEGACY_CLIENT_ID:
+        with _GLOBAL_STATE_LOCK:
+            GLOBAL_STATE["active_session_name"] = filename
     return filename
 
 
-def autosave_session() -> str | None:
+def autosave_session(client_id: str = LEGACY_CLIENT_ID) -> str | None:
     """Create or update the active chat without requiring a manual save."""
-    if not GLOBAL_STATE["history"]:
+    view = CLIENT_SESSIONS.snapshot(client_id)
+    if not view.history:
         return None
 
-    filename = GLOBAL_STATE.get("active_session_name", "")
-    filepath = os.path.join(_SESSIONS_DIR, os.path.basename(filename))
+    filename = view.active_session_name
+    filepath = os.path.join(_SESSIONS_DIR, _resolved_session_filename(filename))
     if filename in ("", "Active Session", "New conversation") or not os.path.isfile(filepath):
         # Use a temporary name until the first response is complete and Selene
         # can name the conversation from its actual subject.
-        return save_session("")
+        filename = save_session_snapshot("", view.session, view.history)
+        committed = CLIENT_SESSIONS.commit_generation(
+            client_id,
+            view.active_session_name,
+            filename,
+            view.session,
+            view.history,
+        )
+        return filename if committed else None
 
-    payload = {
-        "saved_at": datetime.now(timezone.utc).isoformat(),
-        "model": MODEL_NAME,
-        "session": GLOBAL_STATE["session"],
-        "history": GLOBAL_STATE["history"],
-    }
-    with open(filepath, "w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2, ensure_ascii=False)
-    return filename
+    saved_name = save_session_snapshot(filename, view.session, view.history)
+    if saved_name != filename:
+        CLIENT_SESSIONS.commit_generation(
+            client_id,
+            filename,
+            saved_name,
+            view.session,
+            view.history,
+        )
+    return saved_name
 
 
 def save_session_snapshot(
     filename: str,
     session_data: dict,
     history_data: list[dict],
+    *,
+    generation_start_session: dict | None = None,
 ) -> str:
     """Persist one conversation without depending on the globally selected chat."""
     os.makedirs(_SESSIONS_DIR, exist_ok=True)
     safe_filename = os.path.basename(filename or "")
     if safe_filename in ("", "Active Session", "New conversation") or not safe_filename.endswith(".json"):
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
-        safe_filename = f"session_{timestamp}.json"
+        safe_filename = f"session_{timestamp}_{uuid.uuid4().hex[:8]}.json"
 
-    filepath = os.path.join(_SESSIONS_DIR, safe_filename)
-    payload = {
-        "saved_at": datetime.now(timezone.utc).isoformat(),
-        "model": MODEL_NAME,
-        "session": session_data,
-        "history": history_data,
-    }
-    temporary = f"{filepath}.tmp-{threading.get_ident()}"
-    try:
-        with open(temporary, "w", encoding="utf-8") as stream:
-            json.dump(payload, stream, indent=2, ensure_ascii=False)
-        os.replace(temporary, filepath)
-    finally:
-        try:
-            if os.path.exists(temporary):
-                os.remove(temporary)
-        except OSError:
-            pass
-    return safe_filename
+    requested_filename = safe_filename
+    while True:
+        safe_filename = _resolved_session_filename(requested_filename)
+        with _session_lock(safe_filename):
+            # A title rename may have completed while this writer waited for
+            # the old filename lock. Retry against the new name instead of
+            # recreating the temporary session file.
+            if _resolved_session_filename(requested_filename) != safe_filename:
+                continue
+            filepath = os.path.join(_SESSIONS_DIR, safe_filename)
+            persisted_session = deepcopy(session_data)
+            if generation_start_session is not None and os.path.isfile(filepath):
+                try:
+                    current = read_json_preserved(filepath, expected_type=dict)
+                    current_session = current.get("session")
+                    if (
+                        isinstance(current_session, dict)
+                        and current_session != generation_start_session
+                    ):
+                        persisted_session = current_session
+                except (OSError, ValueError):
+                    # The atomic writer below will preserve failures. Malformed
+                    # existing data is surfaced rather than silently replaced.
+                    raise
+            payload = {
+                "saved_at": datetime.now(timezone.utc).isoformat(),
+                "model": MODEL_NAME,
+                "session": persisted_session,
+                "history": deepcopy(history_data),
+            }
+            atomic_write_json(filepath, payload)
+            return safe_filename
 
 
 def _normalize_agent_title(value: str) -> str:
@@ -181,7 +335,13 @@ def _normalize_agent_title(value: str) -> str:
     return " ".join(words)
 
 
-def generate_conversation_title(history: list[dict]) -> str:
+def generate_conversation_title(
+    history: list[dict],
+    *,
+    session_data: dict | None = None,
+    cancellation_token: CancellationToken | None = None,
+    owner: str | None = None,
+) -> str:
     """Ask the local agent for a short semantic title, with a stable fallback."""
     first_user = next(
         (str(message.get("content", "")) for message in history if message.get("role") == "user"),
@@ -194,18 +354,26 @@ def generate_conversation_title(history: list[dict]) -> str:
     if not first_user and not last_assistant:
         return "New Conversation"
 
-    prompt = (
-        "Create a descriptive title for this conversation. Output only the title, "
-        "using exactly 2 or 3 words. Do not output punctuation, quotes, or a label.\n\n"
-        f"User topic:\n{first_user[:1200]}\n\nAssistant response:\n{last_assistant[:1200]}"
-    )
+    title_messages = [
+        {
+            "role": "system",
+            "content": "Return only a descriptive two- or three-word conversation title without punctuation.",
+        },
+        {
+            "role": "user",
+            "content": f"User topic:\n{first_user[:1200]}\n\nAssistant response:\n{last_assistant[:1200]}",
+        },
+    ]
     try:
-        response = ollama.chat(
-            model=MODEL_NAME,
-            messages=[{"role": "user", "content": prompt}],
+        runtime = get_runtime_config(session_data)
+        response = OllamaService(runtime).chat(
+            kind=OperationKind.TITLE,
+            owner=owner or f"title:{threading.get_ident()}:{time.monotonic_ns()}",
+            cancellation_token=cancellation_token,
+            operation_timeout=runtime.title_timeout_seconds,
+            messages=title_messages,
             stream=False,
             think=False,
-            keep_alive="30m",
             options={"temperature": 0.2, "num_predict": 12},
         )
         message = getattr(response, "message", None)
@@ -217,7 +385,16 @@ def generate_conversation_title(history: list[dict]) -> str:
         return "New Conversation"
 
 
-def title_temporary_session(history: list[dict], filename: str | None = None) -> str | None:
+def title_temporary_session(
+    history: list[dict],
+    filename: str | None = None,
+    cancellation_token: CancellationToken | None = None,
+    *,
+    session_data: dict | None = None,
+    owner: str | None = None,
+    generation_id: str | None = None,
+    client_id: str = LEGACY_CLIENT_ID,
+) -> str | None:
     """Replace a first-turn temporary filename with an agent-generated title."""
     filename = os.path.basename(filename or GLOBAL_STATE.get("active_session_name", ""))
     match = re.fullmatch(r"session_(\d{8}_\d{6}(?:_\d{6})?)\.json", filename)
@@ -228,23 +405,45 @@ def title_temporary_session(history: list[dict], filename: str | None = None) ->
     if not os.path.isfile(old_path):
         return None
 
-    title = generate_conversation_title(history)
+    if cancellation_token:
+        cancellation_token.raise_if_cancelled()
+    title = generate_conversation_title(
+        history,
+        session_data=session_data,
+        cancellation_token=cancellation_token,
+        owner=owner,
+    )
+    if cancellation_token:
+        cancellation_token.raise_if_cancelled()
     safe_title = "_".join(_normalize_agent_title(title).split())
-    target = f"{safe_title}_{match.group(1)}.json"
-    target_path = os.path.join(_SESSIONS_DIR, target)
-    suffix = 2
-    while os.path.exists(target_path) and target_path != old_path:
-        target = f"{safe_title}_{match.group(1)}_{suffix}.json"
+    with _session_lock(filename):
+        if not os.path.isfile(old_path):
+            return None
+        target = f"{safe_title}_{match.group(1)}.json"
         target_path = os.path.join(_SESSIONS_DIR, target)
-        suffix += 1
-
-    os.replace(old_path, target_path)
-    if GLOBAL_STATE["active_session_name"] == filename:
-        GLOBAL_STATE["active_session_name"] = target
+        suffix = 2
+        while os.path.exists(target_path) and target_path != old_path:
+            target = f"{safe_title}_{match.group(1)}_{suffix}.json"
+            target_path = os.path.join(_SESSIONS_DIR, target)
+            suffix += 1
+        rebound = False
+        if generation_id:
+            # Reserve the new session identity before making the renamed file
+            # visible, closing the cross-tab generation race.
+            ACTIVE_GENERATIONS.rebind_generation(generation_id, client_id, target)
+            rebound = True
+        try:
+            os.replace(old_path, target_path)
+        except BaseException:
+            if rebound:
+                ACTIVE_GENERATIONS.rebind_generation(generation_id, client_id, filename)
+            raise
+        with _SESSION_LOCKS_GUARD:
+            _SESSION_RENAMES[filename] = target
     return target
 
 
-def load_session(filename: str) -> None:
+def load_session(filename: str, client_id: str = LEGACY_CLIENT_ID) -> None:
     """Load session from a JSON file.
     
     Args:
@@ -253,23 +452,15 @@ def load_session(filename: str) -> None:
     Raises:
         FileNotFoundError: If the specified session file does not exist.
     """
-    filepath = os.path.join(_SESSIONS_DIR, filename)
-    if not os.path.isfile(filepath):
-        raise FileNotFoundError(f"Session file not found: {filename}")
-        
-    with open(filepath, "r", encoding="utf-8") as f:
-        data = json.load(f)
-        
-    GLOBAL_STATE["history"] = data.get("history", [])
-    GLOBAL_STATE["session"] = {
-        **GLOBAL_STATE["session"],
-        **data.get("session", {}),
-        "options": {
-            **GLOBAL_STATE["session"].get("options", {}),
-            **data.get("session", {}).get("options", {}),
-        },
-    }
-    GLOBAL_STATE["active_session_name"] = filename
+    loaded_session, loaded_history = _read_session_snapshot(filename)
+    # A saved session owns its model settings. Loading it must not inherit
+    # explicit overrides from whichever conversation the tab viewed before.
+    CLIENT_SESSIONS.select(client_id, filename, loaded_session, loaded_history)
+    if client_id == LEGACY_CLIENT_ID:
+        with _GLOBAL_STATE_LOCK:
+            GLOBAL_STATE["history"] = deepcopy(loaded_history)
+            GLOBAL_STATE["session"] = deepcopy(loaded_session)
+            GLOBAL_STATE["active_session_name"] = filename
 
 
 # ── Slash Command Handler ─────────────────────────────────────────────
@@ -281,6 +472,7 @@ _COMMANDS_HELP_MD = """
 * `/save [name]` — Save current session (optional name)
 * `/load [name|index]` — Load a saved session (lists sessions if no arg)
 * `/set parameter <name> <val>` — Set a model parameter (e.g., `temperature 0.7`)
+* `/set profile <name>` — Select `auto`, `low-vram`, `balanced`, or `manual`
 * `/set system "<prompt>"` — Set custom system prompt for this session
 * `/set history` / `/set nohistory` — Enable/disable conversation history
 * `/set wordwrap` / `/set nowordwrap` — Enable/disable word wrapping
@@ -300,7 +492,13 @@ _COMMANDS_HELP_MD = """
 * `/quit` or `/exit` or `/q` — Quit/exit the session
 """
 
-def execute_command_web(cmd: str, session: dict, history: list[dict]) -> str:
+def execute_command_web(
+    cmd: str,
+    session: dict,
+    history: list[dict],
+    client_id: str = LEGACY_CLIENT_ID,
+    cancellation_token: CancellationToken | None = None,
+) -> str:
     """Execute a slash command from the web interface.
     
     Similar to the terminal's `_handle_command`, but formats output as markdown
@@ -337,7 +535,7 @@ def execute_command_web(cmd: str, session: dict, history: list[dict]) -> str:
         return "✓ Conversation history and system prompt cleared."
         
     elif base == "/save":
-        filename = save_session(rest)
+        filename = save_session(rest, session, history, client_id)
         display_name = filename.replace(".json", "")
         return f"✓ Session saved as `{display_name}`"
         
@@ -376,7 +574,10 @@ def execute_command_web(cmd: str, session: dict, history: list[dict]) -> str:
         if not target_filename:
             return f"No session found matching '{rest}'."
             
-        load_session(target_filename)
+        loaded_session, loaded_history = _read_session_snapshot(target_filename)
+        session.clear()
+        session.update(loaded_session)
+        history[:] = loaded_history
         return f"✓ Session loaded: `{target_filename.replace('.json', '')}`"
         
     elif base == "/set":
@@ -433,8 +634,8 @@ def execute_command_web(cmd: str, session: dict, history: list[dict]) -> str:
                 "top_k": int,
                 "num_predict": int,
                 "num_ctx": int,
+                "num_batch": int,
                 "repeat_penalty": float,
-                "seed": int,
             }
             subparts = args.split(None, 1)
             if len(subparts) != 2:
@@ -444,13 +645,34 @@ def execute_command_web(cmd: str, session: dict, history: list[dict]) -> str:
                 return f"Unknown parameter: `{name}`\nAvailable: {', '.join(sorted(_ALL_PARAMS.keys()))}"
             try:
                 val = _ALL_PARAMS[name](raw_val)
-                if "options" not in session:
-                    session["options"] = {}
-                session["options"][name] = val
+                candidate = deepcopy(session)
+                candidate.setdefault("options", {})[name] = val
+                normalized = _normalize_session_settings(candidate, fallback=session)
+                session.clear()
+                session.update(normalized)
                 return f"✓ `{name}` = `{val}`"
+            except RuntimeConfigurationError as exc:
+                return f"Invalid value for {name}: {exc}"
             except ValueError:
                 expected = _ALL_PARAMS[name].__name__
                 return f"Invalid value for {name}: expected {expected}, got '{raw_val}'"
+        elif sub == "profile":
+            profile = args.lower().replace("_", "-")
+            candidate = deepcopy(session)
+            candidate["runtime_profile"] = profile
+            try:
+                normalized = _normalize_session_settings(candidate, fallback=session)
+            except RuntimeConfigurationError as exc:
+                return f"Invalid runtime profile: {exc}"
+            session.clear()
+            session.update(normalized)
+            runtime = get_runtime_config(session)
+            lines = [
+                f"✓ Runtime profile = `{runtime.profile.value}`",
+                runtime.selection_reason,
+            ]
+            lines.extend(f"⚠ {warning}" for warning in runtime.warnings)
+            return "\n".join(lines)
         else:
             return f"Unknown /set subcommand: `{sub}`"
             
@@ -459,11 +681,15 @@ def execute_command_web(cmd: str, session: dict, history: list[dict]) -> str:
             return "Usage: `/show <subcommand>` (parameters, system, model)"
         sub = rest.lower()
         if sub == "parameters":
-            if "options" not in session or not session["options"]:
-                return "No custom parameters set (using model defaults)."
-            out = ["**Session parameters:**"]
-            for k, v in session["options"].items():
+            runtime = get_runtime_config(session)
+            out = [
+                f"**Runtime profile:** `{runtime.profile.value}`",
+                "**Effective session parameters:**",
+            ]
+            for k, v in runtime.ollama_options().items():
                 out.append(f"- `{k}` = `{v}`")
+            if session.get("options"):
+                out.append("\nExplicit session overrides are active.")
             return "\n".join(out)
         elif sub == "system":
             prompt = session.get("system", "")
@@ -516,14 +742,17 @@ def execute_command_web(cmd: str, session: dict, history: list[dict]) -> str:
             collection = collection_raw
             
         def call_tool(tool_name, **kwargs):
-            handler = TOOL_DISPATCH.get(tool_name)
-            if not handler:
-                return {"error": f"Tool not found: {tool_name}"}
             try:
-                result = handler(**kwargs)
-                if isinstance(result, str):
-                    return json.loads(result)
-                return result
+                spec = normalize_tool_calls([{
+                    "function": {"name": tool_name, "arguments": kwargs}
+                }])[0]
+                execution = execute_tool_call(
+                    spec,
+                    cancellation_token=cancellation_token,
+                )
+                return json.loads(execution.content)
+            except OperationCancelled:
+                raise
             except Exception as exc:
                 return {"error": str(exc)}
                 
@@ -655,11 +884,16 @@ def execute_command_web(cmd: str, session: dict, history: list[dict]) -> str:
 
 # ── Chat Stream Generator ─────────────────────────────────────────────
 
-def generate_chat_events(
+def _generate_chat_events_impl(
     user_input: str,
     session_data: dict,
     history_data: list[dict],
     session_name: str | None = None,
+    *,
+    cancellation_token: CancellationToken | None = None,
+    generation_id: str | None = None,
+    publish_global: bool = True,
+    client_id: str = LEGACY_CLIENT_ID,
 ):
     """Generator yielding dictionary objects representing the progress of agent generation.
     
@@ -676,18 +910,43 @@ def generate_chat_events(
     Yields:
         dict: A dictionary representing an event in the generation process.
     """
+    cancellation_token = cancellation_token or CancellationToken()
+    cancellation_token.raise_if_cancelled()
+    runtime = get_runtime_config(session_data)
+    generation_start_session = deepcopy(session_data)
+    operation_owner = f"web:{generation_id or threading.get_ident()}"
     origin_name = session_name or GLOBAL_STATE.get("active_session_name", "Active Session")
 
     if user_input.startswith('/'):
-        output = execute_command_web(user_input, session_data, history_data)
+        output = execute_command_web(
+            user_input,
+            session_data,
+            history_data,
+            client_id,
+            cancellation_token,
+        )
         yield {"type": "content_chunk", "content": output}
-        yield {"type": "done"}
+        yield {
+            "type": "done",
+            "state": "completed",
+            "history": history_data,
+            "active_session_name": origin_name,
+            "saved_sessions": list_saved_sessions(),
+        }
         return
 
     previous_name = origin_name
-    origin_name = save_session_snapshot(origin_name, session_data, history_data)
-    if GLOBAL_STATE.get("active_session_name") == previous_name:
-        GLOBAL_STATE["active_session_name"] = origin_name
+    origin_name = save_session_snapshot(
+        origin_name,
+        session_data,
+        history_data,
+        generation_start_session=generation_start_session,
+    )
+    cancellation_token.raise_if_cancelled()
+    if publish_global:
+        with _GLOBAL_STATE_LOCK:
+            if GLOBAL_STATE.get("active_session_name") == previous_name:
+                GLOBAL_STATE["active_session_name"] = origin_name
     yield {"type": "conversation_started", "session_name": origin_name}
 
     # Exact, persistently approved routine triggers are deterministic. Do this
@@ -695,21 +954,44 @@ def generate_chat_events(
     # selection, while the routine executor still enforces its safety policy.
     routine_handler = TOOL_DISPATCH.get("automated_routine_executor")
     if routine_handler:
+        cancellation_token.raise_if_cancelled()
         try:
-            preview = json.loads(routine_handler(action="show", trigger=user_input))
+            preview_call = normalize_tool_calls([{
+                "function": {
+                    "name": "automated_routine_executor",
+                    "arguments": {"action": "show", "trigger": user_input},
+                }
+            }])[0]
+            preview_result = execute_tool_call(
+                preview_call,
+                cancellation_token=cancellation_token,
+            )
+            preview = json.loads(preview_result.content)
         except (TypeError, ValueError, json.JSONDecodeError):
             preview = {}
+        cancellation_token.raise_if_cancelled()
         if preview.get("automatic_trigger") is True:
             routine_name = str(preview.get("name", "routine"))
             yield {"type": "tool_start", "name": "automated_routine_executor"}
             try:
-                result = json.loads(routine_handler(
-                    action="run",
-                    trigger=user_input,
-                    dry_run=False,
-                ))
+                routine_call = normalize_tool_calls([{
+                    "function": {
+                        "name": "automated_routine_executor",
+                        "arguments": {
+                            "action": "run",
+                            "trigger": user_input,
+                            "dry_run": False,
+                        },
+                    }
+                }])[0]
+                routine_result = execute_tool_call(
+                    routine_call,
+                    cancellation_token=cancellation_token,
+                )
+                result = json.loads(routine_result.content)
             except (TypeError, ValueError, json.JSONDecodeError) as exc:
                 result = {"ok": False, "error": str(exc)}
+            cancellation_token.raise_if_cancelled()
             yield {
                 "type": "tool_end",
                 "name": "automated_routine_executor",
@@ -717,26 +999,48 @@ def generate_chat_events(
             }
             if result.get("ok") is True:
                 output = f"✓ Routine **{routine_name}** completed."
+                routine_state = "completed"
             else:
                 detail = result.get("error") or "One or more routine actions failed."
                 output = f"Routine **{routine_name}** failed: {detail}"
+                routine_state = "failed"
 
             if session_data.get("history", True):
                 history_data.append({"role": "user", "content": user_input})
                 history_data.append({"role": "assistant", "content": output})
-                origin_name = save_session_snapshot(origin_name, session_data, history_data)
-                viewing_origin = GLOBAL_STATE.get("active_session_name") == origin_name
-                titled_name = title_temporary_session(history_data, origin_name)
+                origin_name = save_session_snapshot(
+                    origin_name,
+                    session_data,
+                    history_data,
+                    generation_start_session=generation_start_session,
+                )
+                viewing_origin = publish_global and GLOBAL_STATE.get("active_session_name") == origin_name
+                titled_name = title_temporary_session(
+                    history_data,
+                    origin_name,
+                    cancellation_token,
+                    session_data=session_data,
+                    owner=operation_owner,
+                    generation_id=generation_id,
+                    client_id=client_id,
+                )
                 if titled_name:
                     origin_name = titled_name
-                save_session_snapshot(origin_name, session_data, history_data)
+                save_session_snapshot(
+                    origin_name,
+                    session_data,
+                    history_data,
+                    generation_start_session=generation_start_session,
+                )
                 if viewing_origin:
-                    GLOBAL_STATE["active_session_name"] = origin_name
-                    GLOBAL_STATE["session"] = session_data
-                    GLOBAL_STATE["history"] = history_data
+                    with _GLOBAL_STATE_LOCK:
+                        GLOBAL_STATE["active_session_name"] = origin_name
+                        GLOBAL_STATE["session"] = deepcopy(session_data)
+                        GLOBAL_STATE["history"] = deepcopy(history_data)
             yield {"type": "content_chunk", "content": output}
             yield {
                 "type": "done",
+                "state": routine_state,
                 "history": history_data,
                 "active_session_name": origin_name,
                 "saved_sessions": list_saved_sessions(),
@@ -756,6 +1060,7 @@ def generate_chat_events(
     # 2. Check for local file auto-indexing
     pre_tool_message = None
     try:
+        cancellation_token.raise_if_cancelled()
         if os.path.exists(user_input) and os.path.isfile(user_input):
             size = os.path.getsize(user_input)
             ext = os.path.splitext(user_input)[1].lower()
@@ -764,11 +1069,21 @@ def generate_chat_events(
                 yield {"type": "status", "message": f"Large/binary file detected — indexing {user_input}...", "color": "yellow"}
                 handler = TOOL_DISPATCH.get("index_vault")
                 if handler:
-                    res = handler(vault_path=os.path.dirname(user_input) or ".", file_path=user_input)
-                    if isinstance(res, str):
-                        tool_content = res
-                    else:
-                        tool_content = json.dumps(res)
+                    index_call = normalize_tool_calls([{
+                        "function": {
+                            "name": "index_vault",
+                            "arguments": {
+                                "vault_path": os.path.dirname(user_input) or ".",
+                                "file_path": user_input,
+                            },
+                        }
+                    }])[0]
+                    index_result = execute_tool_call(
+                        index_call,
+                        cancellation_token=cancellation_token,
+                    )
+                    cancellation_token.raise_if_cancelled()
+                    tool_content = index_result.content
                     tool_msg = {
                         "role": "tool",
                         "tool_name": "index_vault",
@@ -781,13 +1096,20 @@ def generate_chat_events(
                         pre_tool_message = tool_msg
                     yield {"type": "status", "message": "Indexing complete.", "color": "green"}
     except Exception as e:
+        if isinstance(e, OperationCancelled):
+            raise
         yield {"type": "status", "message": f"Indexing failed: {e}", "color": "red"}
         
     # 3. Build messages to send
     if session_data.get("history", True):
         history_data.append({"role": "user", "content": user_input})
         # Persist the prompt immediately so stopping a generation cannot lose it.
-        save_session_snapshot(origin_name, session_data, history_data)
+        save_session_snapshot(
+            origin_name,
+            session_data,
+            history_data,
+            generation_start_session=generation_start_session,
+        )
         messages_to_send = prepare_messages_for_model(history_data, session_data, tools=TOOL_SCHEMAS)
     else:
         messages_to_send = []
@@ -802,12 +1124,16 @@ def generate_chat_events(
     executed_tool_calls: dict[str, dict] = {}
     tool_rounds = 0
     while True:
-        runtime_tools = compact_tool_schemas(TOOL_SCHEMAS)
+        cancellation_token.raise_if_cancelled()
+        runtime_tools = tool_schemas_for_model(messages_to_send, session_data, TOOL_SCHEMAS)
         try:
             guarded_options = guarded_options_for_call(
                 messages_to_send,
-                session_data.get("options"),
+                effective_session_model_options(session_data)[1],
                 runtime_tools,
+                extra_reserved_tokens=(
+                    CONTEXT_TOOL_LOOP_RESERVE if tool_rounds else 0
+                ),
             )
         except ContextWindowError as exc:
             message = f"Context window guard stopped this response before generation: {exc}"
@@ -815,10 +1141,17 @@ def generate_chat_events(
             assistant_msg = {"role": "assistant", "content": message}
             if session_data.get("history", True):
                 history_data.append(assistant_msg)
-                save_session_snapshot(origin_name, session_data, history_data)
+                save_session_snapshot(
+                    origin_name,
+                    session_data,
+                    history_data,
+                    generation_start_session=generation_start_session,
+                )
             yield {"type": "content_chunk", "content": message}
             yield {
                 "type": "done",
+                "state": "failed",
+                "error": message,
                 "history": history_data,
                 "active_session_name": origin_name,
                 "saved_sessions": list_saved_sessions(),
@@ -830,7 +1163,6 @@ def generate_chat_events(
             "messages": messages_to_send,
             "stream": True,
             "think": session_data.get("think", True),
-            "keep_alive": "30m",
         }
         if session_data.get("format"):
             kwargs["format"] = session_data["format"]
@@ -840,9 +1172,24 @@ def generate_chat_events(
             kwargs["options"] = guarded_options
             
         try:
-            stream = ollama.chat(**kwargs)
+            stream = OllamaService(runtime).chat(
+                kind=OperationKind.CHAT,
+                owner=operation_owner,
+                cancellation_token=cancellation_token,
+                operation_timeout=runtime.chat_timeout_seconds,
+                **kwargs,
+            )
         except Exception as e:
-            yield {"type": "status", "message": f"Ollama Chat error: {e}", "color": "red"}
+            message = f"Ollama Chat error: {e}"
+            yield {"type": "status", "message": message, "color": "red"}
+            yield {
+                "type": "done",
+                "state": "failed",
+                "error": message,
+                "history": history_data,
+                "active_session_name": origin_name,
+                "saved_sessions": list_saved_sessions(),
+            }
             break
             
         thinking_buf = ""
@@ -853,41 +1200,49 @@ def generate_chat_events(
         prompt_tokens = 0
         eval_tokens = 0
         
-        for chunk in stream:
-            msg = chunk.message
+        try:
+            for chunk in stream:
+                cancellation_token.raise_if_cancelled()
+                msg = chunk.message
             
-            if getattr(chunk, "prompt_eval_count", None):
-                prompt_tokens = chunk.prompt_eval_count
-            if getattr(chunk, "eval_count", None):
-                eval_tokens = chunk.eval_count
+                if getattr(chunk, "prompt_eval_count", None):
+                    prompt_tokens = chunk.prompt_eval_count
+                if getattr(chunk, "eval_count", None):
+                    eval_tokens = chunk.eval_count
             
-            # Intercept tool calls
-            if getattr(msg, "tool_calls", None):
-                tool_calls = [
-                    {"function": {"name": tc.function.name, "arguments": tc.function.arguments}}
-                    for tc in msg.tool_calls
-                ]
-                break
+                # Intercept tool calls
+                if getattr(msg, "tool_calls", None):
+                    tool_calls = [
+                        {"function": {"name": tc.function.name, "arguments": tc.function.arguments}}
+                        for tc in msg.tool_calls
+                    ]
+                    break
                 
-            # Stream thinking text
-            thinking_chunk = getattr(msg, "thinking", None) or ""
-            if thinking_chunk:
-                if not thinking_started:
-                    thinking_started = True
-                    in_thinking = True
-                    yield {"type": "thinking_start"}
-                thinking_buf += thinking_chunk
-                yield {"type": "thinking_chunk", "text": thinking_chunk}
-                continue
+                # Stream thinking text
+                thinking_chunk = getattr(msg, "thinking", None) or ""
+                if thinking_chunk:
+                    if not thinking_started:
+                        thinking_started = True
+                        in_thinking = True
+                        yield {"type": "thinking_start"}
+                    thinking_buf += thinking_chunk
+                    yield {"type": "thinking_chunk", "text": thinking_chunk}
+                    continue
                 
-            # Stream final content text
-            content_chunk = getattr(msg, "content", None) or ""
-            if content_chunk:
-                if in_thinking:
-                    in_thinking = False
-                    yield {"type": "thinking_end"}
-                content_buf += content_chunk
-                yield {"type": "content_chunk", "text": content_chunk}
+                # Stream final content text
+                content_chunk = getattr(msg, "content", None) or ""
+                if content_chunk:
+                    if in_thinking:
+                        in_thinking = False
+                        yield {"type": "thinking_end"}
+                    content_buf += content_chunk
+                    yield {"type": "content_chunk", "text": content_chunk}
+        finally:
+            if hasattr(stream, "close"):
+                try:
+                    stream.close()
+                except Exception:
+                    pass
                 
         if in_thinking:
             yield {"type": "thinking_end"}
@@ -897,7 +1252,7 @@ def generate_chat_events(
             yield {
                 "type": "token_usage", 
                 "total": prompt_tokens + eval_tokens,
-                "budget": int(session_data.get("options", {}).get("num_ctx", 8192))
+                "budget": int(guarded_options.get("num_ctx", runtime.num_ctx))
             }
             
         # Compile assistant message
@@ -912,17 +1267,33 @@ def generate_chat_events(
             
         # If there are no tool calls, this turn is completed
         if not tool_calls:
-            viewing_origin = GLOBAL_STATE.get("active_session_name") == origin_name
-            titled_name = title_temporary_session(history_data, origin_name)
+            cancellation_token.raise_if_cancelled()
+            viewing_origin = publish_global and GLOBAL_STATE.get("active_session_name") == origin_name
+            titled_name = title_temporary_session(
+                history_data,
+                origin_name,
+                cancellation_token,
+                session_data=session_data,
+                owner=operation_owner,
+                generation_id=generation_id,
+                client_id=client_id,
+            )
             if titled_name:
                 origin_name = titled_name
-            save_session_snapshot(origin_name, session_data, history_data)
+            save_session_snapshot(
+                origin_name,
+                session_data,
+                history_data,
+                generation_start_session=generation_start_session,
+            )
             if viewing_origin:
-                GLOBAL_STATE["active_session_name"] = origin_name
-                GLOBAL_STATE["session"] = session_data
-                GLOBAL_STATE["history"] = history_data
+                with _GLOBAL_STATE_LOCK:
+                    GLOBAL_STATE["active_session_name"] = origin_name
+                    GLOBAL_STATE["session"] = deepcopy(session_data)
+                    GLOBAL_STATE["history"] = deepcopy(history_data)
             yield {
                 "type": "done",
+                "state": "completed",
                 "history": history_data,
                 "active_session_name": origin_name,
                 "saved_sessions": list_saved_sessions(),
@@ -937,10 +1308,26 @@ def generate_chat_events(
             yield {"type": "status", "message": message, "color": "yellow"}
             yield {"type": "content_chunk", "text": message}
             if session_data.get("history", True):
-                history_data.append({"role": "assistant", "content": message})
-            save_session_snapshot(origin_name, session_data, history_data)
+                # The just-appended model message contains tool_calls that were
+                # deliberately not executed. Never persist an assistant call
+                # without matching tool-result messages; it would make the
+                # next Ollama transcript structurally invalid.
+                if history_data and history_data[-1] is assistant_msg:
+                    history_data.pop()
+                terminal_content = "\n\n".join(
+                    part for part in (content_buf.strip(), message) if part
+                )
+                history_data.append({"role": "assistant", "content": terminal_content})
+            save_session_snapshot(
+                origin_name,
+                session_data,
+                history_data,
+                generation_start_session=generation_start_session,
+            )
             yield {
                 "type": "done",
+                "state": "failed",
+                "error": message,
                 "history": history_data,
                 "active_session_name": origin_name,
                 "saved_sessions": list_saved_sessions(),
@@ -978,39 +1365,40 @@ def generate_chat_events(
             original_index_by_call_id[id(call)] = index
             calls_to_execute.append(call)
 
-        for can_parallel, batch in build_execution_batches(normalize_tool_calls(calls_to_execute)):
-            if not can_parallel:
-                for spec in batch:
-                    original_index = original_index_by_call_id[id(spec.raw)]
-                    yield {"type": "tool_start", "id": original_index, "name": spec.name, "arguments": spec.arguments}
-                    result = execute_tool_call(spec)
-                    yield {"type": "tool_end", "id": original_index, "name": spec.name, "result": result.content}
-                    tool_message = result.as_tool_message()
-                    tool_results_by_index[original_index] = tool_message
-                    if original_index in pending_key_by_index:
-                        executed_tool_calls[pending_key_by_index[original_index]] = dict(tool_message)
-                continue
-
-            yield {
-                "type": "tool_parallel_start",
-                "count": len(batch),
-                "names": [spec.name for spec in batch],
-            }
+        execution_specs = normalize_tool_calls(calls_to_execute)
+        for can_parallel, batch in build_execution_batches(execution_specs):
+            if can_parallel:
+                yield {
+                    "type": "tool_parallel_start",
+                    "count": len(batch),
+                    "names": [spec.name for spec in batch],
+                }
             for spec in batch:
                 original_index = original_index_by_call_id[id(spec.raw)]
-                yield {"type": "tool_start", "id": original_index, "name": spec.name, "arguments": spec.arguments}
+                yield {
+                    "type": "tool_start",
+                    "id": original_index,
+                    "name": spec.name,
+                    "arguments": spec.arguments,
+                }
 
-            worker_count = min(MAX_PARALLEL_TOOL_WORKERS, len(batch))
-            with ThreadPoolExecutor(max_workers=worker_count) as executor:
-                futures = {executor.submit(execute_tool_call, spec): spec for spec in batch}
-                for future in as_completed(futures):
-                    result = future.result()
-                    original_index = original_index_by_call_id[id(result.spec.raw)]
-                    yield {"type": "tool_end", "id": original_index, "name": result.spec.name, "result": result.content}
-                    tool_message = result.as_tool_message()
-                    tool_results_by_index[original_index] = tool_message
-                    if original_index in pending_key_by_index:
-                        executed_tool_calls[pending_key_by_index[original_index]] = dict(tool_message)
+        # The shared executor owns timeout uncertainty, side-effect ordering,
+        # deterministic result order, cancellation, and resource guards.
+        for result in execute_tool_calls(
+            calls_to_execute,
+            cancellation_token=cancellation_token,
+        ):
+            original_index = original_index_by_call_id[id(result.spec.raw)]
+            yield {
+                "type": "tool_end",
+                "id": original_index,
+                "name": result.spec.name,
+                "result": result.content,
+            }
+            tool_message = result.as_tool_message()
+            tool_results_by_index[original_index] = tool_message
+            if original_index in pending_key_by_index:
+                executed_tool_calls[pending_key_by_index[original_index]] = dict(tool_message)
 
         for index, source_index in sorted(duplicate_source_by_index.items()):
             cached = dict(tool_results_by_index[source_index])
@@ -1054,6 +1442,85 @@ def generate_chat_events(
         _check_and_compact_history(history_data, session_data)
 
 
+def generate_chat_events(
+    user_input: str,
+    session_data: dict,
+    history_data: list[dict],
+    session_name: str | None = None,
+    *,
+    cancellation_token: CancellationToken | None = None,
+    generation_id: str | None = None,
+    publish_global: bool = True,
+    client_id: str = LEGACY_CLIENT_ID,
+):
+    """Yield one and only one terminal ``done`` event for a connected stream."""
+    token = cancellation_token or CancellationToken()
+    implementation = _generate_chat_events_impl(
+        user_input,
+        session_data,
+        history_data,
+        session_name,
+        cancellation_token=token,
+        generation_id=generation_id,
+        publish_global=publish_global,
+        client_id=client_id,
+    )
+    terminal_payload: dict | None = None
+    active_name = session_name or "Active Session"
+    terminal_state = TerminalState.FAILED
+    terminal_detail: str | None = None
+    try:
+        for event in implementation:
+            token.raise_if_cancelled()
+            if event.get("type") == "conversation_started":
+                active_name = str(event.get("session_name") or active_name)
+            if event.get("type") == "done":
+                terminal_payload = dict(event)
+                active_name = str(event.get("active_session_name") or active_name)
+                continue
+            yield event
+        if token.cancelled:
+            terminal_state = TerminalState.CANCELLED
+            terminal_detail = token.reason
+        elif terminal_payload is not None:
+            try:
+                terminal_state = TerminalState(terminal_payload.get("state", "completed"))
+            except ValueError:
+                terminal_state = TerminalState.FAILED
+            terminal_detail = terminal_payload.get("error")
+        else:
+            terminal_detail = "Generation ended without a completion result"
+    except OperationCancelled as exc:
+        terminal_state = TerminalState.CANCELLED
+        terminal_detail = str(exc)
+    except GeneratorExit:
+        token.cancel("Client disconnected")
+        raise
+    except Exception as exc:
+        terminal_state = TerminalState.FAILED
+        terminal_detail = f"Generation failed: {exc}"
+        yield {"type": "status", "message": terminal_detail, "color": "red"}
+    finally:
+        try:
+            implementation.close()
+        except Exception:
+            pass
+
+    payload = terminal_payload or {
+        "history": history_data,
+        "active_session_name": active_name,
+        "saved_sessions": list_saved_sessions(),
+    }
+    payload.update({
+        "type": "done",
+        "state": terminal_state.value,
+        "generation_id": generation_id,
+    })
+    if terminal_detail:
+        payload["error"] = terminal_detail
+    yield payload
+
+
 # ── HTTP Handler ──────────────────────────────────────────────────────
 
 class AgentHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
@@ -1067,6 +1534,44 @@ class AgentHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
         """Mute standard output logs to keep the server output clean."""
         pass
 
+    def _client_id(self, body: dict | None = None, query: dict | None = None) -> str:
+        value = body.get("client_id") if body else None
+        if not value and query:
+            value = (query.get("client_id") or [None])[0]
+        if not value:
+            value = self.headers.get("X-Selene-Client-ID")
+        return normalize_runtime_id(value, fallback=LEGACY_CLIENT_ID)
+
+    def _origin_allowed(self) -> bool:
+        """Reject cross-site browser writes to the loopback control API."""
+        origin = str(self.headers.get("Origin") or "").strip()
+        if not origin:
+            # Native clients and same-origin requests may omit Origin.
+            return True
+        configured = str(os.environ.get("ALLOWED_ORIGIN") or "").rstrip("/")
+        if configured and origin.rstrip("/") == configured:
+            return True
+        try:
+            parsed = urlsplit(origin)
+        except ValueError:
+            return False
+        request_host = str(self.headers.get("Host") or "").casefold()
+        return (
+            parsed.scheme in {"http", "https"}
+            and bool(request_host)
+            and parsed.netloc.casefold() == request_host
+        )
+
+    @staticmethod
+    def _publish_legacy_view(client_id: str) -> None:
+        if client_id != LEGACY_CLIENT_ID:
+            return
+        view = CLIENT_SESSIONS.snapshot(client_id)
+        with _GLOBAL_STATE_LOCK:
+            GLOBAL_STATE["session"] = deepcopy(view.session)
+            GLOBAL_STATE["history"] = deepcopy(view.history)
+            GLOBAL_STATE["active_session_name"] = view.active_session_name
+
     def send_json_response(self, status_code: int, data: dict):
         """Helper to send a JSON-encoded HTTP response.
         
@@ -1074,15 +1579,18 @@ class AgentHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
             status_code (int): The HTTP status code to return.
             data (dict): The dictionary to serialize to JSON.
         """
+        payload = json.dumps(data, ensure_ascii=False).encode('utf-8')
         self.send_response(status_code)
         self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(payload)))
+        self.send_header('Cache-Control', 'no-store')
 
         allowed_origin = os.environ.get('ALLOWED_ORIGIN')
         if allowed_origin:
             self.send_header('Access-Control-Allow-Origin', allowed_origin)
 
         self.end_headers()
-        self.wfile.write(json.dumps(data).encode('utf-8'))
+        self.wfile.write(payload)
 
     def read_json_body(self) -> dict:
         """Helper to read and parse the JSON body of an HTTP POST request.
@@ -1091,8 +1599,15 @@ class AgentHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
             dict: The parsed JSON body.
         """
         content_length = int(self.headers.get('Content-Length', 0))
+        if content_length <= 0:
+            return {}
+        if content_length > 2 * 1024 * 1024:
+            raise ValueError("JSON request body exceeds the 2 MiB limit")
         body = self.rfile.read(content_length)
-        return json.loads(body.decode('utf-8'))
+        value = json.loads(body.decode('utf-8'))
+        if not isinstance(value, dict):
+            raise ValueError("JSON request body must be an object")
+        return value
 
     def serve_static_file(self, filename: str, content_type: str):
         """Serve a static file from the STATIC_DIR.
@@ -1126,43 +1641,65 @@ class AgentHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self):
         """Handle incoming HTTP GET requests for static files and settings."""
+        parsed = urlsplit(self.path)
+        path = parsed.path
+        query = parse_qs(parsed.query)
         # 1. Routing for Home and Assets
-        if self.path == '/' or self.path == '/index.html':
+        if path == '/' or path == '/index.html':
             self.serve_static_file('index.html', 'text/html')
             return
-        elif self.path == '/style.css':
+        elif path == '/style.css':
             self.serve_static_file('style.css', 'text/css')
             return
-        elif self.path == '/app.js':
+        elif path == '/app.js':
             self.serve_static_file('app.js', 'application/javascript')
             return
             
         # 2. Routing for Settings/State load
-        elif self.path == '/api/settings':
-            saved = list_saved_sessions()
-            
-            ollama_status = "Online"
+        elif path == '/api/settings':
             try:
-                ollama.list()
-            except Exception:
-                ollama_status = "Offline"
-                
+                client_id = self._client_id(query=query)
+            except ValueError as exc:
+                self.send_json_response(400, {"status": "error", "error": str(exc)})
+                return
+            saved = list_saved_sessions()
+            view = CLIENT_SESSIONS.snapshot(client_id)
+            probe = OllamaService(get_runtime_config(view.session)).probe(
+                model=MODEL_NAME,
+                timeout=3,
+            )
             response_data = {
-                "settings": GLOBAL_STATE["session"],
-                "history": GLOBAL_STATE["history"],
+                "settings": view.session,
+                "history": view.history,
                 "saved_sessions": saved,
-                "active_session_name": GLOBAL_STATE["active_session_name"],
+                "active_session_name": view.active_session_name,
                 "model_name": MODEL_NAME,
-                "ollama_status": ollama_status
+                "ollama_status": "Online" if probe.api_available else "Offline",
+                "ollama_reason": probe.reason,
+                "runtime": _runtime_payload(view.session),
             }
             self.send_json_response(200, response_data)
             return
+
+        elif path == '/api/generations':
+            try:
+                client_id = self._client_id(query=query)
+            except ValueError as exc:
+                self.send_json_response(400, {"status": "error", "error": str(exc)})
+                return
+            operations = [
+                operation
+                for operation in ACTIVE_GENERATIONS.active_operations()
+                if operation["client_id"] == client_id
+            ]
+            self.send_json_response(200, {"active_operations": operations})
+            return
             
-        elif self.path == '/favicon.ico' or self.path == '/favicon.png':
+        elif path == '/favicon.ico' or path == '/favicon.png':
             self.serve_static_file('favicon.png', 'image/png')
             return
             
-        elif self.path == '/avatar.png':
+        elif path == '/avatar.png':
             self.serve_static_file('avatar.png', 'image/jpeg')
             return
             
@@ -1171,6 +1708,9 @@ class AgentHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
 
     def do_OPTIONS(self):
         """Handle CORS preflight requests."""
+        if not self._origin_allowed():
+            self.send_error(403, "Cross-origin API access is not allowed")
+            return
         self.send_response(200)
 
         allowed_origin = os.environ.get('ALLOWED_ORIGIN')
@@ -1178,141 +1718,291 @@ class AgentHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
             self.send_header('Access-Control-Allow-Origin', allowed_origin)
 
         self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
-        self.send_header('Access-Control-Allow-Headers', 'Content-Type')
+        self.send_header('Access-Control-Allow-Headers', 'Content-Type, X-Selene-Client-ID')
         self.end_headers()
 
     def do_POST(self):
         """Handle incoming HTTP POST requests for API endpoints (chat, save/load/clear session)."""
-        # 1. Save Settings
-        if self.path == '/api/settings':
-            try:
-                body = self.read_json_body()
-                GLOBAL_STATE["session"] = body
-                autosave_session()
-                self.send_json_response(200, {"status": "success", "settings": GLOBAL_STATE["session"]})
-            except Exception as e:
-                self.send_json_response(400, {"status": "error", "error": str(e)})
+        if not self._origin_allowed():
+            self.send_json_response(403, {
+                "status": "error",
+                "error": "Cross-origin API access is not allowed",
+            })
             return
-            
-        # 2. Chat SSE Stream
-        elif self.path == '/api/chat':
+        path = urlsplit(self.path).path
+
+        if path == '/api/shutdown':
+            expected_owner = str(os.environ.get('SELENE_BACKEND_OWNER') or '')
+            provided_owner = str(self.headers.get('X-Selene-Backend-Owner') or '')
+            if not expected_owner or not hmac.compare_digest(provided_owner, expected_owner):
+                self.send_json_response(403, {
+                    "status": "error",
+                    "error": "Backend shutdown ownership could not be verified",
+                })
+                return
+            ACTIVE_GENERATIONS.cancel_all("Electron requested backend shutdown")
+            self.send_json_response(202, {"status": "shutting-down"})
+            threading.Thread(target=self.server.shutdown, daemon=True).start()
+            return
+
+        if path == '/api/settings':
             try:
                 body = self.read_json_body()
-                user_input = body.get("message", "").strip()
-                # Pin this request to the conversation that initiated it. The
-                # user may select another chat while this thread is streaming.
-                requested_name = os.path.basename(str(body.get("session_name", "")))
-                current_name = GLOBAL_STATE["active_session_name"]
-                aliases = {"", "Active Session", "New conversation"}
-                if requested_name == current_name or ({requested_name, current_name} <= aliases):
-                    generation_session_name = current_name
-                    generation_session = GLOBAL_STATE["session"]
-                    generation_history = GLOBAL_STATE["history"]
-                else:
-                    requested_path = os.path.join(_SESSIONS_DIR, requested_name)
-                    if not requested_name.endswith(".json") or not os.path.isfile(requested_path):
-                        raise FileNotFoundError("The originating conversation no longer exists")
-                    with open(requested_path, "r", encoding="utf-8") as stream:
-                        requested_session = json.load(stream)
-                    generation_session_name = requested_name
-                    generation_session = requested_session.get("session", {})
-                    generation_history = requested_session.get("history", [])
-            except Exception as e:
-                self.send_json_response(400, {"error": "Invalid JSON body"})
-                return
-                
-            if not user_input:
-                self.send_json_response(400, {"error": "Message cannot be empty"})
-                return
-                
-            self.send_response(200)
-            self.send_header('Content-Type', 'text/event-stream')
-            self.send_header('Cache-Control', 'no-cache')
-            self.send_header('Connection', 'keep-alive')
+                client_id = self._client_id(body)
+                body.pop("client_id", None)
+                current = CLIENT_SESSIONS.snapshot(client_id)
+                settings = _normalize_session_settings(body, fallback=current.session)
+                CLIENT_SESSIONS.update_settings(client_id, settings)
+                autosave_session(client_id)
+                self._publish_legacy_view(client_id)
+                self.send_json_response(200, {
+                    "status": "success",
+                    "settings": settings,
+                    "runtime": _runtime_payload(settings),
+                })
+            except Exception as exc:
+                self.send_json_response(400, {"status": "error", "error": str(exc)})
+            return
 
-            allowed_origin = os.environ.get('ALLOWED_ORIGIN')
-            if allowed_origin:
-                self.send_header('Access-Control-Allow-Origin', allowed_origin)
-
-            self.end_headers()
-            
+        if path == '/api/cancel-generation':
             try:
-                for event in generate_chat_events(
+                body = self.read_json_body()
+                client_id = self._client_id(body)
+                generation_id = normalize_runtime_id(body.get("generation_id"))
+                lease = ACTIVE_GENERATIONS.cancel(
+                    generation_id,
+                    client_id,
+                    reason="Cancelled by the requesting browser tab",
+                )
+                get_ollama_coordinator().cancel_owner(
+                    f"web:{lease.generation_id}",
+                    reason="Cancelled by the requesting browser tab",
+                )
+                self.send_json_response(202, {
+                    "status": "cancelling",
+                    "generation_id": generation_id,
+                })
+            except GenerationOwnershipError as exc:
+                self.send_json_response(403, {"status": "error", "error": str(exc)})
+            except (KeyError, ValueError) as exc:
+                self.send_json_response(404, {"status": "error", "error": str(exc)})
+            return
+
+        if path == '/api/chat':
+            lease = None
+            generator = None
+            terminal_state = TerminalState.FAILED
+            terminal_detail = "Generation did not start"
+            active_name = "Active Session"
+            try:
+                body = self.read_json_body()
+                client_id = self._client_id(body)
+                user_input = str(body.get("message", "")).strip()
+                if not user_input:
+                    raise ValueError("Message cannot be empty")
+                # Session identity creation, generation ownership, and delete
+                # use one short lifecycle lock. This closes both the blank-chat
+                # duplicate race and the delete-then-recreate TOCTOU window.
+                with _SESSION_LIFECYCLE_LOCK:
+                    requested_name = os.path.basename(str(body.get("session_name", "")))
+                    view = CLIENT_SESSIONS.snapshot(client_id)
+                    aliases = {"", "Active Session", "New conversation"}
+                    if requested_name == view.active_session_name or requested_name in aliases:
+                        generation_session_name = view.active_session_name
+                        generation_session = deepcopy(view.session)
+                        generation_history = deepcopy(view.history)
+                    else:
+                        generation_session, generation_history = _read_session_snapshot(requested_name)
+                        generation_session_name = requested_name
+                        CLIENT_SESSIONS.select(
+                            client_id,
+                            requested_name,
+                            generation_session,
+                            generation_history,
+                        )
+
+                    # Give an unsaved conversation a stable disk/session
+                    # identity before acquiring ownership.
+                    if generation_session_name in aliases:
+                        old_name = generation_session_name
+                        generation_session_name = save_session_snapshot(
+                            generation_session_name,
+                            generation_session,
+                            generation_history,
+                        )
+                        CLIENT_SESSIONS.commit_generation(
+                            client_id,
+                            old_name,
+                            generation_session_name,
+                            generation_session,
+                            generation_history,
+                        )
+                    active_name = generation_session_name
+                    generation_start_settings = deepcopy(generation_session)
+                    lease = ACTIVE_GENERATIONS.begin(
+                        generation_session_name,
+                        client_id,
+                        body.get("generation_id"),
+                    )
+            except GenerationConflict as exc:
+                self.send_json_response(409, {"status": "error", "error": str(exc)})
+                return
+            except Exception as exc:
+                self.send_json_response(400, {"status": "error", "error": str(exc)})
+                return
+
+            try:
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/event-stream')
+                self.send_header('Cache-Control', 'no-cache')
+                self.send_header('Connection', 'close')
+                self.send_header('X-Accel-Buffering', 'no')
+                allowed_origin = os.environ.get('ALLOWED_ORIGIN')
+                if allowed_origin:
+                    self.send_header('Access-Control-Allow-Origin', allowed_origin)
+                self.end_headers()
+
+                generator = generate_chat_events(
                     user_input,
                     generation_session,
                     generation_history,
                     generation_session_name,
-                ):
+                    cancellation_token=lease.token,
+                    generation_id=lease.generation_id,
+                    publish_global=client_id == LEGACY_CLIENT_ID,
+                    client_id=client_id,
+                )
+                for event in generator:
+                    if event.get("type") == "done":
+                        active_name = str(event.get("active_session_name") or active_name)
+                        try:
+                            terminal_state = TerminalState(event.get("state", "completed"))
+                        except ValueError:
+                            terminal_state = TerminalState.FAILED
+                        terminal_detail = event.get("error")
                     data_line = f"data: {json.dumps(event)}\n\n"
                     self.wfile.write(data_line.encode('utf-8'))
                     self.wfile.flush()
             except (BrokenPipeError, ConnectionResetError):
-                pass
-            return
-            
-        # 3. Save Session
-        elif self.path == '/api/save-session':
-            try:
-                body = self.read_json_body()
-                name = body.get("name", "").strip()
-                filename = save_session(name)
-                self.send_json_response(200, {"status": "success", "filename": filename})
-            except Exception as e:
-                self.send_json_response(500, {"status": "error", "error": str(e)})
-            return
-            
-        # 4. Load Session
-        elif self.path == '/api/load-session':
-            try:
-                body = self.read_json_body()
-                name = body.get("name", "").strip()
-                load_session(name)
-                self.send_json_response(200, {"status": "success"})
-            except Exception as e:
-                self.send_json_response(500, {"status": "error", "error": str(e)})
+                lease.token.cancel("Client disconnected")
+                terminal_state = TerminalState.CANCELLED
+                terminal_detail = "Client disconnected"
+            except Exception as exc:
+                terminal_state = TerminalState.CANCELLED if lease.token.cancelled else TerminalState.FAILED
+                terminal_detail = lease.token.reason if lease.token.cancelled else str(exc)
+            finally:
+                if generator is not None:
+                    try:
+                        generator.close()
+                    except Exception:
+                        pass
+                CLIENT_SESSIONS.commit_generation(
+                    client_id,
+                    generation_session_name,
+                    active_name,
+                    generation_session,
+                    generation_history,
+                    generation_start_settings,
+                )
+                self._publish_legacy_view(client_id)
+                ACTIVE_GENERATIONS.finish(lease, terminal_state, terminal_detail)
+                self.close_connection = True
             return
 
-        # 5. Start a fresh session after safely persisting the current one
-        elif self.path == '/api/new-session':
-            autosave_session()
-            GLOBAL_STATE["history"] = []
-            GLOBAL_STATE["active_session_name"] = "Active Session"
+        try:
+            body = self.read_json_body() if self.headers.get('Content-Length') else {}
+            client_id = self._client_id(body)
+        except Exception as exc:
+            self.send_json_response(400, {"status": "error", "error": str(exc)})
+            return
+
+        if path == '/api/save-session':
+            try:
+                view = CLIENT_SESSIONS.snapshot(client_id)
+                filename = save_session(
+                    str(body.get("name", "")).strip(),
+                    view.session,
+                    view.history,
+                    client_id,
+                )
+                self._publish_legacy_view(client_id)
+                self.send_json_response(200, {"status": "success", "filename": filename})
+            except Exception as exc:
+                self.send_json_response(500, {"status": "error", "error": str(exc)})
+            return
+
+        if path == '/api/load-session':
+            try:
+                load_session(str(body.get("name", "")).strip(), client_id)
+                self._publish_legacy_view(client_id)
+                view = CLIENT_SESSIONS.snapshot(client_id)
+                self.send_json_response(200, {
+                    "status": "success",
+                    "settings": view.session,
+                    "history": view.history,
+                    "active_session_name": view.active_session_name,
+                })
+            except Exception as exc:
+                self.send_json_response(404, {"status": "error", "error": str(exc)})
+            return
+
+        if path == '/api/new-session':
+            autosave_session(client_id)
+            view = CLIENT_SESSIONS.new_session(client_id)
+            self._publish_legacy_view(client_id)
             self.send_json_response(200, {
                 "status": "success",
+                "settings": view.session,
                 "saved_sessions": list_saved_sessions(),
+                "active_session_name": view.active_session_name,
             })
             return
 
-        # 6. Permanently delete a saved conversation
-        elif self.path == '/api/delete-session':
+        if path == '/api/delete-session':
+            name = os.path.basename(str(body.get("name", "")))
             try:
-                body = self.read_json_body()
-                name = os.path.basename(body.get("name", ""))
-                if not name or name not in list_saved_sessions():
-                    raise FileNotFoundError("Session not found")
-                os.remove(os.path.join(_SESSIONS_DIR, name))
-                if GLOBAL_STATE["active_session_name"] == name:
-                    GLOBAL_STATE["history"] = []
-                    GLOBAL_STATE["active_session_name"] = "Active Session"
+                delete_error = None
+                with _SESSION_LIFECYCLE_LOCK:
+                    if not name or name not in list_saved_sessions():
+                        delete_error = (404, "Session not found")
+                    elif not ACTIVE_GENERATIONS.wait_for_session_idle(name, client_id, 1.0):
+                        delete_error = (
+                            409,
+                            "Session still has an active generation; cancel it before deletion",
+                        )
+                    else:
+                        with _session_lock(name):
+                            os.remove(os.path.join(_SESSIONS_DIR, name))
+                        CLIENT_SESSIONS.remove_session(name)
+                if delete_error is not None:
+                    status, error = delete_error
+                    self.send_json_response(status, {"status": "error", "error": error})
+                    return
+                self._publish_legacy_view(client_id)
+                view = CLIENT_SESSIONS.snapshot(client_id)
                 self.send_json_response(200, {
                     "status": "success",
                     "saved_sessions": list_saved_sessions(),
-                    "active_session_name": GLOBAL_STATE["active_session_name"],
+                    "active_session_name": view.active_session_name,
                 })
-            except Exception as e:
-                self.send_json_response(404, {"status": "error", "error": str(e)})
+            except OSError as exc:
+                self.send_json_response(500, {"status": "error", "error": str(exc)})
             return
-            
-        # 7. Clear Session history
-        elif self.path == '/api/clear-session':
-            GLOBAL_STATE["history"].clear()
-            GLOBAL_STATE["session"]["system"] = ""
-            GLOBAL_STATE["active_session_name"] = "Active Session"
-            self.send_json_response(200, {"status": "success"})
+
+        if path == '/api/clear-session':
+            view = CLIENT_SESSIONS.snapshot(client_id)
+            settings = deepcopy(view.session)
+            settings["system"] = ""
+            cleared = CLIENT_SESSIONS.select(client_id, "Active Session", settings, [])
+            self._publish_legacy_view(client_id)
+            self.send_json_response(200, {
+                "status": "success",
+                "settings": cleared.session,
+                "active_session_name": cleared.active_session_name,
+            })
             return
-            
-        else:
-            self.send_error(404, "Not Found")
+
+        self.send_error(404, "Not Found")
 
 
 # ── Threaded HTTP Server ──────────────────────────────────────────────
@@ -1320,6 +2010,7 @@ class AgentHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
 class ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
     """A threading version of the standard HTTPServer to handle concurrent requests."""
     daemon_threads = True
+    block_on_close = False
 
 
 def find_free_port() -> int:
@@ -1343,21 +2034,24 @@ def start_web_server():
     saved_sessions = list_saved_sessions()
     if saved_sessions:
         try:
-            filepath = os.path.join(_SESSIONS_DIR, saved_sessions[0])
-            with open(filepath, "r", encoding="utf-8") as stream:
-                saved_session = json.load(stream).get("session", {})
-            GLOBAL_STATE["session"] = {
-                **GLOBAL_STATE["session"],
-                **saved_session,
-                "options": {
-                    **GLOBAL_STATE["session"].get("options", {}),
-                    **saved_session.get("options", {}),
-                },
-            }
-        except (OSError, AttributeError, TypeError, json.JSONDecodeError):
+            saved_session, _saved_history = _read_session_snapshot(saved_sessions[0])
+            GLOBAL_STATE["session"] = _normalize_session_settings(
+                saved_session,
+                fallback=GLOBAL_STATE["session"],
+            )
+        except PersistenceError as exc:
+            print(f"Preserved malformed session settings: {exc}")
+        except (OSError, ValueError, RuntimeConfigurationError):
             pass
     GLOBAL_STATE["history"] = []
     GLOBAL_STATE["active_session_name"] = "Active Session"
+    CLIENT_SESSIONS.set_default_session(GLOBAL_STATE["session"])
+    CLIENT_SESSIONS.select(
+        LEGACY_CLIENT_ID,
+        "Active Session",
+        GLOBAL_STATE["session"],
+        [],
+    )
 
     # Attempt to bind to default port 5005 first, then fall back to random port
     host = '127.0.0.1'
@@ -1366,10 +2060,10 @@ def start_web_server():
         
     try:
         server = ThreadingHTTPServer((host, 5005), AgentHTTPRequestHandler)
-        port = 5005
     except OSError:
-        port = find_free_port()
-        server = ThreadingHTTPServer((host, port), AgentHTTPRequestHandler)
+        # Binding directly to port 0 avoids a find-then-bind race.
+        server = ThreadingHTTPServer((host, 0), AgentHTTPRequestHandler)
+    port = int(server.server_address[1])
         
     url = f"http://127.0.0.1:{port}"
     print(f"\n🚀 Starting Selene Web Interface at {url}")
@@ -1391,12 +2085,35 @@ def start_web_server():
         
         def open_browser():
             time.sleep(0.5)
-            webbrowser.open(url)
+            result = open_url_native(url)
+            if not result.ok:
+                print(f"Could not open the browser automatically: {result.error}")
             
         threading.Thread(target=open_browser, daemon=True).start()
     
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
+    previous_handlers: dict[int, object] = {}
+
+    def request_shutdown(signum, _frame):
         print("\nStopping web server...")
+        ACTIVE_GENERATIONS.cancel_all("Selene is shutting down")
+        # HTTPServer.shutdown must run outside the serve_forever thread.
+        threading.Thread(target=server.shutdown, daemon=True).start()
+
+    if threading.current_thread() is threading.main_thread():
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            try:
+                previous_handlers[signum] = signal.signal(signum, request_shutdown)
+            except (OSError, ValueError):
+                pass
+    try:
+        server.serve_forever(poll_interval=0.2)
+    finally:
+        ACTIVE_GENERATIONS.cancel_all("Selene web server stopped")
         server.server_close()
+        for signum, handler in previous_handlers.items():
+            try:
+                signal.signal(signum, handler)
+            except (OSError, ValueError):
+                pass
+        get_ollama_coordinator().shutdown(cancel_active=True, wait=True, timeout=5)
+        shutdown_tool_runner(wait=False)

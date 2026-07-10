@@ -6,6 +6,7 @@ import json
 import os
 from typing import Any, Dict, List
 
+from agent.cancellation import CancellationToken, OperationCancelled
 from tools.vault_embeddings import DEFAULT_EMBED_MODEL, embed_query
 from tools.vault_indexer import CHROMA_DIR, get_chroma_client, resolve_vault_alias
 
@@ -28,8 +29,12 @@ def _positive_int(value: int | str | None, default: int, minimum: int = 1, maxim
     return parsed
 
 
-def _embed_query(text: str, model: str = DEFAULT_EMBED_MODEL) -> List[float]:
-    return embed_query(text, model=model)
+def _embed_query(
+    text: str,
+    model: str = DEFAULT_EMBED_MODEL,
+    cancellation_token: CancellationToken | None = None,
+) -> List[float]:
+    return embed_query(text, model=model, cancellation_token=cancellation_token)
 
 
 def _query_collection(
@@ -38,7 +43,10 @@ def _query_collection(
     model: str,
     top_k: int,
     source: str | None = None,
+    cancellation_token: CancellationToken | None = None,
 ) -> Dict[str, Any]:
+    if cancellation_token:
+        cancellation_token.raise_if_cancelled()
     client = get_chroma_client()
     try:
         collection = client.get_collection(name=collection_name)
@@ -50,7 +58,7 @@ def _query_collection(
     collection_count = collection.count()
     if collection_count == 0:
         return {"documents": [[]], "metadatas": [[]], "distances": [[]]}
-    emb = _embed_query(query, model=model)
+    emb = _embed_query(query, model=model, cancellation_token=cancellation_token)
     fetch_k = min(top_k, collection_count)
     where = None
     if source:
@@ -68,6 +76,8 @@ def _query_collection(
         kwargs["where"] = where
         
     results = collection.query(**kwargs)
+    if cancellation_token:
+        cancellation_token.raise_if_cancelled()
     
     if source and not os.path.isabs(source):
         source_lower = source.lower()
@@ -146,6 +156,7 @@ def search_vault(
     collection: str | None = None,
     max_chars: int = DEFAULT_MAX_CHARS,
     source: str | None = None,
+    cancellation_token: CancellationToken | None = None,
 ) -> str:
     """
     Search the indexed vault and return relevant snippets in a compact JSON format.
@@ -189,6 +200,7 @@ def search_vault(
             model=model,
             top_k=top_k_int,
             source=source,
+            cancellation_token=cancellation_token,
         )
         matches, context = _flatten_results(results, max_chars=max_chars_int)
         return _json({
@@ -200,6 +212,8 @@ def search_vault(
             "context": context,
             "guidance": "Use source and chunk_index/char offsets to cite or retrieve nearby content with read_file/read_document when needed.",
         })
+    except OperationCancelled:
+        raise
     except Exception as exc:
         return _json({"error": str(exc), "collection": collection_name, "persist_directory": CHROMA_DIR})
 

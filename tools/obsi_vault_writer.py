@@ -5,7 +5,9 @@ import os
 import re
 import unicodedata
 
-DATA_DIR = os.path.abspath(os.path.expanduser(os.environ.get("SELENE_DATA_DIR", "~/.selene-agent")))
+from agent.platform_runtime import get_runtime_paths
+
+DATA_DIR = str(get_runtime_paths().data_dir)
 VAULTS_DIR = os.path.join(DATA_DIR, "vaults")
 
 def _json(data: dict) -> str:

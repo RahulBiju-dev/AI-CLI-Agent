@@ -1,0 +1,411 @@
+{
+  "base_commit": "b06c7be5f5f3723cb1471f5d8a0abfb27bf50220",
+  "primary_platform": "fedora-linux",
+  "secondary_platforms": [
+    "windows"
+  ],
+  "core_changes": [
+    "Central runtime profiles and override precedence with a conservative 4 GiB fallback",
+    "Process-wide cancellation-aware Ollama coordinator and local API service",
+    "Staged managed-model lifecycle with normalized Modelfile hash metadata",
+    "End-to-end context accounting and request-specific compact tool schemas",
+    "Per-client session snapshots and owned generation lifecycle with terminal SSE states",
+    "Metadata-driven bounded tool runner with ordering, cancellation, timeouts, and deduplication",
+    "Fedora-first and Windows-native platform contracts for paths, processes, terminals, apps, and browsers",
+    "Fedora DBus Spotify backend preserved with explicit Windows capability behavior",
+    "Atomic critical persistence with malformed-data preservation",
+    "Coordinated embeddings, vision, vault, codebase, and routine execution",
+    "Electron exact-child ownership, readiness, singleton, and owner-token shutdown",
+    "Cross-platform PyInstaller and electron-builder configuration foundations"
+  ],
+  "files_changed": [
+    ".gitignore",
+    "Modelfile",
+    "PHASE1_HANDOFF.md",
+    "PHASE1_HANDOFF.json",
+    "main.py",
+    "agent/cancellation.py",
+    "agent/core.py",
+    "agent/model_lifecycle.py",
+    "agent/ollama_runtime.py",
+    "agent/persistence.py",
+    "agent/platform_runtime.py",
+    "agent/runtime_config.py",
+    "agent/static/app.js",
+    "agent/static/index.html",
+    "agent/tool_runner.py",
+    "agent/web.py",
+    "agent/web_runtime.py",
+    "electron/build_desktop.py",
+    "electron/main.js",
+    "package.json",
+    "requirements.txt",
+    "selene-backend.spec",
+    "tests/test_automated_routine_executor.py",
+    "tests/test_context_budget.py",
+    "tests/test_main.py",
+    "tests/test_model_lifecycle.py",
+    "tests/test_native_desktop_backends.py",
+    "tests/test_ollama_runtime.py",
+    "tests/test_persistence.py",
+    "tests/test_platform_runtime.py",
+    "tests/test_runtime_config.py",
+    "tests/test_tool_runner.py",
+    "tests/test_web_runtime.py",
+    "tools/app_launcher.py",
+    "tools/automated_routine_executor.py",
+    "tools/browser.py",
+    "tools/codebase_indexer.py",
+    "tools/google_workspace.py",
+    "tools/obsi_vault_writer.py",
+    "tools/registry.py",
+    "tools/spotify.py",
+    "tools/terminal_launcher.py",
+    "tools/vault_embeddings.py",
+    "tools/vault_indexer.py",
+    "tools/vault_search.py",
+    "tools/vision_describer.py"
+  ],
+  "tests_run": [
+    "119 final focused unittest tests passed",
+    "earlier unittest discovery: 110 passed, 1 pre-existing pytest import error",
+    "full repository Python compileall passed",
+    "core, CLI, web, and runtime imports passed",
+    "Bun frontend bundle passed",
+    "Electron main and preload syntax passed",
+    "desktop build-helper configuration smoke passed",
+    "tool registry contract passed",
+    "git diff --check passed"
+  ],
+  "registered_tools": [
+    {
+      "name": "get_current_datetime",
+      "module": "tools.current_datetime",
+      "phase1_status": "complete",
+      "fedora_status": "supported",
+      "windows_status": "supported",
+      "remaining_tasks": [],
+      "recommended_tests": ["timezone and temporal-preflight ordering"]
+    },
+    {
+      "name": "spreadsheet",
+      "module": "tools.spreadsheet",
+      "phase1_status": "partial",
+      "fedora_status": "supported",
+      "windows_status": "supported",
+      "remaining_tasks": ["locked-file and atomic output audit"],
+      "recommended_tests": ["Windows locked workbook and Unicode path"]
+    },
+    {
+      "name": "web_search",
+      "module": "tools.search",
+      "phase1_status": "partial",
+      "fedora_status": "supported",
+      "windows_status": "supported",
+      "remaining_tasks": ["dependency and network-error matrix"],
+      "recommended_tests": ["timeout, cancellation, and missing ddgs"]
+    },
+    {
+      "name": "web_scrape",
+      "module": "tools.web_scraper",
+      "phase1_status": "partial",
+      "fedora_status": "supported",
+      "windows_status": "supported",
+      "remaining_tasks": ["network and parser compatibility audit"],
+      "recommended_tests": ["timeout, malformed response, and output bound"]
+    },
+    {
+      "name": "read_document",
+      "module": "tools.document",
+      "phase1_status": "partial",
+      "fedora_status": "supported",
+      "windows_status": "supported",
+      "remaining_tasks": ["optional parser and locked-file matrix"],
+      "recommended_tests": ["PDF and DOCX Unicode paths on Windows"]
+    },
+    {
+      "name": "read_file",
+      "module": "tools.file",
+      "phase1_status": "partial",
+      "fedora_status": "supported",
+      "windows_status": "supported",
+      "remaining_tasks": ["long-path and UNC integration audit"],
+      "recommended_tests": ["drive, UNC, symlink, and Unicode paths"]
+    },
+    {
+      "name": "create_file",
+      "module": "tools.file",
+      "phase1_status": "partial",
+      "fedora_status": "supported",
+      "windows_status": "supported",
+      "remaining_tasks": ["apply shared reserved-name validation to every output path"],
+      "recommended_tests": ["Windows reserved names, locked target, and trailing period"]
+    },
+    {
+      "name": "spotify_play",
+      "module": "tools.spotify",
+      "phase1_status": "complete",
+      "fedora_status": "supported",
+      "windows_status": "partial",
+      "remaining_tasks": ["optional richer native Windows control backend"],
+      "recommended_tests": ["real Fedora DBus and Windows URI smoke"]
+    },
+    {
+      "name": "open_browser",
+      "module": "tools.browser",
+      "phase1_status": "complete",
+      "fedora_status": "supported",
+      "windows_status": "supported",
+      "remaining_tasks": [],
+      "recommended_tests": ["native Fedora and Windows default-browser smoke"]
+    },
+    {
+      "name": "view_code",
+      "module": "tools.code",
+      "phase1_status": "partial",
+      "fedora_status": "supported",
+      "windows_status": "supported",
+      "remaining_tasks": ["Windows path and optional parser audit"],
+      "recommended_tests": ["mixed separators, drive paths, and output limits"]
+    },
+    {
+      "name": "describe_image",
+      "module": "tools.vision_describer",
+      "phase1_status": "complete",
+      "fedora_status": "supported",
+      "windows_status": "supported",
+      "remaining_tasks": ["artifact-level optional dependency smoke"],
+      "recommended_tests": ["coordinator serialization and cancellation with mocked vision"]
+    },
+    {
+      "name": "open_terminal_at_path",
+      "module": "tools.terminal_launcher",
+      "phase1_status": "complete",
+      "fedora_status": "supported",
+      "windows_status": "supported",
+      "remaining_tasks": ["real native terminal smoke on both platforms"],
+      "recommended_tests": ["spaces, Unicode, and backend preference order"]
+    },
+    {
+      "name": "launch_apps",
+      "module": "tools.app_launcher",
+      "phase1_status": "partial",
+      "fedora_status": "supported",
+      "windows_status": "partial",
+      "remaining_tasks": ["validate resolved Windows shortcut targets and broaden bounded registered-app discovery"],
+      "recommended_tests": ["desktop entries, shortcut targets, Start Menu records, and policy rejection"]
+    },
+    {
+      "name": "open_app",
+      "module": "tools.app_launcher",
+      "phase1_status": "partial",
+      "fedora_status": "supported",
+      "windows_status": "partial",
+      "remaining_tasks": ["validate resolved Windows shortcut targets and broaden bounded registered-app discovery"],
+      "recommended_tests": ["single-app aliases, shortcut targets, and policy rejection"]
+    },
+    {
+      "name": "google_workspace",
+      "module": "tools.google_workspace",
+      "phase1_status": "partial",
+      "fedora_status": "supported",
+      "windows_status": "supported",
+      "remaining_tasks": ["native OAuth/browser and packaged credential smoke"],
+      "recommended_tests": ["atomic encrypted state and missing credentials"]
+    },
+    {
+      "name": "codebase_indexer",
+      "module": "tools.codebase_indexer",
+      "phase1_status": "complete",
+      "fedora_status": "supported",
+      "windows_status": "supported",
+      "remaining_tasks": ["real Windows path and locked-index smoke"],
+      "recommended_tests": ["cancelled refresh preserves old index"]
+    },
+    {
+      "name": "index_vault",
+      "module": "tools.vault_indexer",
+      "phase1_status": "complete",
+      "fedora_status": "supported",
+      "windows_status": "supported",
+      "remaining_tasks": ["third-party blocking-call cancellation characterization"],
+      "recommended_tests": ["failure preserves old collection and metadata"]
+    },
+    {
+      "name": "vault_search",
+      "module": "tools.vault_search",
+      "phase1_status": "complete",
+      "fedora_status": "supported",
+      "windows_status": "supported",
+      "remaining_tasks": ["artifact-level Chroma dependency smoke"],
+      "recommended_tests": ["embedding serialization and cancellation"]
+    },
+    {
+      "name": "delete_vault_item",
+      "module": "tools.vault_indexer",
+      "phase1_status": "complete",
+      "fedora_status": "supported",
+      "windows_status": "supported",
+      "remaining_tasks": [],
+      "recommended_tests": ["confirmation and locked-store failure"]
+    },
+    {
+      "name": "list_vaults",
+      "module": "tools.vault_indexer",
+      "phase1_status": "complete",
+      "fedora_status": "supported",
+      "windows_status": "supported",
+      "remaining_tasks": [],
+      "recommended_tests": ["malformed alias metadata preservation"]
+    },
+    {
+      "name": "list_vault_aliases",
+      "module": "tools.vault_indexer",
+      "phase1_status": "complete",
+      "fedora_status": "supported",
+      "windows_status": "supported",
+      "remaining_tasks": [],
+      "recommended_tests": ["Unicode aliases and deterministic ordering"]
+    },
+    {
+      "name": "create_structured_note",
+      "module": "tools.obsi_vault_writer",
+      "phase1_status": "partial",
+      "fedora_status": "supported",
+      "windows_status": "supported",
+      "remaining_tasks": ["all Windows filename and locked-target cases"],
+      "recommended_tests": ["reserved names, Unicode, symlink containment, and collision"]
+    },
+    {
+      "name": "knowledge_graph_builder",
+      "module": "tools.knowledge_graph_builder",
+      "phase1_status": "partial",
+      "fedora_status": "supported",
+      "windows_status": "supported",
+      "remaining_tasks": ["repetitive compatibility audit"],
+      "recommended_tests": ["resource limits and deterministic output"]
+    },
+    {
+      "name": "run_simulation",
+      "module": "tools.run_simulation",
+      "phase1_status": "partial",
+      "fedora_status": "supported",
+      "windows_status": "supported",
+      "remaining_tasks": ["repetitive compatibility audit"],
+      "recommended_tests": ["CPU bounds, cancellation expectations, and malformed equations"]
+    },
+    {
+      "name": "api_orchestrator",
+      "module": "tools.api_orchestrator",
+      "phase1_status": "partial",
+      "fedora_status": "supported",
+      "windows_status": "supported",
+      "remaining_tasks": ["network cancellation and privacy audit"],
+      "recommended_tests": ["timeouts, secret policy, and alternative ordering"]
+    },
+    {
+      "name": "context_memory_optimizer",
+      "module": "tools.context_memory_optimizer",
+      "phase1_status": "partial",
+      "fedora_status": "supported",
+      "windows_status": "supported",
+      "remaining_tasks": ["repetitive compatibility audit"],
+      "recommended_tests": ["bounded input and deterministic compaction"]
+    },
+    {
+      "name": "reasoning_chain_debugger",
+      "module": "tools.reasoning_chain_debugger",
+      "phase1_status": "partial",
+      "fedora_status": "supported",
+      "windows_status": "supported",
+      "remaining_tasks": ["repetitive compatibility and privacy audit"],
+      "recommended_tests": ["bounded output and private-data redaction"]
+    },
+    {
+      "name": "automated_routine_executor",
+      "module": "tools.automated_routine_executor",
+      "phase1_status": "complete",
+      "fedora_status": "supported",
+      "windows_status": "supported",
+      "remaining_tasks": ["real Windows child-tree smoke"],
+      "recommended_tests": ["nested runner, cancellation, timeout, and confirmation"]
+    }
+  ],
+  "phase2_tasks": [
+    {
+      "priority": "P0",
+      "platform": "windows",
+      "file": "agent/platform_runtime.py",
+      "task": "Run native Windows 10 and 11 integration tests for runtime paths, terminals, shortcut-target-safe apps, browser/Spotify capability results, and exact process-tree termination.",
+      "acceptance_criteria": "All supported native operations work without WSL or shell interpolation, shortcut targets are validated, and failures report the actual capability."
+    },
+    {
+      "priority": "P0",
+      "platform": "shared",
+      "file": "electron/main.js",
+      "task": "Build and smoke-test one Fedora AppImage and one Windows NSIS artifact.",
+      "acceptance_criteria": "Bundled backend discovery, port readiness, singleton behavior, clean exact-owner shutdown, hidden Windows console, and user-data survival are verified."
+    },
+    {
+      "priority": "P0",
+      "platform": "shared",
+      "file": "agent/tool_runner.py",
+      "task": "Expand non-cooperative timeout, shutdown, nested execution, idempotency, exception-after-effect uncertainty, and side-effect ordering tests.",
+      "acceptance_criteria": "Uncertain work cannot trigger later unsafe effects and shutdown remains bounded without deadlock."
+    },
+    {
+      "priority": "P1",
+      "platform": "windows",
+      "file": "agent/platform_runtime.py",
+      "task": "Complete drive, mixed-separator, Unicode, reserved-name, locked-file, long-path, and supported UNC integration coverage.",
+      "acceptance_criteria": "Every operation that claims Windows support has explicit passing path and failure tests."
+    },
+    {
+      "priority": "P1",
+      "platform": "shared",
+      "file": "agent/core.py",
+      "task": "Expand natural-language recall tests for request-specific tool-schema selection.",
+      "acceptance_criteria": "Each registered model-exposed tool is selected for representative phrasing without exceeding low-VRAM first-turn context."
+    },
+    {
+      "priority": "P1",
+      "platform": "shared",
+      "file": "tests/test_terminal_launcher.py",
+      "task": "Resolve the pre-existing pytest collection dependency and run Fedora and Windows test matrices.",
+      "acceptance_criteria": "Default full-suite discovery completes without collection errors on both platforms."
+    },
+    {
+      "priority": "P1",
+      "platform": "shared",
+      "file": "selene-backend.spec",
+      "task": "Audit packaged hidden imports, direct build/publish scripts, and optional native dependencies, then align artifact version naming.",
+      "acceptance_criteria": "Clean-machine artifacts start and surface optional dependency failures without startup crashes."
+    },
+    {
+      "priority": "P1",
+      "platform": "shared",
+      "file": "agent/web.py",
+      "task": "Repair legacy /vault compatibility aliases that reference obsolete dispatch names.",
+      "acceptance_criteria": "Every documented vault slash subcommand uses a registered tool path and has a bounded compatibility test."
+    },
+    {
+      "priority": "P1",
+      "platform": "shared",
+      "file": "agent/core.py",
+      "task": "Normalize malformed Ollama stream chunk failures into controlled CLI errors.",
+      "acceptance_criteria": "Unexpected local API response shapes do not terminate the CLI process without a controlled diagnostic."
+    },
+    {
+      "priority": "P2",
+      "platform": "shared",
+      "file": "README.md",
+      "task": "Complete documentation, migration notes, final support matrices, CI expansion, and repetitive per-tool cleanup.",
+      "acceptance_criteria": "Phase 2 documentation and CI truthfully match verified Fedora and Windows behavior."
+    }
+  ],
+  "known_failures": [
+    "Pre-existing tests/test_terminal_launcher.py collection error: pytest is not installed in the inspected environment.",
+    "nvidia-smi returned no usable VRAM data on the inspected host; automatic selection safely fell back to low-vram.",
+    "No live model generation, staged model rebuild, model download, personal data access, OAuth, AppImage build, or Windows NSIS build was performed in Phase 1."
+  ]
+}

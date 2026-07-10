@@ -3,10 +3,9 @@
 from __future__ import annotations
 
 import json
-import shutil
-import subprocess
-import sys
 from pathlib import Path
+
+from agent.platform_runtime import select_terminal_command, spawn_detached
 
 
 def _resolve_directory(path: object) -> Path:
@@ -30,25 +29,11 @@ def _resolve_directory(path: object) -> Path:
 
 
 def _linux_terminal_command(directory: Path) -> tuple[list[str], str] | None:
-    """Select an installed terminal and its native working-directory option."""
-    path = str(directory)
-    candidates = (
-        ("ptyxis", ["--new-window", "--working-directory", path]),
-        ("gnome-terminal", ["--working-directory", path]),
-        ("kgx", ["--working-directory", path]),
-        ("konsole", ["--workdir", path]),
-        ("xfce4-terminal", ["--working-directory", path]),
-        ("kitty", ["--directory", path]),
-        ("alacritty", ["--working-directory", path]),
-        # xterm inherits the child process working directory. No command is
-        # passed to it, so this fallback cannot become shell execution.
-        ("xterm", []),
-    )
-    for name, arguments in candidates:
-        executable = shutil.which(name)
-        if executable:
-            return [executable, *arguments], name
-    return None
+    """Compatibility wrapper around the Fedora-native terminal selector."""
+    selected = select_terminal_command(directory, platform_name="linux")
+    if selected is None:
+        return None
+    return list(selected.argv), selected.backend
 
 
 def open_terminal_at_path(path: str, confirmed: bool = False) -> str:
@@ -65,36 +50,26 @@ def open_terminal_at_path(path: str, confirmed: bool = False) -> str:
         return json.dumps({"error": str(exc)})
 
     try:
-        if sys.platform == "darwin":
-            command = ["/usr/bin/open", "-a", "Terminal", str(directory)]
-            terminal_name = "Terminal"
-        elif sys.platform == "win32":
-            executable = shutil.which("wt.exe") or shutil.which("wt")
-            if not executable:
-                return json.dumps({
-                    "error": "Windows Terminal is required to open a terminal at a directory safely."
-                })
-            command = [executable, "-d", str(directory)]
-            terminal_name = "Windows Terminal"
-        else:
-            selected = _linux_terminal_command(directory)
-            if selected is None:
-                return json.dumps({"error": "No supported terminal emulator is installed."})
-            command, terminal_name = selected
-
-        subprocess.Popen(
-            command,
+        selected = select_terminal_command(directory)
+        if selected is None:
+            return json.dumps({
+                "error": "No supported native terminal is installed.",
+                "supported_backends": {
+                    "fedora_linux": ["GNOME Console", "GNOME Terminal", "Konsole", "Xfce Terminal", "Ptyxis"],
+                    "windows": ["Windows Terminal", "PowerShell 7", "Windows PowerShell", "Command Prompt"],
+                },
+            })
+        spawn_detached(
+            selected.argv,
             cwd=directory,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
+            new_console=selected.new_console,
         )
         return json.dumps({
             "success": True,
-            "terminal": terminal_name,
+            "backend": selected.backend,
+            "terminal": selected.backend,
             "path": str(directory),
-            "message": f"Opened {terminal_name} at '{directory}'.",
+            "message": f"Sent a request to open {selected.backend} at '{directory}'; no command was executed.",
         }, ensure_ascii=False)
     except OSError as exc:
         return json.dumps({

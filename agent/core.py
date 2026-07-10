@@ -11,7 +11,6 @@ import json
 import os
 import re
 import shlex
-import subprocess
 from agent.terminal import (
     _console,
     _print_status,
@@ -36,25 +35,41 @@ try:
 except ImportError:
     pass
 
-import ollama
 from rich.live import Live
 
-from agent.tool_runner import ToolCallResult, ToolCallSpec, execute_tool_calls, normalize_tool_arguments
-from tools.registry import TOOL_DISPATCH, TOOL_SCHEMAS
+from agent.ollama_runtime import OllamaRuntimeError, OllamaService, OperationKind
+from agent.persistence import atomic_write_json, atomic_write_text
+from agent.platform_runtime import get_runtime_paths, resource_path
+from agent.runtime_config import RuntimeConfigurationError, RuntimeConfig, get_runtime_config
+from agent.tool_runner import (
+    ToolCallResult,
+    ToolCallSpec,
+    execute_tool_call,
+    execute_tool_calls,
+    normalize_tool_arguments,
+    normalize_tool_calls,
+)
+from tools.registry import TOOL_DISPATCH, TOOL_SCHEMAS, get_tool_metadata
 
 # ── Configuration ─────────────────────────────────────────────────────
 
-MODEL_NAME = "selene"
-_SESSIONS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "sessions")
-_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_DATA_DIR = os.environ.get("SELENE_DATA_DIR", os.path.expanduser("~/.selene-agent"))
+_RUNTIME_PATHS = get_runtime_paths()
+_BASE_RUNTIME_CONFIG = get_runtime_config()
+_OLLAMA_SERVICE = OllamaService(_BASE_RUNTIME_CONFIG)
+MODEL_NAME = _BASE_RUNTIME_CONFIG.chat_model
+_PROJECT_ROOT = str(resource_path("Modelfile").parent)
+_DATA_DIR = str(_RUNTIME_PATHS.data_dir)
+_SESSIONS_DIR = str(_RUNTIME_PATHS.data_dir / "sessions")
+_LEGACY_SESSIONS_DIR = os.path.join(_PROJECT_ROOT, "sessions")
 _SYSTEM_PROMPT_CACHE_FILE = os.path.join(_DATA_DIR, "system_prompt_cache.txt")
 _DEFAULT_SYSTEM_PROMPT: str | None = None
 _DEFAULT_SYSTEM_PROMPT_MTIME: float | None = None
-_COMPACT_TOOL_SCHEMAS_CACHE: dict[int, list[dict]] = {}
+_COMPACT_TOOL_SCHEMAS_CACHE: dict[str, list[dict]] = {}
+_SYSTEM_PROMPT_LOCK = threading.RLock()
+_COMPACT_TOOL_SCHEMAS_LOCK = threading.Lock()
 
-DEFAULT_NUM_CTX = 8192
-DEFAULT_NUM_PREDICT = 2048
+DEFAULT_NUM_CTX = _BASE_RUNTIME_CONFIG.num_ctx
+DEFAULT_NUM_PREDICT = _BASE_RUNTIME_CONFIG.num_predict
 MIN_RESPONSE_RESERVE_TOKENS = 256
 MIN_EMERGENCY_RESPONSE_TOKENS = 96
 CONTEXT_SAFETY_MARGIN_RATIO = 0.08
@@ -78,15 +93,110 @@ class ContextWindowError(RuntimeError):
     """Raised when a prompt cannot safely fit inside the configured context."""
 
 # Parameters that accept float values via /set parameter
-_FLOAT_PARAMS = {"temperature", "top_p", "top_k", "repeat_penalty", "presence_penalty", "frequency_penalty", "min_p", "tfs_z"}
+_FLOAT_PARAMS = {"temperature", "top_p", "repeat_penalty", "presence_penalty", "frequency_penalty", "min_p", "tfs_z"}
 # Parameters that accept integer values via /set parameter
-_INT_PARAMS = {"num_ctx", "num_predict", "repeat_last_n", "seed", "num_gpu", "num_thread", "num_keep"}
+_INT_PARAMS = {"num_ctx", "num_predict", "num_batch", "top_k", "repeat_last_n", "seed", "num_gpu", "num_thread", "num_keep"}
 _ALL_PARAMS = _FLOAT_PARAMS | _INT_PARAMS
+_CENTRAL_OPTION_NAMES = set(_BASE_RUNTIME_CONFIG.ollama_options())
+_EXTRA_FLOAT_RANGES = {
+    "presence_penalty": (-2.0, 2.0),
+    "frequency_penalty": (-2.0, 2.0),
+    "min_p": (0.0, 1.0),
+    "tfs_z": (0.0, 2.0),
+}
+_EXTRA_INT_RANGES = {
+    "repeat_last_n": (-1, 131072),
+    "seed": (-1, 2_147_483_647),
+    "num_gpu": (-1, 1024),
+    "num_thread": (1, 512),
+    "num_keep": (0, 131072),
+}
 # terminal helpers (spinner, renderer, ANSI constants) are imported
 # from agent.terminal to keep terminal logic modular.
 
 # ── History management ────────────────────────────────────────────────
 # Keeps prompt size bounded so tok/s stays consistent across long sessions.
+
+
+def resolve_session_runtime(session: dict | None = None) -> RuntimeConfig:
+    """Resolve centralized settings with this session's explicit overrides."""
+    return get_runtime_config(session or {})
+
+
+def validate_session_options(options: dict | None) -> tuple[dict, tuple[str, ...]]:
+    """Validate persisted or interactive Ollama options without silent clamping."""
+    if options is None:
+        options = {}
+    if not isinstance(options, dict):
+        raise RuntimeConfigurationError("Session options must be a JSON object")
+
+    unknown = set(options) - _ALL_PARAMS
+    if unknown:
+        raise RuntimeConfigurationError(f"Unknown model option(s): {', '.join(sorted(unknown))}")
+
+    normalized: dict = {}
+    for name, value in options.items():
+        if name in _FLOAT_PARAMS:
+            if isinstance(value, bool):
+                raise RuntimeConfigurationError(f"{name} must be a number, not a boolean")
+            try:
+                normalized[name] = float(value)
+            except (TypeError, ValueError) as exc:
+                raise RuntimeConfigurationError(f"{name} must be a number") from exc
+        else:
+            if isinstance(value, bool):
+                raise RuntimeConfigurationError(f"{name} must be an integer, not a boolean")
+            try:
+                parsed = int(value)
+            except (TypeError, ValueError) as exc:
+                raise RuntimeConfigurationError(f"{name} must be an integer") from exc
+            if isinstance(value, float) and not value.is_integer():
+                raise RuntimeConfigurationError(f"{name} must be an integer")
+            normalized[name] = parsed
+
+    # Central settings are validated together, including num_ctx/num_predict
+    # headroom and detected-profile warnings.
+    runtime = get_runtime_config(normalized)
+    for name, bounds in _EXTRA_FLOAT_RANGES.items():
+        if name in normalized and not bounds[0] <= normalized[name] <= bounds[1]:
+            raise RuntimeConfigurationError(
+                f"{name} must be between {bounds[0]:g} and {bounds[1]:g}"
+            )
+    for name, bounds in _EXTRA_INT_RANGES.items():
+        if name in normalized and not bounds[0] <= normalized[name] <= bounds[1]:
+            raise RuntimeConfigurationError(
+                f"{name} must be between {bounds[0]} and {bounds[1]}"
+            )
+    if normalized.get("num_keep", 0) > runtime.num_ctx:
+        raise RuntimeConfigurationError("num_keep cannot exceed num_ctx")
+    return normalized, runtime.warnings
+
+
+def effective_model_options(options: dict | None = None) -> tuple[RuntimeConfig, dict]:
+    """Merge validated session overrides over the selected runtime profile."""
+    normalized, _warnings = validate_session_options(options)
+    runtime = get_runtime_config(normalized)
+    effective = runtime.ollama_options()
+    effective.update({
+        name: value for name, value in normalized.items()
+        if name not in _CENTRAL_OPTION_NAMES
+    })
+    return runtime, effective
+
+
+def effective_session_model_options(session: dict | None = None) -> tuple[RuntimeConfig, dict]:
+    """Resolve a complete session mapping, including an optional profile."""
+    session_data = session if isinstance(session, dict) else {}
+    normalized, _warnings = validate_session_options(session_data.get("options", {}))
+    runtime_input = dict(session_data)
+    runtime_input["options"] = normalized
+    runtime = get_runtime_config(runtime_input)
+    effective = runtime.ollama_options()
+    effective.update({
+        name: value for name, value in normalized.items()
+        if name not in _CENTRAL_OPTION_NAMES
+    })
+    return runtime, effective
 
 def _estimate_tokens(text: str) -> int:
     """Estimate the number of tokens in a string using a fast heuristic.
@@ -100,7 +210,14 @@ def _estimate_tokens(text: str) -> int:
     Returns:
         int: The estimated token count (~1 token per 4 characters).
     """
-    return len(text) // 4 + 1
+    value = str(text or "")
+    ascii_chars = sum(1 for character in value if ord(character) < 128)
+    non_ascii_chars = len(value) - ascii_chars
+    # Roughly four ASCII characters per token is typical for English/code.
+    # Non-ASCII scripts can approach one token per code point, so count those
+    # separately instead of letting a character-only heuristic under-budget
+    # multilingual prompts and Unicode-heavy tool results.
+    return ascii_chars // 4 + non_ascii_chars + 1
 
 
 def _estimate_message_tokens(message: dict) -> int:
@@ -144,18 +261,22 @@ def compact_tool_schemas(tools: list[dict] | None) -> list[dict] | None:
     """Return lean Ollama tool schemas for lower prompt overhead."""
     if not tools:
         return tools
-    cache_key = id(tools)
-    cached = _COMPACT_TOOL_SCHEMAS_CACHE.get(cache_key)
-    if cached is not None:
-        return cached
+    try:
+        cache_key = json.dumps(tools, ensure_ascii=False, sort_keys=True, default=str)
+    except TypeError:
+        cache_key = repr(tools)
+    with _COMPACT_TOOL_SCHEMAS_LOCK:
+        cached = _COMPACT_TOOL_SCHEMAS_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
 
     compact_tools: list[dict] = []
     for tool in tools:
         function = dict(tool.get("function") or {})
         parameters = _compact_json_schema(function.get("parameters") or {})
         description = str(function.get("description") or "").strip()
-        if len(description) > 220:
-            description = description[:217].rstrip() + "..."
+        if len(description) > 100:
+            description = description[:97].rstrip() + "..."
         compact_function = {
             "name": function.get("name"),
             "description": description,
@@ -163,8 +284,145 @@ def compact_tool_schemas(tools: list[dict] | None) -> list[dict] | None:
         }
         compact_tools.append({"type": "function", "function": compact_function})
 
-    _COMPACT_TOOL_SCHEMAS_CACHE[cache_key] = compact_tools
+    with _COMPACT_TOOL_SCHEMAS_LOCK:
+        # Bound request-specific schema combinations in a long-running server.
+        if len(_COMPACT_TOOL_SCHEMAS_CACHE) >= 16:
+            _COMPACT_TOOL_SCHEMAS_CACHE.clear()
+        _COMPACT_TOOL_SCHEMAS_CACHE[cache_key] = compact_tools
     return compact_tools
+
+
+_DEFAULT_TOOL_NAMES = (
+    "get_current_datetime",
+    "web_search",
+    "read_file",
+    "vault_search",
+    "list_vaults",
+)
+_TOOL_SELECTION_STOPWORDS = {
+    "and", "are", "but", "can", "for", "from", "how", "into", "its",
+    "please", "that", "the", "their", "then", "this", "use", "what",
+    "when", "where", "which", "with", "would", "you", "your",
+}
+_TOOL_KEYWORD_HINTS = {
+    "get_current_datetime": "date time today tomorrow yesterday timezone current now",
+    "spreadsheet": "spreadsheet excel xlsx xls csv worksheet cells table",
+    "web_search": "web internet online latest current news search research",
+    "web_scrape": "website webpage url link article scrape page",
+    "read_document": "pdf docx document pages extract",
+    "read_file": "file text lines read inspect path",
+    "create_file": "create write save new file",
+    "spotify_play": "spotify song music album playlist artist play",
+    "open_browser": "browser website webapp open url",
+    "view_code": "code source implementation function class inspect",
+    "describe_image": "image picture screenshot diagram photo vision describe",
+    "open_terminal_at_path": "terminal console shell directory folder open",
+    "launch_apps": "launch application app desktop open start",
+    "google_workspace": "google calendar tasks event birthday schedule",
+    "codebase_indexer": "repository repo codebase architecture debug optimization security",
+    "index_vault": "index vault document folder embeddings ingest",
+    "vault_search": "vault notes knowledge documents semantic search",
+    "delete_vault_item": "delete remove vault collection chunks index",
+    "list_vaults": "list vault collections indexes",
+    "list_vault_aliases": "vault alias aliases list",
+    "create_structured_note": "obsidian note markdown wikilink tags create",
+    "knowledge_graph_builder": "knowledge graph concepts relationships path",
+    "run_simulation": "simulation monte carlo scenario probability model",
+    "api_orchestrator": "api http endpoint request integration",
+    "context_memory_optimizer": "compact optimize conversation context memory",
+    "reasoning_chain_debugger": "audit claim evidence reasoning confidence graph",
+    "automated_routine_executor": "routine workflow recurring trigger automation",
+}
+
+
+def select_tool_schemas(
+    messages: list[dict],
+    session: dict | None,
+    tools: list[dict] | None,
+) -> list[dict] | None:
+    """Select a bounded, deterministic schema set for the active request.
+
+    Shipping every schema on every turn consumes most of a 4K context before
+    conversation text is considered. Selection affects only model visibility;
+    registry dispatch and all confirmations remain unchanged.
+    """
+    if not tools:
+        return tools
+    runtime = effective_session_model_options(session)[0]
+    maximum = 10 if runtime.num_ctx <= 4096 else 16 if runtime.num_ctx <= 8192 else 24
+    if len(tools) <= maximum:
+        return list(tools)
+
+    recent_user_text = next(
+        (
+            str(message.get("content", ""))
+            for message in reversed(messages)
+            if isinstance(message, dict) and message.get("role") == "user"
+        ),
+        "",
+    ).casefold()
+    normalized_text = re.sub(r"[^\w]+", " ", recent_user_text, flags=re.UNICODE)
+    request_tokens = {
+        token for token in normalized_text.split()
+        if len(token) >= 3 and token not in _TOOL_SELECTION_STOPWORDS
+    }
+
+    by_name: dict[str, dict] = {}
+    scores: dict[str, int] = {}
+    for schema in tools:
+        function = schema.get("function") if isinstance(schema, dict) else None
+        if not isinstance(function, dict):
+            continue
+        name = str(function.get("name") or "").strip()
+        if not name:
+            continue
+        by_name[name] = schema
+        searchable = " ".join((
+            name.replace("_", " "),
+            str(function.get("description") or ""),
+            _TOOL_KEYWORD_HINTS.get(name, ""),
+        )).casefold()
+        searchable_tokens = {
+            token for token in re.sub(r"[^\w]+", " ", searchable).split()
+            if len(token) >= 3 and token not in _TOOL_SELECTION_STOPWORDS
+        }
+        overlap = request_tokens & searchable_tokens
+        score = len(overlap)
+        if name.casefold() in recent_user_text:
+            score += 20
+        scores[name] = score
+
+    chosen: list[str] = [
+        name for name, score in sorted(scores.items(), key=lambda item: (-item[1], item[0]))
+        if score > 0
+    ]
+    if not chosen:
+        chosen.extend(_DEFAULT_TOOL_NAMES)
+    else:
+        for name in _DEFAULT_TOOL_NAMES:
+            if name not in chosen:
+                chosen.append(name)
+
+    # A selected date-sensitive tool must retain its mandatory preflight.
+    if any(
+        (metadata := get_tool_metadata(name)) is not None
+        and metadata.requires_temporal_preflight
+        for name in chosen[:maximum]
+    ) and "get_current_datetime" not in chosen[:maximum]:
+        chosen.insert(0, "get_current_datetime")
+
+    selected_names = set(chosen[:maximum])
+    # Preserve registry order for stable prompts and model caching.
+    return [schema for name, schema in by_name.items() if name in selected_names]
+
+
+def tool_schemas_for_model(
+    messages: list[dict],
+    session: dict | None,
+    tools: list[dict] | None = None,
+) -> list[dict] | None:
+    """Return request-selected compact schemas used for budgeting and sending."""
+    return compact_tool_schemas(select_tool_schemas(messages, session, tools))
 
 
 def _context_window_size(options: dict | None = None) -> int:
@@ -210,9 +468,7 @@ def _write_system_prompt_cache(prompt: str) -> None:
     if not prompt:
         return
     try:
-        os.makedirs(_DATA_DIR, exist_ok=True)
-        with open(_SYSTEM_PROMPT_CACHE_FILE, "w", encoding="utf-8") as stream:
-            stream.write(prompt)
+        atomic_write_text(_SYSTEM_PROMPT_CACHE_FILE, prompt, durable=True)
     except OSError:
         pass
 
@@ -228,37 +484,38 @@ def _read_system_prompt_cache() -> str:
 def load_default_system_prompt(force_refresh: bool = False) -> str:
     """Load and persist the active model system prompt with durable fallbacks."""
     global _DEFAULT_SYSTEM_PROMPT, _DEFAULT_SYSTEM_PROMPT_MTIME
-    current_mtime = _modelfile_mtime()
-    if (
-        _DEFAULT_SYSTEM_PROMPT is not None
-        and not force_refresh
-        and current_mtime == _DEFAULT_SYSTEM_PROMPT_MTIME
-    ):
-        return _DEFAULT_SYSTEM_PROMPT
+    with _SYSTEM_PROMPT_LOCK:
+        current_mtime = _modelfile_mtime()
+        if (
+            _DEFAULT_SYSTEM_PROMPT is not None
+            and not force_refresh
+            and current_mtime == _DEFAULT_SYSTEM_PROMPT_MTIME
+        ):
+            return _DEFAULT_SYSTEM_PROMPT
 
-    prompt = _extract_system_prompt_from_modelfile()
-    try:
-        result = subprocess.run(
-            ["ollama", "show", MODEL_NAME, "--system"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        if not prompt and result.returncode == 0:
-            prompt = result.stdout.strip()
-    except Exception:
-        pass
+        prompt = _extract_system_prompt_from_modelfile()
+        if not prompt:
+            try:
+                result = _OLLAMA_SERVICE.show_model(MODEL_NAME, timeout=10)
+                if hasattr(result, "model_dump"):
+                    result = result.model_dump()
+                prompt = str(
+                    result.get("system", "") if isinstance(result, dict)
+                    else getattr(result, "system", "")
+                ).strip()
+            except OllamaRuntimeError:
+                pass
 
-    if prompt:
-        _write_system_prompt_cache(prompt)
-    else:
-        prompt = _read_system_prompt_cache()
         if prompt:
             _write_system_prompt_cache(prompt)
+        else:
+            prompt = _read_system_prompt_cache()
+            if prompt:
+                _write_system_prompt_cache(prompt)
 
-    _DEFAULT_SYSTEM_PROMPT = prompt
-    _DEFAULT_SYSTEM_PROMPT_MTIME = current_mtime
-    return prompt
+        _DEFAULT_SYSTEM_PROMPT = prompt
+        _DEFAULT_SYSTEM_PROMPT_MTIME = current_mtime
+        return prompt
 
 
 def _split_system_and_conversation(messages: list[dict]) -> tuple[list[dict], list[dict]]:
@@ -427,10 +684,10 @@ def prepare_messages_for_model(
     extra_reserved_tokens: int = 0,
 ) -> list[dict]:
     """Trim outgoing prompts with system preservation and response headroom."""
-    options = session.get("options", {}) if isinstance(session, dict) else {}
+    _runtime, options = effective_session_model_options(session)
     num_ctx = _context_window_size(options)
     requested_response = _requested_response_tokens(options)
-    runtime_tools = compact_tool_schemas(tools)
+    runtime_tools = tool_schemas_for_model(messages, session, tools)
     tool_tokens = _estimate_tool_schema_tokens(runtime_tools)
     reserved = requested_response + max(0, int(extra_reserved_tokens))
 
@@ -461,13 +718,20 @@ def guarded_options_for_call(
     messages: list[dict],
     options: dict | None = None,
     tools: list[dict] | None = None,
+    *,
+    extra_reserved_tokens: int = 0,
 ) -> dict | None:
     """Return options with a safe per-call num_predict cap."""
-    base_options = dict(options or {})
+    _runtime, base_options = effective_model_options(options)
     num_ctx = _context_window_size(base_options)
-    runtime_tools = compact_tool_schemas(tools)
+    runtime_tools = tool_schemas_for_model(messages, {"options": options or {}}, tools)
     prompt_tokens = _estimate_messages_tokens(messages) + _estimate_tool_schema_tokens(runtime_tools)
-    available = num_ctx - prompt_tokens - _context_safety_margin(num_ctx)
+    available = (
+        num_ctx
+        - prompt_tokens
+        - _context_safety_margin(num_ctx)
+        - max(0, int(extra_reserved_tokens))
+    )
 
     if available < MIN_EMERGENCY_RESPONSE_TOKENS:
         raise ContextWindowError(
@@ -483,78 +747,69 @@ def guarded_options_for_call(
 
 
 def _compact_history_bg(history: list[dict], session: dict, start_idx: int, end_idx: int) -> None:
-    """Run background summarization and replace older messages."""
-    import ollama
-    messages_to_compact = history[start_idx:end_idx]
-    
-    # We want to format the previous conversation for the LLM to summarize
-    text_to_summarize = ""
-    for msg in messages_to_compact:
-        role = msg.get("role", "unknown")
-        content = msg.get("content", "")
-        text_to_summarize += f"[{role.upper()}]: {content}\n\n"
-        
-    system_prompt = session.get("system", "")
-    if not system_prompt and history and history[0].get("role") == "system":
-        system_prompt = history[0].get("content", "")
-        
-    summarize_prompt = (
-        "Please provide a concise, factual summary of the following conversation history. "
-        "Retain all key context, decisions, and factual information so it can be used "
-        "in place of the full history without losing context.\n\n"
-        f"Conversation:\n{text_to_summarize}"
-    )
-    
-    compact_messages = []
-    if system_prompt:
-        compact_messages.append({"role": "system", "content": system_prompt})
-    compact_messages.append({"role": "user", "content": summarize_prompt})
-    
+    """Compact a stable older-history slice without another model request.
+
+    The former background summarizer raced live session mutation and could load
+    a second large model while chat was active. The extractive optimizer is
+    bounded, deterministic, and leaves the recent complete turns untouched.
+    """
+    messages_to_compact = [dict(message) for message in history[start_idx:end_idx]]
     try:
-        response = ollama.chat(
-            model=MODEL_NAME,
-            messages=compact_messages,
-            options=session.get("options", {})
-        )
-        summary = response.message.content or ""
-        if summary:
-            from tools.context_memory_optimizer import context_memory_optimizer
-            optimized = json.loads(context_memory_optimizer(
-                [{"role": "assistant", "content": summary}],
-                target_tokens=max(512, int(session.get("options", {}).get("num_ctx", 8192) * 0.25)),
-                preserve_recent=1,
-            ))
-            history[start_idx:end_idx] = optimized.get("messages") or [
-                {"role": "assistant", "content": f"[System Note: Older conversation compacted]\n{summary}"}
-            ]
-    except Exception as e:
-        # Ignore errors in background compaction to prevent terminal spam
-        pass
+        if not messages_to_compact:
+            return
+        from tools.context_memory_optimizer import context_memory_optimizer
+
+        optimized = json.loads(context_memory_optimizer(
+            messages_to_compact,
+            target_tokens=max(
+                512,
+                int(effective_session_model_options(session)[0].num_ctx * 0.25),
+            ),
+            preserve_recent=2,
+        ))
+        replacement = optimized.get("messages")
+        if not isinstance(replacement, list) or not replacement:
+            return
+
+        # Do not overwrite a slice that changed while compaction was running.
+        if history[start_idx:end_idx] == messages_to_compact:
+            history[start_idx:end_idx] = replacement
+    except Exception:
+        # Compaction is an optimization; preserving the original history is the
+        # safe failure mode.
+        return
     finally:
-        session["_is_compacting"] = False
+        session.pop("_is_compacting", None)
 
 
 def _check_and_compact_history(history: list[dict], session: dict) -> None:
-    """Check token usage and trigger background compaction if > 75%."""
+    """Compact complete older turns once history exceeds 75% of context."""
     if session.get("_is_compacting"):
         return
         
-    num_ctx = _context_window_size(session.get("options", {}))
+    num_ctx = effective_session_model_options(session)[0].num_ctx
     compact_threshold = int(num_ctx * 0.75)
     
     total_tokens = _estimate_messages_tokens(history)
     
-    if total_tokens > compact_threshold:
-        # Determine the slice to compact. Keep system prompt (idx 0) and at least the 4 most recent messages (e.g. 2 turns).
-        if len(history) >= 6:
-            start_idx = 1 if history[0].get("role") == "system" else 0
-            end_idx = len(history) - 4
-            if start_idx < end_idx:
-                session["_is_compacting"] = True
-                import threading
-                t = threading.Thread(target=_compact_history_bg, args=(history, session, start_idx, end_idx))
-                t.daemon = True
-                t.start()
+    if total_tokens <= compact_threshold:
+        return
+
+    start_idx = 1 if history and history[0].get("role") == "system" else 0
+    user_indices = [
+        index for index in range(start_idx, len(history))
+        if history[index].get("role") == "user"
+    ]
+    # Keep the latest two complete user turns. Ending at a user boundary avoids
+    # separating assistant tool calls from their tool results.
+    if len(user_indices) < 3:
+        return
+    end_idx = user_indices[-2]
+    if start_idx >= end_idx:
+        return
+
+    session["_is_compacting"] = True
+    _compact_history_bg(history, session, start_idx, end_idx)
 
 def _stream_thinking_response(
     model: str,
@@ -564,6 +819,7 @@ def _stream_thinking_response(
     verbose: bool = False,
     think: bool = True,
     fmt: str | None = None,
+    extra_reserved_tokens: int = 0,
 ) -> dict:
     """Stream a response from the Ollama model, displaying thinking progress and final answer.
     
@@ -585,7 +841,7 @@ def _stream_thinking_response(
     """
     spinner = _Spinner("Thinking").start()
     t_start = time.monotonic()
-    runtime_tools = compact_tool_schemas(tools)
+    runtime_tools = tool_schemas_for_model(messages, {"options": options or {}}, tools)
 
     thinking_buf = ""
     content_buf = ""
@@ -593,8 +849,14 @@ def _stream_thinking_response(
     thinking_displayed = False
 
     try:
-        guarded_options = guarded_options_for_call(messages, options, runtime_tools)
-    except ContextWindowError as exc:
+        runtime_config, effective_options = effective_model_options(options)
+        guarded_options = guarded_options_for_call(
+            messages,
+            effective_options,
+            runtime_tools,
+            extra_reserved_tokens=extra_reserved_tokens,
+        )
+    except (ContextWindowError, RuntimeConfigurationError) as exc:
         spinner.stop()
         message = f"Context window guard stopped this response before generation: {exc}"
         _console.print(f"\n[yellow]⚠ {message}[/]\n")
@@ -605,7 +867,7 @@ def _stream_thinking_response(
         "messages": messages,
         "stream": True,
         "think": think,
-        "keep_alive": "30m",
+        "keep_alive": runtime_config.keep_alive,
     }
     if fmt:
         kwargs["format"] = fmt
@@ -614,9 +876,15 @@ def _stream_thinking_response(
     if guarded_options:
         kwargs["options"] = guarded_options
 
+    owner = f"cli:{threading.get_ident()}:{time.monotonic_ns()}"
     try:
-        stream = ollama.chat(**kwargs)
-    except Exception as exc:
+        stream = _OLLAMA_SERVICE.chat(
+            kind=OperationKind.CHAT,
+            owner=owner,
+            operation_timeout=runtime_config.chat_timeout_seconds,
+            **kwargs,
+        )
+    except OllamaRuntimeError as exc:
         spinner.stop()
         message = f"Ollama chat failed before streaming: {exc}"
         _console.print(f"\n[red]⚠ {message}[/]\n")
@@ -629,7 +897,13 @@ def _stream_thinking_response(
 
     global _interrupted
     _interrupted = False
-    old_handler = signal.signal(signal.SIGQUIT, _sigquit_handler)
+    interrupt_signal = getattr(signal, "SIGQUIT", None) or getattr(signal, "SIGBREAK", None)
+    old_handler = None
+    if interrupt_signal is not None:
+        try:
+            old_handler = signal.signal(interrupt_signal, _sigquit_handler)
+        except (OSError, ValueError):
+            interrupt_signal = None
 
     try:
         for chunk in stream:
@@ -638,7 +912,8 @@ def _stream_thinking_response(
                 if in_thinking:
                     in_thinking = False
                     print_thinking_footer("interrupted")
-                _console.print(f"\n[yellow]⚠ Generation interrupted by user (Ctrl+\\).[/]\n")
+                shortcut = "Ctrl+\\" if hasattr(signal, "SIGQUIT") else "Ctrl+Break"
+                _console.print(f"\n[yellow]⚠ Generation interrupted by user ({shortcut}).[/]\n")
                 break
             
             msg = chunk.message
@@ -705,8 +980,21 @@ def _stream_thinking_response(
                     live.update(assistant_stream_panel(content_buf), refresh=True)
                     _last_render = now
 
+    except OllamaRuntimeError as exc:
+        spinner.stop()
+        message = f"Ollama chat failed while streaming: {exc}"
+        _console.print(f"\n[red]⚠ {message}[/]\n")
+        if not content_buf:
+            content_buf = message
     finally:
-        signal.signal(signal.SIGQUIT, old_handler)
+        close = getattr(stream, "close", None)
+        if callable(close):
+            close()
+        if interrupt_signal is not None and old_handler is not None:
+            try:
+                signal.signal(interrupt_signal, old_handler)
+            except (OSError, ValueError):
+                pass
         if live:
             live.stop()
         flush_terminal_input()
@@ -889,6 +1177,7 @@ _COMMANDS_HELP = f"""
   [green]/save [name][/]                   — Save current session  [dim](optional name)[/]
   [green]/load [name|index][/]             — Load a saved session  [dim](lists sessions if no arg)[/]
   [green]/set parameter <name> <val>[/]    — Set a model parameter  [dim](e.g. temperature 0.7)[/]
+  [green]/set profile <name>[/]             — Select auto, low-vram, balanced, or manual
   [green]/set system "<prompt>"[/]         — Set the system prompt for this session
   [green]/set history[/]                   — Enable conversation history  [dim](default)[/]
   [green]/set nohistory[/]                 — Disable history  [dim](each turn is standalone)[/]
@@ -1022,6 +1311,23 @@ def _handle_set(args: str, session: dict, history: list[dict]) -> None:
         _console.print(f"[cyan][bold]✓  System prompt set:[/] [dim]{display}[/]\n")
         return
 
+    if sub == "profile":
+        profile = rest.strip().lower().replace("_", "-")
+        candidate = dict(session)
+        candidate["runtime_profile"] = profile
+        try:
+            runtime = get_runtime_config(candidate)
+        except RuntimeConfigurationError as exc:
+            _console.print(f"[red]Invalid runtime profile: {exc}[/]\n")
+            return
+        session["runtime_profile"] = profile
+        _console.print(f"[cyan][bold]✓  Runtime profile = {runtime.profile.value}[/]")
+        _console.print(f"[dim]{runtime.selection_reason}[/]")
+        for warning in runtime.warnings:
+            _console.print(f"[yellow]⚠ {warning}[/]")
+        _console.print()
+        return
+
     # ── /set parameter <name> <value> ─────────────────────────────────
     if sub == "parameter":
         param_parts = rest.strip().split(None, 1)
@@ -1044,11 +1350,22 @@ def _handle_set(args: str, session: dict, history: list[dict]) -> None:
             _console.print(f"[red]Invalid value for {name}: expected {expected}, got '{raw_val}'[/]\n")
             return
 
-        session["options"][name] = value
+        candidate = dict(session.get("options", {}))
+        candidate[name] = value
+        try:
+            normalized, warnings = validate_session_options(candidate)
+        except RuntimeConfigurationError as exc:
+            _console.print(f"[red]Invalid value for {name}: {exc}[/]\n")
+            return
+        session["options"] = normalized
         _console.print(f"[cyan][bold]✓  {name} = {value}[/]\n")
+        for warning in warnings:
+            _console.print(f"[yellow]⚠ {warning}[/]")
+        if warnings:
+            _console.print()
         return
 
-    _console.print(f"[red]Unknown /set subcommand: {sub}[/]  [dim](try: parameter, system, verbose, quiet, wordwrap, nowordwrap, history, nohistory, format, noformat, think, nothink)[/]\n")
+    _console.print(f"[red]Unknown /set subcommand: {sub}[/]  [dim](try: parameter, profile, system, verbose, quiet, wordwrap, nowordwrap, history, nohistory, format, noformat, think, nothink)[/]\n")
 
 
 def _handle_show(args: str, session: dict, history: list[dict]) -> None:
@@ -1066,13 +1383,20 @@ def _handle_show(args: str, session: dict, history: list[dict]) -> None:
 
     if sub == "parameters":
         opts = session.get("options", {})
-        if not opts:
-            _console.print(f"[dim]  No custom parameters set (using model defaults).[/]\n")
-        else:
-            _console.print(f"\n[cyan][bold]Session parameters:[/]")
-            for k, v in sorted(opts.items()):
-                _console.print(f"  [green]{k}[/] = {v}")
-            _console.print()
+        try:
+            runtime, effective = effective_session_model_options(session)
+        except RuntimeConfigurationError as exc:
+            _console.print(f"[red]Invalid session configuration: {exc}[/]\n")
+            return
+        _console.print(f"\n[cyan][bold]Runtime profile:[/] {runtime.profile.value}")
+        _console.print(f"[dim]{runtime.selection_reason}[/]")
+        _console.print(f"[cyan][bold]Effective model parameters:[/]")
+        for key, value in sorted(effective.items()):
+            suffix = " [dim](session override)[/]" if key in opts else ""
+            _console.print(f"  [green]{key}[/] = {value}{suffix}")
+        for warning in runtime.warnings:
+            _console.print(f"[yellow]⚠ {warning}[/]")
+        _console.print()
         # Also show flags
         flags = []
         if session.get("verbose"):
@@ -1103,14 +1427,19 @@ def _handle_show(args: str, session: dict, history: list[dict]) -> None:
 
     if sub in ("model", "info"):
         try:
-            info = ollama.show(MODEL_NAME)
-            model_info = getattr(info, "modelinfo", None) or {}
+            info = _OLLAMA_SERVICE.show_model(MODEL_NAME, timeout=10)
+            if hasattr(info, "model_dump"):
+                info = info.model_dump()
+            model_info = (
+                info.get("modelinfo", {}) if isinstance(info, dict)
+                else getattr(info, "modelinfo", None) or {}
+            )
             family = model_info.get("general.architecture", "unknown")
             params = model_info.get("general.parameter_count", "unknown")
             _console.print(f"\n[cyan][bold]Model:[/]  {MODEL_NAME}")
             _console.print(f"[cyan][bold]Family:[/] {family}")
             _console.print(f"[cyan][bold]Params:[/] {params}\n")
-        except Exception:
+        except OllamaRuntimeError:
             _console.print(f"\n[cyan][bold]Model:[/]  {MODEL_NAME}\n")
         return
 
@@ -1123,9 +1452,20 @@ def _list_saved_sessions() -> list[str]:
     Returns:
         list[str]: A list of absolute file paths to saved sessions.
     """
-    if not os.path.isdir(_SESSIONS_DIR):
-        return []
-    files = glob.glob(os.path.join(_SESSIONS_DIR, "*.json"))
+    directories = [_SESSIONS_DIR]
+    if os.path.abspath(_LEGACY_SESSIONS_DIR) != os.path.abspath(_SESSIONS_DIR):
+        directories.append(_LEGACY_SESSIONS_DIR)
+    files: list[str] = []
+    seen_names: set[str] = set()
+    for directory in directories:
+        if not os.path.isdir(directory):
+            continue
+        for filepath in glob.glob(os.path.join(directory, "*.json")):
+            name = os.path.basename(filepath).casefold()
+            if name in seen_names:
+                continue
+            seen_names.add(name)
+            files.append(filepath)
     files.sort(key=os.path.getmtime, reverse=True)
     return files
 
@@ -1162,13 +1502,13 @@ def _handle_save(args: str, session: dict, history: list[dict]) -> None:
             "history": session.get("history", True),
             "format": session.get("format", ""),
             "think": session.get("think", True),
+            "runtime_profile": session.get("runtime_profile", "auto"),
         },
         "history": history,
     }
 
     try:
-        with open(filepath, "w", encoding="utf-8") as f:
-            json.dump(payload, f, indent=2, ensure_ascii=False)
+        atomic_write_json(filepath, payload, durable=True)
         display_name = os.path.basename(filepath)
         msg_count = sum(1 for m in history if m.get("role") == "user")
         _console.print(f"[cyan][bold]✓  Session saved:[/] [dim]{display_name}[/]  ({msg_count} user message{'s' if msg_count != 1 else ''})\n")
@@ -1243,23 +1583,51 @@ def _handle_load(args: str, session: dict, history: list[dict]) -> None:
         _console.print(f"[red]Failed to load session: {exc}[/]\n")
         return
 
-    # Restore history
-    history.clear()
-    history.extend(data.get("history", []))
-
-    # Restore session parameters
+    saved_history = data.get("history", [])
     saved_session = data.get("session", {})
-    session["options"] = saved_session.get("options", {})
+    if (
+        not isinstance(saved_history, list)
+        or any(not isinstance(message, dict) for message in saved_history)
+        or not isinstance(saved_session, dict)
+    ):
+        _console.print("[red]Failed to load session: invalid session structure.[/]\n")
+        return
+    try:
+        restored_options, warnings = validate_session_options(saved_session.get("options", {}))
+    except RuntimeConfigurationError as exc:
+        _console.print(f"[red]Failed to load session: invalid model settings: {exc}[/]\n")
+        return
+    runtime_profile = saved_session.get("runtime_profile", "auto")
+    try:
+        restored_runtime = get_runtime_config({
+            "runtime_profile": runtime_profile,
+            "options": restored_options,
+        })
+    except RuntimeConfigurationError as exc:
+        _console.print(f"[red]Failed to load session: invalid runtime profile: {exc}[/]\n")
+        return
+    warnings = tuple(dict.fromkeys((*warnings, *restored_runtime.warnings)))
+
+    # Validate before replacing live state so a malformed restore cannot erase
+    # the current conversation.
+    history.clear()
+    history.extend(saved_history)
+    session["options"] = restored_options
     session["verbose"] = saved_session.get("verbose", False)
     session["wordwrap"] = saved_session.get("wordwrap", True)
     session["system"] = saved_session.get("system", "")
     session["history"] = saved_session.get("history", True)
     session["format"] = saved_session.get("format", "")
     session["think"] = saved_session.get("think", True)
+    session["runtime_profile"] = runtime_profile
 
     display_name = os.path.basename(target_path).replace(".json", "")
     msg_count = sum(1 for m in history if m.get("role") == "user")
     _console.print(f"[cyan][bold]✓  Session loaded:[/] [dim]{display_name}[/]  ({msg_count} user message{'s' if msg_count != 1 else ''})\n")
+    for warning in warnings:
+        _console.print(f"[yellow]⚠ {warning}[/]")
+    if warnings:
+        _console.print()
 
 
 def _extract_option(tokens: list[str], names: tuple[str, ...], default: str | None = None) -> str | None:
@@ -1312,7 +1680,7 @@ def _extract_flag(tokens: list[str], names: tuple[str, ...]) -> bool:
 
 
 def _call_tool_json(tool_name: str, **kwargs) -> dict:
-    """Helper method to invoke a tool locally and ensure the output is a dict.
+    """Invoke a CLI helper through the shared tool safety contract.
     
     Args:
         tool_name (str): Tool function name to execute.
@@ -1321,21 +1689,15 @@ def _call_tool_json(tool_name: str, **kwargs) -> dict:
     Returns:
         dict: The tool result parsed as JSON, or an error dict.
     """
-    handler = TOOL_DISPATCH.get(tool_name)
-    if handler is None:
-        return {"error": f"Tool not found: {tool_name}"}
+    spec = normalize_tool_calls([{
+        "function": {"name": tool_name, "arguments": kwargs},
+    }])[0]
+    execution = execute_tool_call(spec)
     try:
-        result = handler(**kwargs)
-    except Exception as exc:
-        return {"error": str(exc)}
-    if isinstance(result, str):
-        try:
-            return json.loads(result)
-        except json.JSONDecodeError:
-            return {"result": result}
-    if isinstance(result, dict):
-        return result
-    return {"result": result}
+        parsed = json.loads(execution.content)
+    except json.JSONDecodeError:
+        return {"result": execution.content, "ok": execution.ok}
+    return parsed if isinstance(parsed, dict) else {"result": parsed, "ok": execution.ok}
 
 
 def _format_match_snippet(text: str | None, max_chars: int = 260) -> str:
@@ -1640,6 +2002,7 @@ def run() -> None:
         "history": True,     # Whether to keep conversation history across turns
         "format": "",        # Output format ("" = default, "json" = JSON mode)
         "think": True,       # Whether to enable model thinking/reasoning
+        "runtime_profile": "auto",  # Hardware-aware profile; explicit options still win
     }
 
     print_welcome_header()
@@ -1684,16 +2047,18 @@ def run() -> None:
                 INDEX_THRESHOLD = 200_000
                 if size > INDEX_THRESHOLD or ext in (".pdf", ".docx"):
                     _print_status("🔧", f"Large/binary file detected — indexing: [dim]{user_input}[/]", "yellow")
-                    handler = TOOL_DISPATCH.get("index_vault")
-                    if handler:
+                    if "index_vault" in TOOL_DISPATCH:
                         try:
-                            res = handler(vault_path=os.path.dirname(user_input) or ".", file_path=user_input)
-                            # Ensure we push a tool-style message into history so the model knows indexing occurred
-                            if isinstance(res, str):
-                                tool_content = res
-                            else:
-                                import json as _json
-                                tool_content = _json.dumps(res)
+                            execution = execute_tool_calls([{
+                                "function": {
+                                    "name": "index_vault",
+                                    "arguments": {
+                                        "vault_path": os.path.dirname(user_input) or ".",
+                                        "file_path": user_input,
+                                    },
+                                }
+                            }])[0]
+                            tool_content = execution.content
                             tool_msg = {
                                 "role": "tool",
                                 "tool_name": "index_vault",
@@ -1704,7 +2069,10 @@ def run() -> None:
                                 history.append(tool_msg)
                             else:
                                 pre_tool_message = tool_msg
-                            _print_status("✓", "Indexing complete.", "green")
+                            if execution.ok:
+                                _print_status("✓", "Indexing complete.", "green")
+                            else:
+                                _print_status("⚠", "Indexing did not complete; the model will receive the error.", "yellow")
                         except Exception as e:
                             _print_status("⚠", f"Indexing failed: {e}", "red")
         except Exception:
@@ -1733,7 +2101,7 @@ def run() -> None:
             model=MODEL_NAME,
             messages=messages_to_send,
             tools=TOOL_SCHEMAS,
-            options=session["options"] or None,
+            options=effective_session_model_options(session)[1],
             verbose=session["verbose"],
             think=session["think"],
             fmt=session["format"] or None,
@@ -1790,10 +2158,11 @@ def run() -> None:
                 model=MODEL_NAME,
                 messages=messages_to_send,
                 tools=TOOL_SCHEMAS,
-                options=session["options"] or None,
+                options=effective_session_model_options(session)[1],
                 verbose=session["verbose"],
                 think=session["think"],
                 fmt=session["format"] or None,
+                extra_reserved_tokens=CONTEXT_TOOL_LOOP_RESERVE,
             )
             if session["history"]:
                 history.append(assistant_msg)

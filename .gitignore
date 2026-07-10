@@ -31,6 +31,9 @@ MANIFEST
 #   before PyInstaller builds the exe, so as to inject date/other infos into it.
 *.manifest
 *.spec
+# Selene's maintained cross-platform backend build contract is source, not a
+# generated one-off spec.
+!selene-backend.spec
 
 # Installer logs
 pip-log.txt

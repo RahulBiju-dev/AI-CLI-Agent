@@ -4,16 +4,23 @@ from __future__ import annotations
 
 import json
 import os
-import subprocess
 import tempfile
+import threading
 import time
-import webbrowser
 from pathlib import Path
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DATA_DIR = Path(
-    os.path.abspath(os.path.expanduser(os.environ.get("SELENE_DATA_DIR", "~/.selene-agent")))
+from agent.cancellation import CancellationToken, OperationCancelled
+from agent.persistence import PersistenceError, atomic_write_json, read_json_preserved
+from agent.platform_runtime import (
+    get_runtime_paths,
+    open_url_native,
+    path_is_within,
+    spawn_detached,
+    terminate_process_tree,
 )
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+DATA_DIR = get_runtime_paths().data_dir
 STORE_PATH = DATA_DIR / "routines.json"
 LEGACY_STORE_PATH = PROJECT_ROOT / ".selene" / "routines.json"
 MAX_ACTIONS = 50
@@ -22,38 +29,30 @@ AUTOMATIC_ACTION_TYPES = {"open_app", "delay", "tool"}
 AUTOMATIC_TOOL_NAMES = {"open_app", "launch_apps"}
 CONFIRMATION_TOOL_NAMES = {*AUTOMATIC_TOOL_NAMES, "open_terminal_at_path"}
 ALLOWED_ROUTINE_COMMANDS = {"python", "pytest", "git", "ls", "cat", "echo", "grep", "node", "npm"}
+_STORE_LOCK = threading.RLock()
+
+
+def _active_store_path() -> Path:
+    """Choose one routine store without silently copying or moving legacy data."""
+    if STORE_PATH.exists() or not LEGACY_STORE_PATH.is_file():
+        return STORE_PATH
+    return LEGACY_STORE_PATH
 
 
 def _load() -> dict[str, dict]:
-    store = STORE_PATH
-    # Older releases kept routines inside the source checkout. Import that file
-    # once so upgrades preserve existing routines while all future writes use
-    # the per-user application data directory.
-    if not store.exists() and LEGACY_STORE_PATH.is_file():
-        try:
-            value = json.loads(LEGACY_STORE_PATH.read_text(encoding="utf-8"))
-            if isinstance(value, dict):
-                _save(value)
-                return value
-        except (OSError, json.JSONDecodeError):
-            pass
+    store = _active_store_path()
     try:
-        value = json.loads(store.read_text(encoding="utf-8"))
-        return value if isinstance(value, dict) else {}
-    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return read_json_preserved(store, expected_type=dict)
+    except FileNotFoundError:
         return {}
+    except OSError as exc:
+        raise PersistenceError(
+            f"Routine state at '{store}' could not be read and was preserved: {exc}"
+        ) from exc
 
 
 def _save(routines: dict[str, dict]) -> None:
-    STORE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    handle, temporary = tempfile.mkstemp(prefix="routines-", suffix=".json", dir=STORE_PATH.parent)
-    try:
-        with os.fdopen(handle, "w", encoding="utf-8") as stream:
-            json.dump(routines, stream, ensure_ascii=False, indent=2)
-        os.replace(temporary, STORE_PATH)
-    finally:
-        if os.path.exists(temporary):
-            os.unlink(temporary)
+    atomic_write_json(_active_store_path(), routines)
 
 
 def _resolve(routines: dict[str, dict], name: str | None, trigger: str | None) -> tuple[str | None, dict | None]:
@@ -185,13 +184,19 @@ def _is_safe_automatic_routine(routine: dict) -> bool:
     return True
 
 
-def _run_registered_tool(tool_name: str, arguments: dict, action_type: str = "tool") -> dict:
+def _run_registered_tool(
+    tool_name: str,
+    arguments: dict,
+    action_type: str = "tool",
+    cancellation_token: CancellationToken | None = None,
+) -> dict:
     """Call tools through the shared registry used by normal agent tool calls."""
     if tool_name == "automated_routine_executor":
         raise ValueError("A routine cannot recursively invoke itself")
 
     # Imported lazily because registry.py imports this module while constructing
     # the shared dispatch map.
+    from agent.tool_runner import execute_tool_call, normalize_tool_calls
     from tools.registry import TOOL_DISPATCH
 
     handler = TOOL_DISPATCH.get(tool_name)
@@ -204,7 +209,11 @@ def _run_registered_tool(tool_name: str, arguments: dict, action_type: str = "to
     # from AUTOMATIC_TOOL_NAMES, so it can never bypass per-run confirmation.
     if tool_name in CONFIRMATION_TOOL_NAMES:
         call_arguments["confirmed"] = True
-    raw_result = handler(**call_arguments)
+    spec = normalize_tool_calls([{
+        "function": {"name": tool_name, "arguments": call_arguments}
+    }])[0]
+    execution = execute_tool_call(spec, cancellation_token=cancellation_token)
+    raw_result = execution.content
     if isinstance(raw_result, str):
         try:
             result = json.loads(raw_result)
@@ -213,47 +222,113 @@ def _run_registered_tool(tool_name: str, arguments: dict, action_type: str = "to
     else:
         result = raw_result
 
-    failed = isinstance(result, dict) and (
+    failed = not execution.ok or (isinstance(result, dict) and (
         "error" in result or result.get("success") is False or result.get("ok") is False
-    )
+    ))
     return {
         "type": action_type,
         "ok": not failed,
         "tool_name": tool_name,
+        "status": execution.status.value,
         "result": result,
     }
 
 
-def _run_action(item: dict) -> dict:
+def _run_action(
+    item: dict,
+    cancellation_token: CancellationToken | None = None,
+) -> dict:
+    if cancellation_token:
+        cancellation_token.raise_if_cancelled()
     action_type = item["type"]
     if action_type == "delay":
         seconds = max(0.0, min(float(item.get("seconds", 1)), 30.0))
-        time.sleep(seconds)
+        if cancellation_token and cancellation_token.wait(seconds):
+            cancellation_token.raise_if_cancelled()
+        elif not cancellation_token:
+            time.sleep(seconds)
         return {"type": action_type, "ok": True, "seconds": seconds}
     if action_type == "open_url":
-        return {"type": action_type, "ok": bool(webbrowser.open(str(item["url"]), new=2)), "url": item["url"]}
+        launch = open_url_native(item["url"])
+        return {"type": action_type, **launch.as_dict(), "url": item["url"]}
     if action_type == "open_app":
         app_name = item.get("app_name")
         if not app_name and isinstance(item.get("argv"), list) and item["argv"]:
             app_name = str(item["argv"][0])
         if not app_name:
             raise ValueError("open_app requires app_name; command arguments are not permitted")
-        result = _run_registered_tool("open_app", {"app_name": str(app_name)}, action_type)
+        result = _run_registered_tool(
+            "open_app",
+            {"app_name": str(app_name)},
+            action_type,
+            cancellation_token,
+        )
         result["app_name"] = app_name
         return result
     if action_type == "tool":
-        return _run_registered_tool(item["tool_name"], item.get("arguments", {}))
+        return _run_registered_tool(
+            item["tool_name"],
+            item.get("arguments", {}),
+            cancellation_token=cancellation_token,
+        )
     argv = [str(value) for value in item["argv"]]
     if not argv:
         raise ValueError("argv cannot be empty")
     if argv[0] not in ALLOWED_ROUTINE_COMMANDS:
         raise ValueError(f"Command '{argv[0]}' is not permitted")
     requested_cwd = (PROJECT_ROOT / str(item.get("cwd", "."))).resolve()
-    if requested_cwd != PROJECT_ROOT and PROJECT_ROOT not in requested_cwd.parents:
+    if not path_is_within(requested_cwd, PROJECT_ROOT):
         raise ValueError("Command cwd must stay inside the project workspace")
     timeout = max(1.0, min(float(item.get("timeout", 60)), 600.0))
-    completed = subprocess.run(argv, cwd=requested_cwd, capture_output=True, text=True, timeout=timeout, shell=False)
-    return {"type": action_type, "ok": completed.returncode == 0, "argv": argv, "returncode": completed.returncode, "stdout": completed.stdout[-12000:], "stderr": completed.stderr[-12000:]}
+    with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
+        handle = spawn_detached(
+            argv,
+            cwd=requested_cwd,
+            stdout=stdout_file,
+            stderr=stderr_file,
+        )
+        deadline = time.monotonic() + timeout
+        timed_out = False
+        while handle.poll() is None:
+            if cancellation_token and cancellation_token.wait(0.05):
+                if not terminate_process_tree(handle):
+                    raise RuntimeError(
+                        "Cancellation was requested, but termination of the owned process tree could not be confirmed"
+                    )
+                cancellation_token.raise_if_cancelled()
+            if time.monotonic() >= deadline:
+                timed_out = True
+                termination_confirmed = terminate_process_tree(handle)
+                break
+            if not cancellation_token:
+                time.sleep(0.05)
+        returncode = handle.process.poll()
+
+        def output_tail(stream) -> str:
+            stream.flush()
+            size = stream.seek(0, os.SEEK_END)
+            stream.seek(max(0, size - 12000))
+            return stream.read().decode("utf-8", errors="replace")
+
+        result = {
+            "type": action_type,
+            "ok": not timed_out and returncode == 0,
+            "argv": argv,
+            "returncode": returncode,
+            "stdout": output_tail(stdout_file),
+            "stderr": output_tail(stderr_file),
+        }
+        if timed_out:
+            if termination_confirmed:
+                result["error"] = (
+                    f"Command exceeded its {timeout:g}s timeout and its owned process tree was stopped"
+                )
+            else:
+                result["error"] = (
+                    f"Command exceeded its {timeout:g}s timeout; termination of its owned process tree "
+                    "could not be confirmed"
+                )
+        return result
 
 
 def automated_routine_executor(
@@ -263,12 +338,23 @@ def automated_routine_executor(
     trigger: str | None = None,
     dry_run: bool = False,
     confirmed: bool = False,
+    cancellation_token: CancellationToken | None = None,
 ) -> str:
     """Manage workflow macros with per-run or narrowly scoped persistent approval."""
-    routines = _load()
+    if cancellation_token:
+        cancellation_token.raise_if_cancelled()
+    try:
+        with _STORE_LOCK:
+            routines = _load()
+    except PersistenceError as exc:
+        return json.dumps({
+            "error": str(exc),
+            "store": str(_active_store_path()),
+            "preserved": True,
+        }, ensure_ascii=False)
     if action == "list":
         items = [{"name": key, "description": value.get("description", ""), "triggers": value.get("triggers", []), "action_count": len(value.get("actions", []))} for key, value in sorted(routines.items())]
-        return json.dumps({"routines": items}, ensure_ascii=False)
+        return json.dumps({"routines": items, "store": str(_active_store_path())}, ensure_ascii=False)
     if action == "define":
         if not name or not routine:
             return json.dumps({"error": "name and routine are required for define"})
@@ -284,13 +370,15 @@ def automated_routine_executor(
                 "error": "Persistent automatic execution requires confirmed=true after the user approves the preview.",
                 "routine": candidate,
             }, ensure_ascii=False)
-        routines[name] = {
-            "description": candidate["description"],
-            "triggers": candidate["triggers"],
-            "actions": candidate["actions"],
-            "automatic_approved": wants_automatic and confirmed is True,
-        }
-        _save(routines)
+        with _STORE_LOCK:
+            routines = _load()
+            routines[name] = {
+                "description": candidate["description"],
+                "triggers": candidate["triggers"],
+                "actions": candidate["actions"],
+                "automatic_approved": wants_automatic and confirmed is True,
+            }
+            _save(routines)
         return json.dumps({
             "ok": True,
             "defined": name,
@@ -298,15 +386,17 @@ def automated_routine_executor(
             "triggers": candidate["triggers"],
             "action_count": len(candidate["actions"]),
             "automatic_approved": wants_automatic and confirmed is True,
-            "store": str(STORE_PATH),
+            "store": str(_active_store_path()),
         })
     if action == "delete":
         if not confirmed:
             return json.dumps({"error": "Deleting a routine requires confirmed=true"})
-        if not name or name not in routines:
-            return json.dumps({"error": "Routine not found"})
-        del routines[name]
-        _save(routines)
+        with _STORE_LOCK:
+            routines = _load()
+            if not name or name not in routines:
+                return json.dumps({"error": "Routine not found"})
+            del routines[name]
+            _save(routines)
         return json.dumps({"ok": True, "deleted": name})
     if action not in {"show", "run"}:
         return json.dumps({"error": "action must be list, define, show, run, or delete"})
@@ -339,7 +429,9 @@ def automated_routine_executor(
     results = []
     for index, item in enumerate(selected["actions"]):
         try:
-            result = _run_action(item)
+            result = _run_action(item, cancellation_token)
+        except OperationCancelled:
+            raise
         except Exception as exc:
             result = {"type": item.get("type"), "ok": False, "error": str(exc)}
         results.append({"index": index, **result})

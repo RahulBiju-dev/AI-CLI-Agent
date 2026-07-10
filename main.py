@@ -1,17 +1,12 @@
 #!/usr/bin/env python3
-"""
-main.py — Entry point for the Selene AI Agent.
-
-Creates the custom Ollama model from the Modelfile (if needed)
-and launches the interactive chat loop.
-"""
+"""Selene entry point: validate local runtime, then launch CLI or web UI."""
 
 import sys
-import os
 
-import ollama
-
-from agent.core import MODEL_NAME, run
+from agent.model_lifecycle import ModelStartupResult, ensure_managed_model
+from agent.ollama_runtime import InvalidModelfileError, OllamaRuntimeError, OllamaService
+from agent.platform_runtime import get_runtime_paths, resource_path
+from agent.runtime_config import RuntimeConfig, RuntimeConfigurationError, get_runtime_config
 
 from rich.console import Console
 
@@ -27,51 +22,66 @@ def _get_modelfile_path() -> str:
     Returns:
         str: Absolute path to the Modelfile.
     """
-    if hasattr(sys, '_MEIPASS'):
-        # PyInstaller extracts bundled files to sys._MEIPASS
-        return os.path.join(sys._MEIPASS, 'Modelfile')
-    # Default behavior: look in the same directory as main.py
-    return os.path.join(os.path.dirname(os.path.abspath(__file__)), 'Modelfile')
+    return str(resource_path("Modelfile"))
 
-def _ensure_model() -> None:
-    """Create the custom model from the Modelfile if it doesn't already exist.
-    
-    Checks Ollama's local registry for the required model. If missing, it triggers
-    a build process using the provided Modelfile to ensure the agent has the correct
-    environment and persona.
-    """
-    try:
-        # Check if the required custom model is already present in Ollama
-        ollama.show(MODEL_NAME)
-    except ollama.ResponseError:
-        # If the model is not found, build it from the local Modelfile
-        _console.print(f"[cyan bold]⟳  Building model '{MODEL_NAME}' from Modelfile…[/]")
-        ollama.create(model=MODEL_NAME, from_=_get_modelfile_path())
-        _console.print("[cyan bold]✓  Model ready.[/]\n")
+def _ensure_model(
+    config: RuntimeConfig | None = None,
+    service: OllamaService | None = None,
+) -> ModelStartupResult:
+    """Verify or safely stage-build Selene's managed model alias."""
+    runtime = config or get_runtime_config()
+    return ensure_managed_model(
+        config=runtime,
+        service=service,
+        modelfile_path=_get_modelfile_path(),
+    )
 
 
 def main() -> None:
     """Main execution point for the application."""
+    service: OllamaService | None = None
     try:
-        # Ensure the model is available before launching any interfaces
-        _ensure_model()
-        
-        # Check arguments to determine which interface to launch
+        runtime = get_runtime_config(refresh=True)
+        runtime_paths = get_runtime_paths()
+        _console.print(f"[cyan]Runtime profile:[/] {runtime.profile.value}")
+        _console.print(f"[dim]{runtime.selection_reason}[/]")
+        _console.print(
+            f"[dim]Runtime data: {runtime_paths.data_dir} ({runtime_paths.source})[/]"
+        )
+        for warning in runtime.warnings:
+            _console.print(f"[yellow]⚠ {warning}[/]")
+
+        service = OllamaService(runtime)
+        _console.print(f"[cyan bold]⟳  Verifying local model '{runtime.chat_model}'…[/]")
+        model_result = _ensure_model(runtime, service)
+        if model_result.action in {"built", "rebuilt"}:
+            _console.print(
+                f"[cyan bold]✓  Model {model_result.action} safely through a verified staging alias.[/]"
+            )
+        else:
+            _console.print(f"[cyan bold]✓  Model ready ({model_result.action}).[/]")
+        _console.print()
+
         if "--cli" in sys.argv:
-            # Launch the terminal-based interactive CLI
+            from agent.core import run
+
             run()
         else:
-            # Launch the threaded web server for the browser interface
             from agent.web import start_web_server
+
             start_web_server() 
     except KeyboardInterrupt:
-        # Gracefully handle Ctrl+C to exit without stack traces
         _console.print("\n[dim]Interrupted — goodbye.[/]")
-        sys.exit(0)
-    except ollama.ResponseError as exc:
-        # Catch and display Ollama-specific connection or model errors
-        _console.print(f"\n[red bold]Ollama error:[/red bold] {exc}", style="red")
-        sys.exit(1)
+    except (RuntimeConfigurationError, InvalidModelfileError, OllamaRuntimeError) as exc:
+        _console.print(f"\n[red bold]Selene startup failed:[/] {exc}", style="red")
+        raise SystemExit(1) from None
+    finally:
+        if service is not None:
+            service.coordinator.shutdown(cancel_active=True, wait=False)
+        tool_runner = sys.modules.get("agent.tool_runner")
+        shutdown = getattr(tool_runner, "shutdown_tool_runner", None)
+        if callable(shutdown):
+            shutdown(wait=False)
 
 
 if __name__ == "__main__":

@@ -7,6 +7,11 @@ function schema). Add new tools here as the agent grows. These schemas are
 passed directly to the LLM so it knows what tools are available and how to call them.
 """
 
+from __future__ import annotations
+
+from dataclasses import dataclass, replace
+from typing import Callable
+
 from tools.search import web_search
 from tools.web_scraper import web_scrape
 from tools.document import read_document
@@ -706,7 +711,7 @@ TOOL_SCHEMAS.extend([
 # ── Dispatch map ──────────────────────────────────────────────────────
 # Maps function names to their Python callables.
 
-TOOL_DISPATCH: dict[str, callable] = {
+TOOL_DISPATCH: dict[str, Callable] = {
     "get_current_datetime": get_current_datetime,
     "spreadsheet": spreadsheet,
     "web_search": web_search,
@@ -740,3 +745,233 @@ TOOL_DISPATCH.update({
     "codebase_indexer": codebase_indexer,
     "google_workspace": google_workspace,
 })
+
+
+# ── Execution metadata ────────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class ToolMetadata:
+    """Resource and safety contract used by every shared tool executor."""
+
+    name: str
+    read_only: bool
+    side_effecting: bool
+    parallel_safe: bool
+    idempotent: bool
+    network_bound: bool = False
+    cpu_heavy: bool = False
+    gpu_heavy: bool = False
+    requires_temporal_preflight: bool = False
+    supports_cancellation: bool = False
+    default_timeout_seconds: float = 60.0
+    max_output_chars: int = 20_000
+    fedora_support: str = "supported"
+    windows_support: str = "supported"
+    optional_dependencies: tuple[str, ...] = ()
+    model_exposed: bool = True
+
+    def __post_init__(self) -> None:
+        if self.read_only == self.side_effecting:
+            raise ValueError(f"{self.name}: exactly one of read_only/side_effecting must be true")
+        if self.parallel_safe and (self.side_effecting or self.cpu_heavy or self.gpu_heavy):
+            raise ValueError(f"{self.name}: heavy or side-effecting tools cannot be parallel-safe")
+        if self.default_timeout_seconds <= 0:
+            raise ValueError(f"{self.name}: default timeout must be positive")
+        if self.max_output_chars < 256:
+            raise ValueError(f"{self.name}: output bound is too small")
+
+
+def _metadata(
+    name: str,
+    *,
+    read_only: bool = True,
+    parallel_safe: bool = False,
+    idempotent: bool | None = None,
+    **values,
+) -> ToolMetadata:
+    side_effecting = not read_only
+    if idempotent is None:
+        idempotent = read_only
+    return ToolMetadata(
+        name=name,
+        read_only=read_only,
+        side_effecting=side_effecting,
+        parallel_safe=parallel_safe,
+        idempotent=idempotent,
+        **values,
+    )
+
+
+# This map is deliberately explicit. A new dispatch entry should not silently
+# inherit optimistic parallel/resource behavior.
+TOOL_METADATA: dict[str, ToolMetadata] = {
+    "get_current_datetime": _metadata(
+        "get_current_datetime", parallel_safe=True, default_timeout_seconds=5, max_output_chars=4_000
+    ),
+    "spreadsheet": _metadata(
+        "spreadsheet", read_only=False, default_timeout_seconds=120, max_output_chars=30_000,
+        optional_dependencies=("openpyxl",),
+    ),
+    "web_search": _metadata(
+        "web_search", parallel_safe=True, network_bound=True,
+        requires_temporal_preflight=True, default_timeout_seconds=90, max_output_chars=35_000,
+        optional_dependencies=("ddgs",),
+    ),
+    "web_scrape": _metadata(
+        "web_scrape", parallel_safe=True, network_bound=True,
+        requires_temporal_preflight=True, default_timeout_seconds=90, max_output_chars=50_000,
+        optional_dependencies=("requests", "beautifulsoup4"),
+    ),
+    "read_document": _metadata(
+        "read_document", cpu_heavy=True, default_timeout_seconds=120, max_output_chars=20_000,
+        optional_dependencies=("pypdf", "python-docx"),
+    ),
+    "read_file": _metadata(
+        "read_file", parallel_safe=True, default_timeout_seconds=20, max_output_chars=20_000
+    ),
+    "create_file": _metadata(
+        "create_file", read_only=False, default_timeout_seconds=120, max_output_chars=12_000
+    ),
+    "spotify_play": _metadata(
+        "spotify_play", read_only=False, network_bound=True, default_timeout_seconds=30,
+        max_output_chars=8_000, windows_support="partial", optional_dependencies=("dbus-python",),
+    ),
+    "open_browser": _metadata(
+        "open_browser", read_only=False, default_timeout_seconds=15, max_output_chars=8_000
+    ),
+    "view_code": _metadata(
+        "view_code", parallel_safe=True, default_timeout_seconds=20, max_output_chars=20_000
+    ),
+    "describe_image": _metadata(
+        "describe_image", gpu_heavy=True, supports_cancellation=True,
+        default_timeout_seconds=300, max_output_chars=24_000,
+        optional_dependencies=("ollama",),
+    ),
+    "open_terminal_at_path": _metadata(
+        "open_terminal_at_path", read_only=False, default_timeout_seconds=15, max_output_chars=8_000
+    ),
+    "launch_apps": _metadata(
+        "launch_apps", read_only=False, default_timeout_seconds=45, max_output_chars=12_000
+    ),
+    "open_app": _metadata(
+        "open_app", read_only=False, default_timeout_seconds=20, max_output_chars=8_000,
+        model_exposed=False,
+    ),
+    "google_workspace": _metadata(
+        "google_workspace", read_only=False, network_bound=True,
+        requires_temporal_preflight=True, default_timeout_seconds=120, max_output_chars=25_000,
+        optional_dependencies=("google-api-python-client", "cryptography"),
+    ),
+    "codebase_indexer": _metadata(
+        "codebase_indexer", read_only=False, cpu_heavy=True, gpu_heavy=True,
+        supports_cancellation=True,
+        default_timeout_seconds=900, max_output_chars=25_000,
+        optional_dependencies=("chromadb", "ollama"),
+    ),
+    "index_vault": _metadata(
+        "index_vault", read_only=False, cpu_heavy=True, gpu_heavy=True,
+        supports_cancellation=True,
+        default_timeout_seconds=900, max_output_chars=20_000,
+        optional_dependencies=("chromadb", "ollama"),
+    ),
+    "vault_search": _metadata(
+        "vault_search", gpu_heavy=True, supports_cancellation=True,
+        default_timeout_seconds=180, max_output_chars=20_000,
+        optional_dependencies=("chromadb", "ollama"),
+    ),
+    "delete_vault_item": _metadata(
+        "delete_vault_item", read_only=False, cpu_heavy=True,
+        default_timeout_seconds=120, max_output_chars=12_000, optional_dependencies=("chromadb",),
+    ),
+    "list_vaults": _metadata(
+        "list_vaults", default_timeout_seconds=60, max_output_chars=12_000,
+        optional_dependencies=("chromadb",),
+    ),
+    "list_vault_aliases": _metadata(
+        "list_vault_aliases", parallel_safe=True, default_timeout_seconds=10, max_output_chars=12_000
+    ),
+    "create_structured_note": _metadata(
+        "create_structured_note", read_only=False, default_timeout_seconds=60, max_output_chars=12_000
+    ),
+    "knowledge_graph_builder": _metadata(
+        "knowledge_graph_builder", cpu_heavy=True, default_timeout_seconds=60, max_output_chars=30_000
+    ),
+    "run_simulation": _metadata(
+        "run_simulation", cpu_heavy=True, default_timeout_seconds=120, max_output_chars=25_000
+    ),
+    "api_orchestrator": _metadata(
+        "api_orchestrator", read_only=False, network_bound=True,
+        requires_temporal_preflight=True, default_timeout_seconds=180, max_output_chars=30_000
+    ),
+    "context_memory_optimizer": _metadata(
+        "context_memory_optimizer", cpu_heavy=True, default_timeout_seconds=30, max_output_chars=25_000
+    ),
+    "reasoning_chain_debugger": _metadata(
+        "reasoning_chain_debugger", cpu_heavy=True, default_timeout_seconds=30, max_output_chars=25_000
+    ),
+    "automated_routine_executor": _metadata(
+        "automated_routine_executor", read_only=False, supports_cancellation=True,
+        default_timeout_seconds=300, max_output_chars=20_000
+    ),
+}
+
+
+TOOL_SCHEMA_BY_NAME: dict[str, dict] = {
+    str(entry.get("function", {}).get("name")): entry.get("function", {}).get("parameters", {})
+    for entry in TOOL_SCHEMAS
+    if entry.get("type") == "function" and entry.get("function", {}).get("name")
+}
+
+
+def get_tool_metadata(name: str, arguments: dict | None = None) -> ToolMetadata | None:
+    """Resolve metadata, including the few operations whose safety varies by action."""
+    metadata = TOOL_METADATA.get(name)
+    if metadata is None:
+        return None
+    action = str((arguments or {}).get("action") or "").casefold()
+    if name == "spreadsheet" and action in {"view", "read"}:
+        return replace(
+            metadata,
+            read_only=True,
+            side_effecting=False,
+            parallel_safe=True,
+            idempotent=True,
+        )
+    if name == "google_workspace" and action in {
+        "status", "list_calendars", "list_events", "list_tasks", "list_task_lists"
+    }:
+        return replace(
+            metadata,
+            read_only=True,
+            side_effecting=False,
+            parallel_safe=False,
+            idempotent=True,
+        )
+    if name == "automated_routine_executor" and action in {"list", "show"}:
+        return replace(
+            metadata,
+            read_only=True,
+            side_effecting=False,
+            parallel_safe=False,
+            idempotent=True,
+        )
+    return metadata
+
+
+def validate_tool_registry() -> list[str]:
+    """Return contract violations without making optional tools fail at import time."""
+    errors: list[str] = []
+    dispatch_names = set(TOOL_DISPATCH)
+    metadata_names = set(TOOL_METADATA)
+    schema_names = set(TOOL_SCHEMA_BY_NAME)
+    if dispatch_names - metadata_names:
+        errors.append(f"Dispatch tools missing metadata: {sorted(dispatch_names - metadata_names)}")
+    if metadata_names - dispatch_names:
+        errors.append(f"Metadata without dispatch handlers: {sorted(metadata_names - dispatch_names)}")
+    exposed_metadata = {name for name, value in TOOL_METADATA.items() if value.model_exposed}
+    if schema_names != exposed_metadata:
+        errors.append(
+            f"Model schema/metadata mismatch: schemas_only={sorted(schema_names - exposed_metadata)}, "
+            f"metadata_only={sorted(exposed_metadata - schema_names)}"
+        )
+    return errors

@@ -6,12 +6,14 @@ import hashlib
 import json
 import os
 import re
-import tempfile
 import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+from agent.cancellation import CancellationToken, OperationCancelled
+from agent.persistence import PersistenceError, atomic_write_json, read_json_preserved
 
 from tools.vault_embeddings import DEFAULT_EMBED_MODEL, embed_query, embed_texts
 from tools.vault_indexer import CHROMA_DIR, DATA_DIR, chunk_text_with_offsets, get_chroma_client
@@ -74,40 +76,34 @@ def _collection_name(root: str) -> str:
 def _load_state() -> dict:
     with _STATE_LOCK:
         try:
-            with open(STATE_FILE, "r", encoding="utf-8") as stream:
-                value = json.load(stream)
-            return value if isinstance(value, dict) else {}
-        except (OSError, json.JSONDecodeError):
+            return read_json_preserved(STATE_FILE, expected_type=dict)
+        except FileNotFoundError:
             return {}
 
 
 def _save_state(state: dict) -> None:
     with _STATE_LOCK:
-        directory = os.path.dirname(STATE_FILE)
-        os.makedirs(directory, exist_ok=True)
-        handle, temporary = tempfile.mkstemp(prefix="codebase-index-", suffix=".json", dir=directory)
-        try:
-            with os.fdopen(handle, "w", encoding="utf-8") as stream:
-                json.dump(state, stream, indent=2, ensure_ascii=False)
-                stream.flush()
-                os.fsync(stream.fileno())
-            os.replace(temporary, STATE_FILE)
-        finally:
-            if os.path.exists(temporary):
-                os.unlink(temporary)
+        atomic_write_json(STATE_FILE, state)
 
 
 def _is_indexable(path: Path) -> bool:
     return path.suffix.lower() in CODE_EXTENSIONS or path.name.casefold() in SPECIAL_FILES
 
 
-def _discover_files(root: str) -> tuple[list[Path], list[dict]]:
+def _discover_files(
+    root: str,
+    cancellation_token: CancellationToken | None = None,
+) -> tuple[list[Path], list[dict]]:
     files: list[Path] = []
     skipped: list[dict] = []
     total_bytes = 0
     for current, dirs, names in os.walk(root, followlinks=False):
+        if cancellation_token:
+            cancellation_token.raise_if_cancelled()
         dirs[:] = sorted(name for name in dirs if name not in IGNORED_DIRS and not os.path.islink(os.path.join(current, name)))
         for name in sorted(names):
+            if cancellation_token:
+                cancellation_token.raise_if_cancelled()
             path = Path(current, name)
             if not _is_indexable(path) or path.is_symlink():
                 continue
@@ -180,8 +176,14 @@ def _existing_ids(collection: Any) -> tuple[set[str], dict[str, set[str]]]:
     return set(ids), by_source
 
 
-def _index_repository(root: str, collection_name: str, model: str, now: float) -> dict:
-    files, discovery_skips = _discover_files(root)
+def _index_repository(
+    root: str,
+    collection_name: str,
+    model: str,
+    now: float,
+    cancellation_token: CancellationToken | None = None,
+) -> dict:
+    files, discovery_skips = _discover_files(root, cancellation_token)
     if not files:
         return {"error": "No supported UTF-8 source or project files were found", "codebase_path": root}
     try:
@@ -197,6 +199,8 @@ def _index_repository(root: str, collection_name: str, model: str, now: float) -
     indexed_chunks = 0
 
     for path in files:
+        if cancellation_token:
+            cancellation_token.raise_if_cancelled()
         relative = path.relative_to(root).as_posix()
         try:
             text = _read_source(path)
@@ -225,7 +229,13 @@ def _index_repository(root: str, collection_name: str, model: str, now: float) -
             } for item in chunks]
             embeddings: list[list[float]] = []
             for start in range(0, len(documents), DEFAULT_BATCH_SIZE):
-                embeddings.extend(embed_texts(documents[start:start + DEFAULT_BATCH_SIZE], model=model))
+                if cancellation_token:
+                    cancellation_token.raise_if_cancelled()
+                embeddings.extend(embed_texts(
+                    documents[start:start + DEFAULT_BATCH_SIZE],
+                    model=model,
+                    cancellation_token=cancellation_token,
+                ))
             collection.upsert(ids=ids, documents=documents, embeddings=embeddings, metadatas=metadatas)
             active_ids.update(ids)
             indexed_chunks += len(ids)
@@ -236,6 +246,8 @@ def _index_repository(root: str, collection_name: str, model: str, now: float) -
                 "line_count": text.count("\n") + (1 if text else 0),
                 "symbols": symbols,
             })
+        except OperationCancelled:
+            raise
         except Exception as exc:
             active_ids.update(previous_by_source.get(relative, set()))
             skipped.append({"file": relative, "reason": f"previous index preserved: {exc}"})
@@ -253,7 +265,13 @@ def _index_repository(root: str, collection_name: str, model: str, now: float) -
     overview_docs = [item["text"] for item in overview_chunks]
     try:
         collection.upsert(
-            ids=overview_ids, documents=overview_docs, embeddings=embed_texts(overview_docs, model=model),
+            ids=overview_ids,
+            documents=overview_docs,
+            embeddings=embed_texts(
+                overview_docs,
+                model=model,
+                cancellation_token=cancellation_token,
+            ),
             metadatas=[{
                 "source": "[repository overview]", "source_path": root, "filename": "[repository overview]",
                 "extension": "", "language": "Repository map", "chunk_index": item["index"],
@@ -265,6 +283,8 @@ def _index_repository(root: str, collection_name: str, model: str, now: float) -
         )
         active_ids.update(overview_ids)
         indexed_chunks += len(overview_ids)
+    except OperationCancelled:
+        raise
     except Exception as exc:
         skipped.append({"file": "[repository overview]", "reason": str(exc)})
         active_ids.update(previous_by_source.get("[repository overview]", set()))
@@ -276,7 +296,14 @@ def _index_repository(root: str, collection_name: str, model: str, now: float) -
         except Exception as exc:
             skipped.append({"file": "[stale index entries]", "reason": str(exc)})
 
-    state = _load_state()
+    try:
+        state = _load_state()
+    except PersistenceError as exc:
+        return {
+            "error": str(exc),
+            "state_file": STATE_FILE,
+            "preserved": True,
+        }
     state[root] = {
         "collection": collection_name,
         "last_indexed_at": now,
@@ -325,17 +352,31 @@ def _index_available(collection_name: str) -> bool:
         return False
 
 
-def _search(root: str, collection_name: str, query: str, model: str, top_k: int, max_chars: int) -> dict:
+def _search(
+    root: str,
+    collection_name: str,
+    query: str,
+    model: str,
+    top_k: int,
+    max_chars: int,
+    cancellation_token: CancellationToken | None = None,
+) -> dict:
     try:
         collection = get_chroma_client().get_collection(name=collection_name)
         count = collection.count()
         if not count:
             return {"error": "The codebase index is empty", "collection": collection_name}
         results = collection.query(
-            query_embeddings=[embed_query(query, model=model)],
+            query_embeddings=[embed_query(
+                query,
+                model=model,
+                cancellation_token=cancellation_token,
+            )],
             n_results=min(top_k, count),
             include=["documents", "metadatas", "distances"],
         )
+    except OperationCancelled:
+        raise
     except Exception as exc:
         return {"error": f"Could not search codebase index: {exc}", "collection": collection_name}
 
@@ -387,6 +428,7 @@ def codebase_indexer(
     model: str = DEFAULT_EMBED_MODEL,
     top_k: int = DEFAULT_TOP_K,
     max_chars: int = DEFAULT_MAX_CHARS,
+    cancellation_token: CancellationToken | None = None,
 ) -> str:
     """Index, inspect, or semantically query a local source repository.
 
@@ -403,21 +445,32 @@ def codebase_indexer(
         return _json({"error": "action must be query, index, or status"})
     if query is not None and len(str(query)) > 4000:
         return _json({"error": "query exceeds the 4000-character limit"})
+    if cancellation_token:
+        cancellation_token.raise_if_cancelled()
 
     now = time.time()
     collection_name = _collection_name(root)
-    status = _refresh_status(root, now)
+    try:
+        status = _refresh_status(root, now)
+    except PersistenceError as exc:
+        return _json({"error": str(exc), "state_file": STATE_FILE, "preserved": True})
     if action == "status":
         return _json({"codebase_path": root, "collection": collection_name, **status})
 
     refresh = bool(force_reindex) or action == "index" or status["needs_refresh"] or not _index_available(collection_name)
     index_result: dict | None = None
     if refresh:
-        with _INDEX_LOCK:
+        while not _INDEX_LOCK.acquire(timeout=0.1):
+            if cancellation_token:
+                cancellation_token.raise_if_cancelled()
+        try:
             # A second query may have waited while the first refreshed this repo.
             # Recheck inside the lock so simultaneous first-use requests do not
             # duplicate all embedding work.
-            locked_status = _refresh_status(root, time.time())
+            try:
+                locked_status = _refresh_status(root, time.time())
+            except PersistenceError as exc:
+                return _json({"error": str(exc), "state_file": STATE_FILE, "preserved": True})
             should_refresh = (
                 bool(force_reindex)
                 or action == "index"
@@ -425,11 +478,19 @@ def codebase_indexer(
                 or not _index_available(collection_name)
             )
             if should_refresh:
-                index_result = _index_repository(root, collection_name, model, now)
+                index_result = _index_repository(
+                    root,
+                    collection_name,
+                    model,
+                    now,
+                    cancellation_token,
+                )
                 if "error" in index_result:
                     return _json(index_result)
             else:
                 status = locked_status
+        finally:
+            _INDEX_LOCK.release()
     if action == "index" and not query:
         return _json(index_result or {"refreshed": False, "codebase_path": root, "collection": collection_name})
     if not query or not str(query).strip():
@@ -445,6 +506,14 @@ def codebase_indexer(
         max_chars = DEFAULT_MAX_CHARS
     top_k = max(1, min(20, top_k))
     max_chars = max(1000, min(30000, max_chars))
-    result = _search(root, collection_name, str(query).strip(), model, top_k, max_chars)
+    result = _search(
+        root,
+        collection_name,
+        str(query).strip(),
+        model,
+        top_k,
+        max_chars,
+        cancellation_token,
+    )
     result["refresh"] = index_result or {"refreshed": False, **status}
     return _json(result)

@@ -6,18 +6,20 @@ import base64
 import json
 import os
 import re
-import tempfile
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+from agent.persistence import atomic_write_bytes
+from agent.platform_runtime import get_runtime_paths
 
 
 SCOPES = (
     "https://www.googleapis.com/auth/calendar",
     "https://www.googleapis.com/auth/tasks",
 )
-DATA_DIR = Path(os.path.abspath(os.path.expanduser(os.environ.get("SELENE_DATA_DIR", "~/.selene-agent"))))
+DATA_DIR = get_runtime_paths().data_dir
 CREDENTIAL_PATH = DATA_DIR / "google_oauth.enc"
 KEY_PATH = DATA_DIR / ".credential-key"
 KEYRING_SERVICE = "selene-agent"
@@ -41,17 +43,7 @@ def _safe_error(exc: Exception) -> str:
 
 
 def _atomic_private_write(path: Path, data: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    handle, temporary = tempfile.mkstemp(prefix=f".{path.name}-", dir=path.parent)
-    try:
-        os.fchmod(handle, 0o600)
-        with os.fdopen(handle, "wb") as stream:
-            stream.write(data)
-        os.replace(temporary, path)
-        os.chmod(path, 0o600)
-    finally:
-        if os.path.exists(temporary):
-            os.unlink(temporary)
+    atomic_write_bytes(path, data, private=True)
 
 
 def _encryption_key(create: bool) -> bytes:

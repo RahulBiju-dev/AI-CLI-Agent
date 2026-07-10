@@ -1,7 +1,8 @@
 # Vector database for the searchable vault
 chromadb>=0.3.25
-# DBus support for Linux desktop integrations (like Spotify)
-dbus-python
+# DBus support for native Linux desktop integrations (like Spotify).  Keep it
+# out of native Windows environments where dbus-python cannot be installed.
+dbus-python; sys_platform == "linux"
 # DuckDuckGo search library for web querying
 ddgs
 # Official Ollama Python client for LLM interaction

@@ -3,18 +3,17 @@
 from __future__ import annotations
 
 import math
+import threading
+import time
 from typing import Any, List, Sequence
 
-import requests
+from agent.cancellation import CancellationToken
+from agent.ollama_runtime import OllamaRuntimeError, OllamaService
+from agent.runtime_config import get_runtime_config
 
-DEFAULT_EMBED_MODEL = "embeddinggemma"
-OLLAMA_EMBED_URLS = (
-    "http://127.0.0.1:11434/api/embed",
-)
-OLLAMA_LEGACY_EMBED_URL = "http://127.0.0.1:11434/api/embeddings"
-
-# Persistent session for connection pooling
-_SESSION = requests.Session()
+_RUNTIME_CONFIG = get_runtime_config()
+DEFAULT_EMBED_MODEL = _RUNTIME_CONFIG.embedding_model
+_EMBED_SERVICE = OllamaService(_RUNTIME_CONFIG)
 
 
 def _as_plain_data(response: Any) -> Any:
@@ -74,13 +73,17 @@ def _validate_embedding_count(embeddings: list[list[float]], expected: int) -> l
     return normalized
 
 
-def embed_texts(texts: Sequence[str], model: str = DEFAULT_EMBED_MODEL, timeout: int = 60) -> List[List[float]]:
+def embed_texts(
+    texts: Sequence[str],
+    model: str = DEFAULT_EMBED_MODEL,
+    timeout: int = 60,
+    cancellation_token: CancellationToken | None = None,
+) -> List[List[float]]:
     """
     Embed one or more texts using Ollama, returning Chroma-compatible vectors.
     
     This function communicates with a local Ollama instance to generate vector
-    embeddings for the provided strings. It supports batching and handles fallback
-    to the Ollama Python client if direct HTTP requests fail.
+    embeddings for the provided strings through the shared resource coordinator.
     
     Args:
         texts (Sequence[str]): A list or tuple of string documents to embed.
@@ -91,66 +94,45 @@ def embed_texts(texts: Sequence[str], model: str = DEFAULT_EMBED_MODEL, timeout:
         List[List[float]]: A list of floating-point vectors corresponding to the inputs.
         
     Raises:
-        RuntimeError: If all connection methods to Ollama fail or if the shape of the
-                      returned embeddings does not match the inputs.
+        RuntimeError: If Ollama fails or the returned vectors do not match the inputs.
     """
     inputs = _clean_inputs(texts)
     if not inputs:
         return []
 
     timeout = max(1, min(int(timeout), 300))
-    last_error: Exception | None = None
-    payload = {"model": model, "input": inputs}
-
-    for url in OLLAMA_EMBED_URLS:
-        try:
-            resp = _SESSION.post(url, json=payload, timeout=timeout)
-            resp.raise_for_status()
-            return _validate_embedding_count(normalize_embeddings(resp.json()), len(inputs))
-        except Exception as exc:
-            last_error = exc
-
-    # Ollama versions before /api/embed accepted one prompt per request at
-    # /api/embeddings. Keep this compatibility path explicit, but concurrent
-    # to significantly improve latency on bulk embedding tasks.
+    thread_id = threading.get_ident()
+    coordinator = _EMBED_SERVICE.coordinator
+    owner = (
+        f"tool:{thread_id}"
+        if coordinator.is_owned_by_current_context()
+        else f"embedding:{thread_id}:{time.monotonic_ns()}"
+    )
     try:
-        from concurrent.futures import ThreadPoolExecutor
-
-        legacy_embeddings = []
-
-        def _fetch_legacy_embedding(text: str) -> list[list[float]]:
-            resp = _SESSION.post(OLLAMA_LEGACY_EMBED_URL, json={"model": model, "prompt": text}, timeout=timeout)
-            resp.raise_for_status()
-            return normalize_embeddings(resp.json())
-
-        # Use up to 10 threads to avoid overwhelming a local LLM server
-        with ThreadPoolExecutor(max_workers=10) as executor:
-            # map ensures results are returned in the exact order of `inputs`
-            results = executor.map(_fetch_legacy_embedding, inputs)
-
-            for emb_list in results:
-                legacy_embeddings.extend(emb_list)
-
-        return _validate_embedding_count(legacy_embeddings, len(inputs))
-    except Exception as exc:
-        last_error = exc
-
-    try:
-        import ollama
-
-        if hasattr(ollama, "embed"):
-            return _validate_embedding_count(normalize_embeddings(ollama.embed(model=model, input=inputs)), len(inputs))
-        if hasattr(ollama, "Embeddings"):
-            client = ollama.Embeddings()
-            return _validate_embedding_count(normalize_embeddings(client.create(model=model, input=inputs)), len(inputs))
-    except Exception as exc:
-        last_error = exc
-
-    raise RuntimeError("Failed to obtain embeddings via HTTP or ollama client: %s" % last_error)
+        response = _EMBED_SERVICE.embed(
+            inputs,
+            owner=owner,
+            model=model,
+            cancellation_token=cancellation_token,
+            operation_timeout=timeout,
+        )
+        return _validate_embedding_count(normalize_embeddings(response), len(inputs))
+    except OllamaRuntimeError as exc:
+        raise RuntimeError(f"Failed to obtain coordinated Ollama embeddings: {exc}") from exc
 
 
-def embed_query(text: str, model: str = DEFAULT_EMBED_MODEL, timeout: int = 30) -> List[float]:
-    embeddings = embed_texts([text], model=model, timeout=timeout)
+def embed_query(
+    text: str,
+    model: str = DEFAULT_EMBED_MODEL,
+    timeout: int = 30,
+    cancellation_token: CancellationToken | None = None,
+) -> List[float]:
+    embeddings = embed_texts(
+        [text],
+        model=model,
+        timeout=timeout,
+        cancellation_token=cancellation_token,
+    )
     if not embeddings:
         raise RuntimeError("Ollama returned no embedding for query")
     return embeddings[0]

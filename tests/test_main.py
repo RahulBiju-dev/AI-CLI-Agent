@@ -1,17 +1,20 @@
 import sys
 import os
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
-# Mock modules to prevent import errors during test collection
-sys.modules['ollama'] = unittest.mock.MagicMock()
-sys.modules['agent'] = unittest.mock.MagicMock()
-sys.modules['agent.core'] = unittest.mock.MagicMock()
-sys.modules['agent.web'] = unittest.mock.MagicMock()
-sys.modules['rich'] = unittest.mock.MagicMock()
-sys.modules['rich.console'] = unittest.mock.MagicMock()
-
-import main
+# Mock expensive startup dependencies only while importing this test subject;
+# restoring sys.modules prevents this module from poisoning later test imports.
+with patch.dict(sys.modules, {
+    'ollama': unittest.mock.MagicMock(),
+    'agent.core': unittest.mock.MagicMock(),
+    'agent.web': unittest.mock.MagicMock(),
+    'rich': unittest.mock.MagicMock(),
+    'rich.console': unittest.mock.MagicMock(),
+}):
+    import main
 from main import _get_modelfile_path
 
 class TestMain(unittest.TestCase):
@@ -25,10 +28,12 @@ class TestMain(unittest.TestCase):
         self.assertEqual(path, expected)
 
     def test_get_modelfile_path_meipass(self):
-        with patch.object(sys, '_MEIPASS', '/tmp/fake_meipass', create=True):
-            path = _get_modelfile_path()
-            expected = os.path.join('/tmp/fake_meipass', 'Modelfile')
-            self.assertEqual(path, expected)
+        with tempfile.TemporaryDirectory() as temporary:
+            expected = Path(temporary) / 'Modelfile'
+            expected.touch()
+            with patch.object(sys, '_MEIPASS', temporary, create=True):
+                path = _get_modelfile_path()
+            self.assertEqual(path, str(expected))
 
 if __name__ == '__main__':
     unittest.main()

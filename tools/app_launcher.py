@@ -7,7 +7,6 @@ on Linux, macOS, and Windows in a detached, non-blocking background process.
 
 import os
 import re
-import sys
 import shlex
 import shutil
 import subprocess
@@ -15,6 +14,14 @@ import json
 import threading
 import time
 from pathlib import Path
+
+from agent.platform_runtime import (
+    linux_application_dirs,
+    open_native_target,
+    platform_family,
+    spawn_detached,
+    windows_start_menu_dirs,
+)
 
 
 _APP_CACHE: tuple[float, list[dict]] = (0.0, [])
@@ -26,10 +33,27 @@ MAX_APPS_PER_REQUEST = 10
 # programs can turn an innocent-looking app request into arbitrary command access.
 _BLOCKED_EXECUTABLES = {
     "bash", "cmd", "cmd.exe", "command", "dash", "fish", "gnome-terminal",
-    "konsole", "osascript", "powershell", "powershell.exe", "pwsh", "sh",
-    "terminal", "terminal.app", "wscript", "wscript.exe", "xterm", "zsh",
+    "kgx", "konsole", "osascript", "powershell", "powershell.exe", "ptyxis",
+    "pwsh", "sh", "terminal", "terminal.app", "wscript", "wscript.exe",
+    "xfce4-terminal", "xterm", "zsh",
+}
+_BLOCKED_APP_NAMES = {
+    "commandprompt", "cmd", "gnomeconsole", "gnometerminal", "konsole",
+    "powershell", "powershell7", "ptyxis", "terminal", "windowspowershell",
+    "windowsterminal", "xfce4terminal", "xterm",
 }
 _SAFE_APP_NAME = re.compile(r"^[\w .+&'()@#-]+$", flags=re.UNICODE)
+
+
+def _is_prohibited_app_name(value: object) -> bool:
+    normalized = _normalize_app_name(str(value or ""))
+    return (
+        normalized in _BLOCKED_APP_NAMES
+        or "uninstall" in normalized
+        or normalized.startswith(("powershell", "windowspowershell"))
+        or normalized.endswith(("terminal", "commandprompt"))
+        or normalized in {"bash", "fish", "gitbash", "pwsh", "zsh"}
+    )
 
 
 # ── Linux Desktop Entry Parser ────────────────────────────────────────
@@ -106,15 +130,9 @@ def _get_installed_apps() -> list[dict]:
         if cached_apps and time.monotonic() - cached_at < _APP_CACHE_SECONDS:
             return [dict(app) for app in cached_apps]
 
-    xdg_dirs = [part for part in os.environ.get("XDG_DATA_DIRS", "/usr/local/share:/usr/share").split(os.pathsep) if part]
     # User entries precede system entries because desktop files with the same
     # ID are user-overridable under the XDG specification.
-    app_dirs = [os.path.expanduser("~/.local/share/applications")]
-    app_dirs.extend(os.path.join(d, "applications") for d in xdg_dirs)
-    # Add flatpak applications export directory if not already included
-    flatpak_dir = "/var/lib/flatpak/exports/share/applications"
-    if flatpak_dir not in app_dirs:
-        app_dirs.append(flatpak_dir)
+    app_dirs = linux_application_dirs()
 
     apps = []
     seen_files = set()
@@ -190,14 +208,6 @@ def _clean_exec_line(exec_str: str) -> list[str]:
     return [part for part in cmd_parts if part]
 
 
-def _find_terminal_emulator() -> str | None:
-    """Find a supported terminal emulator on Linux to launch CLI-only apps."""
-    for term in ("gnome-terminal", "konsole", "xfce4-terminal", "xterm", "alacritty", "kitty"):
-        if shutil.which(term):
-            return term
-    return None
-
-
 def _normalize_app_name(value: str) -> str:
     """Normalize a human-facing app name for comparisons (``VS Code`` -> ``vscode``)."""
     return "".join(character for character in value.casefold() if character.isalnum())
@@ -214,10 +224,12 @@ def _validate_app_name(app_name: object) -> str:
         raise ValueError("Use an application display name, not a filesystem location.")
     if not _SAFE_APP_NAME.fullmatch(value):
         raise ValueError("Use an application name only; paths, URLs, and command syntax are not accepted.")
+    if re.search(r"(?:^|\s)--?[\w]", value, flags=re.UNICODE):
+        raise ValueError("Application flags are not accepted; use the installed display name only.")
     if "/" in value or "\\" in value or value.casefold().endswith((".desktop", ".lnk")):
         raise ValueError("Use the application's display name, not a file path or shortcut path.")
-    if value.casefold() in _BLOCKED_EXECUTABLES:
-        raise ValueError("Shells and terminal applications cannot be launched by this tool.")
+    if value.casefold() in _BLOCKED_EXECUTABLES or _is_prohibited_app_name(value):
+        raise ValueError("Shells, terminals, and uninstallers cannot be launched by this tool.")
     return value
 
 
@@ -226,33 +238,61 @@ def _is_safe_desktop_entry(app: dict) -> bool:
     command = _clean_exec_line(app.get("exec", ""))
     if not command:
         return False
-    executable = os.path.basename(command[0]).casefold()
-    return not app.get("terminal", False) and executable not in _BLOCKED_EXECUTABLES
+    executable_index = 0
+    executable = os.path.basename(command[executable_index]).casefold()
+    # Some legitimate desktop records use ``env NAME=value executable``. Look
+    # through that narrow wrapper so it cannot hide a shell or terminal.
+    if executable == "env":
+        executable_index += 1
+        while executable_index < len(command):
+            token = command[executable_index]
+            if token.startswith("-") or ("=" in token and not token.startswith(("/", "\\"))):
+                executable_index += 1
+                continue
+            break
+        if executable_index >= len(command):
+            return False
+        executable = os.path.basename(command[executable_index]).casefold()
+    return (
+        not app.get("terminal", False)
+        and executable not in _BLOCKED_EXECUTABLES
+        and not _is_prohibited_app_name(app.get("name", ""))
+    )
+
+
+def _is_safe_windows_shortcut(shortcut: Path) -> bool:
+    """Reject discovered Start Menu records for shells, terminals, and uninstallers."""
+    normalized = _normalize_app_name(shortcut.stem)
+    return bool(normalized) and not _is_prohibited_app_name(shortcut.stem)
 
 
 def _find_windows_shortcut(query: str) -> tuple[Path | None, list[str]]:
     """Resolve a display name to an installed Start Menu shortcut."""
-    roots = []
-    for environment_name, suffix in (
-        ("APPDATA", ("Microsoft", "Windows", "Start Menu", "Programs")),
-        ("PROGRAMDATA", ("Microsoft", "Windows", "Start Menu", "Programs")),
-    ):
-        base = os.environ.get(environment_name)
-        if base:
-            roots.append(Path(base).joinpath(*suffix))
-
+    roots = windows_start_menu_dirs()
     normalized = _normalize_app_name(query)
-    matches = []
+    matches: list[Path] = []
+    inspected = 0
     for root in roots:
         if not root.is_dir():
             continue
         try:
-            shortcuts = root.rglob("*.lnk")
-            for shortcut in shortcuts:
-                if normalized in _name_aliases(shortcut.stem):
-                    matches.append(shortcut)
+            for current, directories, files in os.walk(root, followlinks=False):
+                directories[:] = sorted(directories)[:500]
+                for filename in sorted(files):
+                    inspected += 1
+                    if inspected > 5000:
+                        break
+                    if not filename.casefold().endswith((".lnk", ".appref-ms")):
+                        continue
+                    shortcut = Path(current, filename)
+                    if _is_safe_windows_shortcut(shortcut) and normalized in _name_aliases(shortcut.stem):
+                        matches.append(shortcut)
+                if inspected > 5000:
+                    break
         except OSError:
             continue
+        if inspected > 5000:
+            break
     unique = {str(item).casefold(): item for item in matches}
     values = list(unique.values())
     if len(values) == 1:
@@ -395,10 +435,10 @@ def open_app(app_name: str, confirmed: bool = False) -> str:
     except ValueError as exc:
         return json.dumps({"error": str(exc)})
 
-    platform = sys.platform
+    platform = platform_family()
 
     # ── macOS ─────────────────────────────────────────────────────────
-    if platform == "darwin":
+    if platform == "macos":
         try:
             check = subprocess.run(
                 ["open", "-Ra", app_name],
@@ -410,21 +450,18 @@ def open_app(app_name: str, confirmed: bool = False) -> str:
             if check.returncode != 0:
                 return json.dumps({"error": f"Could not find an installed application named '{app_name}'."})
             # We use `open -a` to start applications on macOS
-            subprocess.Popen(
-                ["open", "-a", app_name],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                start_new_session=True
-            )
+            spawn_detached(["open", "-a", app_name], platform_name="macos")
             return json.dumps({
                 "success": True,
-                "message": f"Sent launch request for application '{app_name}' via open -a."
+                "backend": "macos-open",
+                "launch_requested": True,
+                "message": f"Sent launch request for application '{app_name}' via open -a; startup was not verified."
             })
         except Exception as e:
             return json.dumps({"error": f"Failed to launch '{app_name}' on macOS: {str(e)}"})
 
     # ── Windows ───────────────────────────────────────────────────────
-    elif platform == "win32":
+    elif platform == "windows":
         try:
             shortcut, suggestions = _find_windows_shortcut(app_name)
             if not shortcut:
@@ -434,10 +471,14 @@ def open_app(app_name: str, confirmed: bool = False) -> str:
                 return json.dumps(response)
             # Only a shortcut discovered beneath a Start Menu directory reaches
             # ShellExecute; user input itself is never treated as a path.
-            os.startfile(str(shortcut))  # type: ignore[attr-defined]
+            launch = open_native_target(shortcut, platform_name="windows")
+            if not launch.ok:
+                return json.dumps(launch.as_dict(), ensure_ascii=False)
             return json.dumps({
                 "success": True,
-                "message": f"Sent launch request for application '{shortcut.stem}'."
+                "backend": launch.backend,
+                "launch_requested": True,
+                "message": f"Sent launch request for application '{shortcut.stem}'; startup was not verified."
             })
         except Exception as e:
             return json.dumps({"error": f"Failed to launch '{app_name}' on Windows: {str(e)}"})
@@ -468,16 +509,12 @@ def open_app(app_name: str, confirmed: bool = False) -> str:
         gtk_launch_bin = shutil.which("gtk-launch")
         if gtk_launch_bin:
             try:
-                subprocess.Popen(
-                    [gtk_launch_bin, matched["filename"]],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    stdin=subprocess.DEVNULL,
-                    start_new_session=True
-                )
+                spawn_detached([gtk_launch_bin, matched["filename"]], platform_name="linux")
                 return json.dumps({
                     "success": True,
-                    "message": f"Opened application '{matched['name']}' ({matched['filename']}) via gtk-launch."
+                    "backend": "linux-gtk-launch",
+                    "launch_requested": True,
+                    "message": f"Sent launch request for '{matched['name']}' ({matched['filename']}) via gtk-launch; startup was not verified."
                 })
             except Exception:
                 # Fall through to manual exec if gtk-launch fails
@@ -489,16 +526,12 @@ def open_app(app_name: str, confirmed: bool = False) -> str:
             return json.dumps({"error": f"Application '{matched['name']}' has an empty or invalid Exec entry."})
 
         try:
-            subprocess.Popen(
-                cmd_parts,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                stdin=subprocess.DEVNULL,
-                start_new_session=True
-            )
+            spawn_detached(cmd_parts, platform_name="linux")
             return json.dumps({
                 "success": True,
-                "message": f"Launched application '{matched['name']}'."
+                "backend": "linux-desktop-exec",
+                "launch_requested": True,
+                "message": f"Sent launch request for application '{matched['name']}'; startup was not verified."
             })
         except Exception as e:
             return json.dumps({
