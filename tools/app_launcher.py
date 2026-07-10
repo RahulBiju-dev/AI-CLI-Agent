@@ -266,6 +266,77 @@ def _is_safe_windows_shortcut(shortcut: Path) -> bool:
     return bool(normalized) and not _is_prohibited_app_name(shortcut.stem)
 
 
+def _is_safe_windows_target(target: Path | None) -> bool:
+    """Reject resolved shortcut targets that would become command runners."""
+    if target is None:
+        return False
+    try:
+        # Use Windows path semantics so Linux unit tests and mixed-separator
+        # strings still evaluate basenames correctly.
+        from pathlib import PureWindowsPath
+
+        windows_path = PureWindowsPath(str(target))
+        name = windows_path.name.casefold()
+        stem = windows_path.stem.casefold()
+    except (OSError, TypeError, ValueError):
+        return False
+    if name in _BLOCKED_EXECUTABLES or stem in _BLOCKED_EXECUTABLES:
+        return False
+    if _is_prohibited_app_name(stem) or _is_prohibited_app_name(name):
+        return False
+    if "uninstall" in _normalize_app_name(name) or "uninstall" in _normalize_app_name(stem):
+        return False
+    # Reject obvious helper shells even when renamed by packaging.
+    if name.endswith((".bat", ".cmd", ".vbs", ".ps1", ".js")):
+        return False
+    return True
+
+
+def resolve_windows_shortcut_target(shortcut: Path) -> Path | None:
+    """Resolve a Start Menu ``.lnk`` target without launching it.
+
+    Uses Windows Script Host COM through PowerShell so Selene never depends on
+    a third-party binary parser. Returns ``None`` when the target cannot be
+    resolved safely.
+    """
+    try:
+        shortcut_path = Path(shortcut)
+    except TypeError:
+        return None
+    if not str(shortcut_path).casefold().endswith(".lnk"):
+        # ClickOnce appref-ms records are opened as the discovered record itself.
+        return shortcut_path if shortcut_path.exists() else None
+    if platform_family() != "windows":
+        return None
+    ps = shutil.which("powershell") or shutil.which("pwsh")
+    if not ps:
+        return None
+    # PowerShell string literal uses single quotes; escape embedded quotes.
+    literal = str(shortcut_path).replace("'", "''")
+    script = (
+        f"$s = (New-Object -ComObject WScript.Shell).CreateShortcut('{literal}'); "
+        "$s.TargetPath"
+    )
+    try:
+        completed = subprocess.run(
+            [ps, "-NoProfile", "-NonInteractive", "-Command", script],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+            shell=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    target_text = (completed.stdout or "").strip().splitlines()
+    if completed.returncode != 0 or not target_text:
+        return None
+    target = Path(target_text[-1].strip().strip('"'))
+    if not target.is_absolute() or not target.exists():
+        return None
+    return target
+
+
 def _find_windows_shortcut(query: str) -> tuple[Path | None, list[str]]:
     """Resolve a display name to an installed Start Menu shortcut."""
     roots = windows_start_menu_dirs()
@@ -469,17 +540,45 @@ def open_app(app_name: str, confirmed: bool = False) -> str:
                 if suggestions:
                     response["suggestions"] = suggestions
                 return json.dumps(response)
+            # Validate the resolved target so a Start Menu label cannot hide a
+            # shell, uninstaller, or script helper.
+            target = resolve_windows_shortcut_target(shortcut)
+            if target is not None and not _is_safe_windows_target(target):
+                return json.dumps({
+                    "error": (
+                        f"Start Menu entry '{shortcut.stem}' resolves to a blocked "
+                        f"target and cannot be launched by this tool."
+                    ),
+                    "target": str(target),
+                })
+            if (
+                str(shortcut).casefold().endswith(".lnk")
+                and target is None
+                and platform_family() == "windows"
+            ):
+                return json.dumps({
+                    "error": (
+                        f"Could not validate the target for Start Menu entry "
+                        f"'{shortcut.stem}'; launch was refused."
+                    ),
+                })
             # Only a shortcut discovered beneath a Start Menu directory reaches
             # ShellExecute; user input itself is never treated as a path.
             launch = open_native_target(shortcut, platform_name="windows")
             if not launch.ok:
                 return json.dumps(launch.as_dict(), ensure_ascii=False)
-            return json.dumps({
+            payload = {
                 "success": True,
                 "backend": launch.backend,
                 "launch_requested": True,
-                "message": f"Sent launch request for application '{shortcut.stem}'; startup was not verified."
-            })
+                "message": (
+                    f"Sent launch request for application '{shortcut.stem}'; "
+                    "startup was not verified."
+                ),
+            }
+            if target is not None:
+                payload["target"] = str(target)
+            return json.dumps(payload)
         except Exception as e:
             return json.dumps({"error": f"Failed to launch '{app_name}' on Windows: {str(e)}"})
 

@@ -1,6 +1,8 @@
-# AI CLI Agent
+# Selene (AI CLI Agent)
 
 A modular, tool-augmented local AI agent built with Python and [Ollama](https://ollama.com/). Inference, conversation storage, and document memory stay local; optional integrations such as Google Calendar and Google Tasks contact their provider only after user-authorized OAuth. The agent wraps a customised [Gemma 4](https://ai.google.dev/gemma) model with an autonomous tool-calling loop, real-time streaming output, and a persistent RAG (Retrieval-Augmented Generation) vault for long-term document memory.
+
+**Fedora Linux is the primary development and reference platform.** Windows 10/11 are supported natively (no WSL or Unix compatibility layer). See [docs/platform-support.md](docs/platform-support.md) for the full tool and backend matrix.
 
 By default the agent launches a **modern browser-based Web UI** with live streaming, collapsible thinking panels, and an interactive sidebar. The classic terminal interface is still available via `--cli`.
 
@@ -21,8 +23,10 @@ By default the agent launches a **modern browser-based Web UI** with live stream
   - [Codebase Indexer](#codebase-indexer)
   - [Google Calendar and Tasks](#google-calendar-and-tasks)
 - [Architecture](#architecture)
+- [Platform support](#platform-support)
 - [Prerequisites](#prerequisites)
 - [Installation](#installation)
+- [Diagnostics](#diagnostics)
 - [Usage](#usage)
   - [Web UI (Default)](#web-ui-default)
   - [Terminal CLI](#terminal-cli)
@@ -31,6 +35,7 @@ By default the agent launches a **modern browser-based Web UI** with live stream
   - [Runtime Configuration](#runtime-configuration)
 - [Performance Tuning](#performance-tuning)
 - [Project Structure](#project-structure)
+- [Testing](#testing)
 - [Contributing](#contributing)
 - [License](#license)
 
@@ -407,24 +412,54 @@ Example routine definition:
 
 ---
 
+## Platform support
+
+| Platform | Role | Notes |
+|----------|------|-------|
+| **Fedora Linux** | Primary / reference | DBus Spotify, desktop entries, XDG paths, GNOME terminals, AppImage |
+| **Windows 10/11** | Native secondary | No WSL required; Start Menu apps, Windows Terminal/PowerShell/cmd, LocalAppData runtime |
+
+Authoritative matrix (every registered tool): [docs/platform-support.md](docs/platform-support.md). Contributor architecture rules: [AGENTS.md](AGENTS.md).
+
+### Runtime data paths
+
+Selection order (no silent migration or copy):
+
+1. `SELENE_DATA_DIR` (if set)
+2. Existing legacy store `~/.selene-agent` (kept in place when present)
+3. Platform default:
+   - Linux: XDG data/state/config/cache under the Selene app name
+   - Windows: `%LOCALAPPDATA%\Selene`
+
+### Spotify / PDF notes
+
+- **Fedora:** Spotify uses MPRIS over DBus (`dbus-python` is Linux-only in `requirements.txt`).
+- **Windows:** Spotify uses a URI launch backend and never claims confirmed playback.
+- **PDF text** works with `pypdf` alone. **PDF-to-image** needs Poppler (`poppler-utils` on Fedora; set `POPPLER_PATH` / `SELENE_POPPLER_PATH` on Windows if needed).
+
+---
+
 ## Prerequisites
 
 - **[Ollama](https://ollama.com/)** installed and running (`ollama serve`)
-- **Python 3.10+**
+- **Python 3.10+** (CI validates 3.11/3.12; local Fedora hosts may be newer)
 - **Gemma 4 E4B model:** `ollama pull gemma4:e4b`
 - **Embedding model (for vault):** `ollama pull embeddinggemma`
+- **Vision model (optional):** `ollama pull moondream`
 - **For Spotify:** Spotify desktop app. On Linux, `dbus-python` is also required (pre-installed on most GNOME/Fedora systems).
 
 ---
 
 ## Installation
 
+### Fedora
+
 ```bash
 # Clone the repository
 git clone https://github.com/RahulBiju-dev/AI-CLI-Agent.git
 cd AI-CLI-Agent
 
-# Install system dependencies (for PDF vision support)
+# Optional: PDF page images (text extraction works without this)
 sudo dnf install poppler-utils -y
 
 # Install Python dependencies
@@ -433,11 +468,27 @@ pip install -r requirements.txt
 # Ensure Ollama has the required models
 ollama pull gemma4:e4b
 ollama pull embeddinggemma
-ollama pull moondream
+ollama pull moondream   # optional vision
+
+# Non-destructive environment check
+python main.py --doctor
 
 # Start the agent (auto-builds the custom model on first run)
 python main.py
 ```
+
+### Windows (native)
+
+```powershell
+git clone https://github.com/RahulBiju-dev/AI-CLI-Agent.git
+cd AI-CLI-Agent
+python -m pip install -r requirements.txt
+# dbus-python is skipped automatically via environment markers
+python main.py --doctor
+python main.py
+```
+
+Optional PDF images on Windows: install Poppler and set `SELENE_POPPLER_PATH` to its `bin` directory.
 
 ### Multimodal Vision Capabilities
 The agent supports memory-safe multimodal vision, allowing it to read slides, diagrams, and architectures from large PDFs without RAM exhaustion.
@@ -445,12 +496,23 @@ The agent supports memory-safe multimodal vision, allowing it to read slides, di
 
 ### What happens on first run
 
-The agent calls `ollama create selene -f Modelfile` to build a custom model variant that bundles:
+The agent uses a **staged managed-model lifecycle**: build under a temporary alias, inspect, publish to the live `selene` alias, then record Modelfile hash metadata. It never pre-deletes the live alias. The Modelfile bundles:
 - The Gemma 4 base weights
 - A system prompt with personality, knowledge cutoff rules, and tool-use instructions
-- Tuned sampling parameters (`temperature`, `num_ctx`, `num_batch`, `num_predict`)
+- Conservative sampling parameters aligned with the selected hardware profile
 
-This custom model is cached by Ollama and reused on subsequent runs.
+This custom model is cached by Ollama and reused on subsequent runs when the Modelfile hash matches.
+
+---
+
+## Diagnostics
+
+```bash
+python main.py --doctor
+python main.py --doctor --json
+```
+
+Reports Python/OS, runtime paths and writability, hardware profile, Ollama availability, model presence, GPU probe (when safe), tool-registry consistency, optional dependencies, terminal/Spotify capabilities, Poppler, port availability, and packaged resources. Secrets and personal document contents are never printed. Individual check failures do not abort the rest of the report.
 
 ---
 
@@ -485,11 +547,16 @@ Selene can be built into a standalone desktop application using Electron and PyI
 4. **Build the Electron App**:
    Package the application for your operating system:
    ```bash
-   bun run build
+   bun run build          # backend + Linux AppImage
+   bun run build:windows  # backend + Windows NSIS (on Windows hosts)
    ```
-   The Linux build is written to `dist-electron/Selene-1.0.0.AppImage`, replacing any
-   existing artifact at that path. Other platform binaries are also output to the
-   `dist-electron/` folder.
+   Artifacts use the version from `package.json` (for example
+   `dist-electron/Selene-2.2.0.AppImage` or `Selene-2.2.0-Setup.exe`). The
+   packaging helper always forces `--publish never`. NSIS uninstall leaves user
+   runtime data intact.
+
+   The PyInstaller backend keeps a console for Electron's stdout port-readiness
+   contract; Electron launches it with a hidden console on Windows.
 
 ## Usage
 
@@ -617,14 +684,17 @@ Available parameters: `temperature`, `top_p`, `top_k`, `num_ctx`, `num_predict`,
 
 ## Performance Tuning
 
-The default configuration is optimised for consumer hardware (4-8GB VRAM GPUs). Key parameters in the `Modelfile`:
+Selene selects a **hardware profile** at startup (`auto`, `low-vram`, `balanced`, `manual`). When VRAM cannot be measured, or a ~4 GiB class GPU is detected, the conservative **low-vram** profile is used:
 
-| Parameter | Default | Purpose |
-|-----------|---------|---------|
-| `num_ctx` | 8192 | Context window size. Increase for more history, decrease for faster tok/s |
-| `num_predict` | 2048 | Max tokens per response. Prevents runaway generation |
-| `num_batch` | 512 | Prompt evaluation batch size. Higher = faster prefill on capable GPUs |
-| `temperature` | 0.4 | Sampling temperature. Lower = more deterministic |
+| Setting | low-vram (default safeguard) | Purpose |
+|---------|------------------------------|---------|
+| `num_ctx` | 4096 | Context window — keeps first-turn tool schemas viable on 4 GiB |
+| `num_predict` | 768 | Output ceiling |
+| `num_batch` | 128 | Prefill batch size |
+| model slots | 1 | Serializes chat/embed/vision under the Ollama coordinator |
+| tool workers | 2 | Bounded parallel tool execution |
+
+These are **safeguards**, not a claim of measured optimality for every RTX 3050 Ti 4 GB host. Override via environment (`SELENE_PROFILE`, `SELENE_NUM_CTX`, …) or session `/set` commands after reading `python main.py --doctor`.
 
 ### Ollama Environment Variables
 
@@ -637,20 +707,20 @@ export OLLAMA_FLASH_ATTENTION=1
 # Single user mode (max throughput)
 export OLLAMA_NUM_PARALLEL=1
 
-# Keep model loaded between requests (note: the agent also sets keep_alive=30m per-request)
+# Keep model loaded between requests (note: the agent also sets keep_alive per-request)
 export OLLAMA_KEEP_ALIVE=30m
 ```
 
-### Memory Budgets
+### Memory Budgets (approximate)
 
 | `num_ctx` | Approx. KV Cache | Recommended VRAM |
 |-----------|-------------------|------------------|
 | 2048 | ~0.5 GB | 4 GB+ |
-| 4096 | ~1.0 GB | 4 GB+ |
+| 4096 | ~1.0 GB | 4 GB+ (Selene low-vram default) |
 | 8192 | ~2.0 GB | 6 GB+ |
 | 16384 | ~4.0 GB | 8 GB+ |
-| 32768 | ~8.0 GB | 12 GB+ |
-| 65536 | ~16 GB | 24 GB+ |
+
+Exact VRAM use depends on model weights, quantization, and concurrent workloads.
 
 > **Rule of thumb:** If your tok/s drops below ~10 for simple queries, your KV cache is probably spilling to system RAM. Lower `num_ctx` until it fits in VRAM.
 
@@ -720,16 +790,30 @@ Runtime data is kept outside the checkout in `~/.selene-agent/` by default. This
 
 ---
 
+## Testing
+
+```bash
+python -m compileall . -q
+python -m unittest discover -s tests -v
+python main.py --doctor
+```
+
+CI (`.github/workflows/ci.yml`) runs Linux and Windows Python matrices, registry validation, frontend bundle checks, and packaging configuration smoke tests. Tests never download Ollama models or require a GPU, OAuth credentials, Spotify, or GUI interaction.
+
 ## Contributing
 
 1. Fork the repository
 2. Create a feature branch (`git checkout -b feature/my-tool`)
-3. Add your tool in `tools/` following the existing pattern:
+3. Read [AGENTS.md](AGENTS.md) for architecture freeze rules and platform policy
+4. Add your tool in `tools/` following the existing pattern:
    - Implement the tool function
-   - Add a JSON schema to `TOOL_SCHEMAS` in `tools/registry.py`
-   - Add the function to `TOOL_DISPATCH`
-4. Test with `python main.py`
-5. Submit a pull request
+   - Add a JSON schema to `TOOL_SCHEMAS` in `tools/registry.py` (if model-exposed)
+   - Add the function to `TOOL_DISPATCH` **and** `TOOL_METADATA`
+   - Route execution only through `agent/tool_runner.py`
+5. Test with `python -m unittest discover -s tests -v` and `python main.py --doctor`
+6. Submit a pull request
+
+Also see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ---
 

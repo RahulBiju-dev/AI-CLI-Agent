@@ -298,6 +298,14 @@ def create_file(file_path: str, content: str) -> str:
         basename = os.path.basename(str(file_path).strip())
         if basename in {"", ".", "..", ".vault_aliases.json"}:
             return _json({"error": "file_path must contain a valid filename"})
+        try:
+            from agent.platform_runtime import validate_filename_component
+
+            # Always apply the stricter Windows filename rules so vault
+            # contents remain portable across Fedora and Windows installs.
+            validate_filename_component(basename, platform_name="windows")
+        except ValueError as exc:
+            return _json({"error": f"Invalid filename: {exc}"})
         if not isinstance(content, str):
             content = str(content)
         if len(content.encode("utf-8")) > 10 * 1024 * 1024:

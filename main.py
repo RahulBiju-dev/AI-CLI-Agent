@@ -39,6 +39,11 @@ def _ensure_model(
 
 def main() -> None:
     """Main execution point for the application."""
+    if "--doctor" in sys.argv:
+        from agent.diagnostics import main_doctor
+
+        raise SystemExit(main_doctor(as_json="--json" in sys.argv))
+
     service: OllamaService | None = None
     try:
         runtime = get_runtime_config(refresh=True)

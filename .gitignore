@@ -223,8 +223,7 @@ __marimo__/
 # Saved sessions
 sessions/
 
-#Agents
-AGENTS.md
+# Local agent scratch (root AGENTS.md is tracked project guidance)
 .agents/
 
 #Dev Docs

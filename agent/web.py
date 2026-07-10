@@ -775,12 +775,21 @@ def execute_command_web(
             data = call_tool("list_vault_aliases")
             if "error" in data:
                 return f"Failed to list aliases: {data['error']}"
-            aliases = data.get("aliases", {})
+            aliases = data.get("aliases", [])
             if not aliases:
                 return "No registered vault aliases found."
             out = ["### Vault Aliases"]
-            for name, coll in aliases.items():
-                out.append(f"- `{name}` → `{coll}`")
+            if isinstance(aliases, dict):
+                for name, coll in aliases.items():
+                    out.append(f"- `{name}` → `{coll}`")
+            else:
+                for entry in aliases:
+                    if isinstance(entry, dict):
+                        out.append(
+                            f"- `{entry.get('alias', '?')}` → `{entry.get('collection', '?')}`"
+                        )
+                    else:
+                        out.append(f"- `{entry}`")
             return "\n".join(out)
             
         elif sub == "alias":
@@ -790,16 +799,19 @@ def execute_command_web(
             data = call_tool("register_vault_alias", alias=alias_name, collection=target_coll)
             if "error" in data:
                 return f"Failed to register alias: {data['error']}"
-            return f"✓ Alias `{alias_name}` registered to collection `{target_coll}`"
+            collection = data.get("collection", target_coll)
+            return f"✓ Alias `{alias_name}` registered to collection `{collection}`"
             
         elif sub == "rename":
             if len(tokens) < 2:
                 return "Usage: `/vault rename <old> <new>`"
             old_name, new_name = tokens[0], tokens[1]
-            data = call_tool("rename_vault_collection", old_collection=old_name, new_collection=new_name)
+            data = call_tool("rename_vault", old_name=old_name, new_name=new_name)
             if "error" in data:
                 return f"Failed to rename vault: {data['error']}"
-            return f"✓ Vault collection `{old_name}` renamed to `{new_name}`"
+            old_collection = data.get("old_collection", old_name)
+            new_collection = data.get("new_collection", new_name)
+            return f"✓ Vault collection `{old_collection}` renamed to `{new_collection}`"
             
         elif sub == "add":
             if not tokens:
@@ -839,7 +851,13 @@ def execute_command_web(
                 top_k = 4
                 
             query = " ".join(tokens)
-            data = call_tool("search_vault", query=query, collection=collection, top_k=top_k, source=source_filter)
+            data = call_tool(
+                "vault_search",
+                query=query,
+                collection=collection,
+                top_k=top_k,
+                source=source_filter,
+            )
             if "error" in data:
                 return f"Vault search failed: {data['error']}"
                 
@@ -849,11 +867,17 @@ def execute_command_web(
                 
             out = [f"### Vault Search Results for '{query}'"]
             for idx, res in enumerate(results, 1):
-                src = res.get("source", "unknown")
+                if not isinstance(res, dict):
+                    continue
+                src = res.get("source") or res.get("source_path") or "unknown"
                 score = res.get("score", 0.0)
-                text = res.get("text", "")
+                text = res.get("text") or res.get("document") or ""
                 snippet = text[:260] + "..." if len(text) > 260 else text
-                out.append(f"{idx}. **{src}** (score: {score:.3f})\n>{snippet}\n")
+                try:
+                    score_text = f"{float(score):.3f}"
+                except (TypeError, ValueError):
+                    score_text = str(score)
+                out.append(f"{idx}. **{src}** (score: {score_text})\n>{snippet}\n")
             return "\n".join(out)
             
         elif sub == "delete":
@@ -866,7 +890,12 @@ def execute_command_web(
                 return "Usage: `/vault delete <source> [--collection name]` or `/vault delete --all [--collection name]`"
                 
             source = tokens[0] if tokens else None
-            data = call_tool("delete_vault", source=source, collection=collection, delete_collection=delete_all)
+            data = call_tool(
+                "delete_vault_item",
+                source=source,
+                collection=collection,
+                delete_collection=delete_all,
+            )
             if "error" in data:
                 return f"Vault delete failed: {data['error']}"
                 

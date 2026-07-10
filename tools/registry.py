@@ -9,6 +9,8 @@ passed directly to the LLM so it knows what tools are available and how to call 
 
 from __future__ import annotations
 
+import importlib
+import sys
 from dataclasses import dataclass, replace
 from typing import Callable
 
@@ -23,7 +25,14 @@ from tools.app_launcher import launch_apps, open_app
 from tools.terminal_launcher import open_terminal_at_path
 from tools.current_datetime import get_current_datetime
 from tools.spreadsheet import spreadsheet
-from tools.vault_indexer import delete_vault_item, index_vault, list_vault_aliases, list_vaults
+from tools.vault_indexer import (
+    delete_vault_item,
+    index_vault,
+    list_vault_aliases,
+    list_vaults,
+    register_vault_alias_tool,
+    rename_vault,
+)
 from tools.vault_search import search_vault
 from tools.obsi_vault_writer import create_structured_note
 from tools.vision_describer import describe_image
@@ -735,6 +744,9 @@ TOOL_DISPATCH.update({
     "delete_vault_item": delete_vault_item,
     "list_vaults": list_vaults,
     "list_vault_aliases": list_vault_aliases,
+    # Slash-command administrative helpers (not model-exposed).
+    "register_vault_alias": register_vault_alias_tool,
+    "rename_vault": rename_vault,
     "create_structured_note": create_structured_note,
     "knowledge_graph_builder": knowledge_graph_builder,
     "run_simulation": run_simulation,
@@ -890,6 +902,14 @@ TOOL_METADATA: dict[str, ToolMetadata] = {
     "list_vault_aliases": _metadata(
         "list_vault_aliases", parallel_safe=True, default_timeout_seconds=10, max_output_chars=12_000
     ),
+    "register_vault_alias": _metadata(
+        "register_vault_alias", read_only=False, default_timeout_seconds=15, max_output_chars=8_000,
+        model_exposed=False,
+    ),
+    "rename_vault": _metadata(
+        "rename_vault", read_only=False, cpu_heavy=True, default_timeout_seconds=180,
+        max_output_chars=12_000, model_exposed=False, optional_dependencies=("chromadb",),
+    ),
     "create_structured_note": _metadata(
         "create_structured_note", read_only=False, default_timeout_seconds=60, max_output_chars=12_000
     ),
@@ -958,6 +978,9 @@ def get_tool_metadata(name: str, arguments: dict | None = None) -> ToolMetadata 
     return metadata
 
 
+_VALID_PLATFORM_SUPPORT = frozenset({"supported", "partial", "unsupported", "limited"})
+
+
 def validate_tool_registry() -> list[str]:
     """Return contract violations without making optional tools fail at import time."""
     errors: list[str] = []
@@ -974,4 +997,21 @@ def validate_tool_registry() -> list[str]:
             f"Model schema/metadata mismatch: schemas_only={sorted(schema_names - exposed_metadata)}, "
             f"metadata_only={sorted(exposed_metadata - schema_names)}"
         )
+    for name, handler in TOOL_DISPATCH.items():
+        if not callable(handler):
+            errors.append(f"Dispatch handler for '{name}' is not callable")
+        module = getattr(handler, "__module__", None)
+        if module and module not in sys.modules:
+            # Imported callables always have a module; require it still exists.
+            try:
+                importlib.import_module(module)
+            except Exception as exc:  # pragma: no cover - defensive
+                errors.append(f"Dispatch module for '{name}' ({module}) is not importable: {exc}")
+    for name, metadata in TOOL_METADATA.items():
+        if metadata.fedora_support not in _VALID_PLATFORM_SUPPORT:
+            errors.append(f"{name}: invalid fedora_support={metadata.fedora_support!r}")
+        if metadata.windows_support not in _VALID_PLATFORM_SUPPORT:
+            errors.append(f"{name}: invalid windows_support={metadata.windows_support!r}")
+        if not metadata.name or metadata.name != name:
+            errors.append(f"Metadata key '{name}' does not match metadata.name={metadata.name!r}")
     return errors

@@ -375,6 +375,77 @@ class TestToolRegistryContract(unittest.TestCase):
             with self.subTest(tool=name):
                 self.assertFalse(metadata.parallel_safe)
 
+    def test_every_tool_has_platform_support_classification(self):
+        for name, metadata in TOOL_METADATA.items():
+            with self.subTest(tool=name):
+                self.assertIn(metadata.fedora_support, {"supported", "partial", "unsupported", "limited"})
+                self.assertIn(metadata.windows_support, {"supported", "partial", "unsupported", "limited"})
+                self.assertTrue(callable(TOOL_DISPATCH[name]))
+
+
+class TestToolRunnerUncertainty(unittest.TestCase):
+    def tearDown(self):
+        tool_runner.set_tool_resource_guard(None)
+
+    def test_exception_after_side_effect_blocks_later_side_effects_when_uncertain(self):
+        """Non-idempotent side effects that raise still block subsequent effects."""
+        invocations = []
+
+        def first():
+            invocations.append("first")
+            raise RuntimeError("failed after possible side effect")
+
+        def second():
+            invocations.append("second")
+            return "should-not-run"
+
+        first_metadata = ToolMetadata(
+            name="uncertain_write",
+            read_only=False,
+            side_effecting=True,
+            parallel_safe=False,
+            idempotent=False,
+            default_timeout_seconds=0.5,
+            max_output_chars=2_000,
+        )
+        second_metadata = _metadata("later_write", side_effecting=True, timeout=0.5)
+        calls = [
+            {"function": {"name": "uncertain_write", "arguments": {}}},
+            {"function": {"name": "later_write", "arguments": {}}},
+        ]
+        with _registered_tool("uncertain_write", first, first_metadata):
+            with _registered_tool("later_write", second, second_metadata):
+                results = execute_tool_calls(calls)
+
+        self.assertEqual(results[0].status, ToolResultStatus.ERROR)
+        self.assertEqual(results[1].status, ToolResultStatus.CANCELLED)
+        self.assertEqual(invocations, ["first"])
+        blocked = json.loads(results[1].content)
+        self.assertEqual(blocked["error_code"], "blocked_by_prior_call")
+
+    def test_shutdown_rejects_new_work_without_deadlock(self):
+        def handler():
+            return "ok"
+
+        with _registered_tool("after_shutdown", handler):
+            # Soft shutdown must return promptly and refuse new work.
+            started = time.monotonic()
+            tool_runner.shutdown_tool_runner(wait=False)
+            result = execute_tool_call(_spec("after_shutdown"), timeout_seconds=0.5)
+            elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 1.0)
+        self.assertEqual(result.status, ToolResultStatus.CANCELLED)
+        payload = json.loads(result.content)
+        self.assertEqual(payload["error_code"], "runner_shutdown")
+        # Restore a live executor for later tests in this process.
+        from concurrent.futures import ThreadPoolExecutor
+
+        tool_runner._SHUTDOWN = False
+        tool_runner._HANDLER_EXECUTOR = ThreadPoolExecutor(
+            max_workers=tool_runner.MAX_PARALLEL_TOOL_WORKERS,
+            thread_name_prefix="selene-tool",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

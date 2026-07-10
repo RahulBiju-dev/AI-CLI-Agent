@@ -37,12 +37,19 @@ If you find a bug or have a feature idea, please search the existing issues befo
    - Follow standard Python naming and design conventions (snake_case, clean docstrings, logical layouts).
    - Keep tool schemas and implementations modular.
 5. **Test Your Changes**:
-   - Run the agent locally:
+   - Run unit tests (no pytest required):
+     ```bash
+     python -m unittest discover -s tests -v
+     python main.py --doctor
+     ```
+   - Optionally run the agent locally with Ollama available:
      ```bash
      python main.py
      ```
-   - Verify tool calls work as expected.
+   - Verify tool calls work as expected. Prefer Fedora-first native behavior and native Windows parity without WSL.
 6. **Submit a Pull Request**: Submit your pull request to the `main` branch. Provide a clear description of the changes and references to any related issues.
+
+See [AGENTS.md](AGENTS.md) for architecture ownership rules and [docs/platform-support.md](docs/platform-support.md) for the tool support matrix.
 
 ---
 

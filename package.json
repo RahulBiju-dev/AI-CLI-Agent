@@ -22,10 +22,16 @@
     "linux": {
       "target": ["AppImage"],
       "category": "Utility",
-      "artifactName": "Selene-1.0.0.${ext}"
+      "artifactName": "Selene-${version}.${ext}"
     },
     "win": {
-      "target": ["nsis"]
+      "target": ["nsis"],
+      "artifactName": "Selene-${version}-Setup.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "deleteAppDataOnUninstall": false
     },
     "directories": {
       "buildResources": "build",

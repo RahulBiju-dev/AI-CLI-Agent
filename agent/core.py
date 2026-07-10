@@ -915,70 +915,109 @@ def _stream_thinking_response(
                 shortcut = "Ctrl+\\" if hasattr(signal, "SIGQUIT") else "Ctrl+Break"
                 _console.print(f"\n[yellow]⚠ Generation interrupted by user ({shortcut}).[/]\n")
                 break
-            
-            msg = chunk.message
 
-            # ── Tool calls come through as non-streamed chunks ────────
-            if msg.tool_calls:
+            try:
+                msg = getattr(chunk, "message", None)
+                if msg is None and isinstance(chunk, dict):
+                    msg = chunk.get("message")
+                if msg is None:
+                    # Skip keep-alive or heartbeat frames without a message body.
+                    continue
+                if isinstance(msg, dict):
+                    class _MsgView:
+                        __slots__ = ("content", "thinking", "tool_calls")
+
+                        def __init__(self, payload: dict) -> None:
+                            self.content = payload.get("content") or ""
+                            self.thinking = payload.get("thinking") or ""
+                            raw_calls = payload.get("tool_calls") or []
+                            self.tool_calls = raw_calls
+
+                    msg = _MsgView(msg)
+
+                tool_calls = getattr(msg, "tool_calls", None) or None
+                # ── Tool calls come through as non-streamed chunks ────────
+                if tool_calls:
+                    spinner.stop()
+                    assistant_msg = {"role": "assistant", "content": content_buf}
+                    if thinking_buf:
+                        assistant_msg["thinking"] = thinking_buf
+                    normalized_calls = []
+                    for tc in tool_calls:
+                        try:
+                            if isinstance(tc, dict):
+                                function = tc.get("function") or {}
+                                name = function.get("name") if isinstance(function, dict) else None
+                                arguments = function.get("arguments") if isinstance(function, dict) else {}
+                            else:
+                                function = getattr(tc, "function", None)
+                                name = getattr(function, "name", None)
+                                arguments = getattr(function, "arguments", {})
+                            if not name:
+                                continue
+                            normalized_calls.append(
+                                {"function": {"name": name, "arguments": arguments or {}}}
+                            )
+                        except Exception:
+                            continue
+                    if normalized_calls:
+                        assistant_msg["tool_calls"] = normalized_calls
+                        return assistant_msg
+                    continue
+
+                # ── Thinking tokens ───────────────────────────────────────
+                thinking_chunk = getattr(msg, "thinking", None) or ""
+                if thinking_chunk:
+                    if not in_thinking:
+                        in_thinking = True
+                        spinner.stop()
+                        print_thinking_header()
+                        thinking_displayed = True
+
+                    thinking_buf += str(thinking_chunk)
+                    from rich.markup import escape
+                    _console.print(escape(str(thinking_chunk)), style="dim magenta", end="")
+                    continue
+
+                # ── Content tokens ────────────────────────────────────────
+                content_chunk = getattr(msg, "content", None) or ""
+                if content_chunk:
+                    if in_thinking:
+                        in_thinking = False
+                        print_thinking_footer()
+                        spinner.stop()
+                    elif spinner._thread and not spinner._stop_event.is_set():
+                        spinner.stop()
+                        if not thinking_displayed:
+                            _console.print()
+
+                    content_buf += str(content_chunk)
+
+                    if live is None:
+                        live = Live(
+                            assistant_stream_panel(content_buf),
+                            console=_console,
+                            auto_refresh=False,
+                            screen=False,
+                            transient=True,
+                            vertical_overflow="visible",
+                        )
+                        live.start()
+
+                    now = time.monotonic()
+                    if now - _last_render >= _RENDER_INTERVAL:
+                        live.update(assistant_stream_panel(content_buf), refresh=True)
+                        _last_render = now
+            except Exception as exc:
                 spinner.stop()
-                # Build the assistant message with any accumulated content
-                assistant_msg = {"role": "assistant", "content": content_buf}
-                if thinking_buf:
-                    assistant_msg["thinking"] = thinking_buf
-                assistant_msg["tool_calls"] = [
-                    {"function": {"name": tc.function.name, "arguments": tc.function.arguments}}
-                    for tc in msg.tool_calls
-                ]
-                return assistant_msg
-
-            # ── Thinking tokens ───────────────────────────────────────
-            thinking_chunk = getattr(msg, "thinking", None) or ""
-            if thinking_chunk:
-                if not in_thinking:
-                    in_thinking = True
-                    spinner.stop()
-                    print_thinking_header()
-                    thinking_displayed = True
-
-                thinking_buf += thinking_chunk
-                # Print thinking content in dim magenta
-                from rich.markup import escape
-                _console.print(escape(thinking_chunk), style="dim magenta", end="")
-                continue
-
-            # ── Content tokens ────────────────────────────────────────
-            content_chunk = msg.content or ""
-            if content_chunk:
-                if in_thinking:
-                    # Transition from thinking to answering
-                    in_thinking = False
-                    print_thinking_footer()
-                    spinner.stop()
-                elif spinner._thread and not spinner._stop_event.is_set():
-                    spinner.stop()
-                    if not thinking_displayed:
-                        _console.print()  # newline before answer
-
-                content_buf += content_chunk
-
-                # Initialize Live display on the first content chunk
-                if live is None:
-                    live = Live(
-                        assistant_stream_panel(content_buf),
-                        console=_console,
-                        auto_refresh=False,
-                        screen=False,
-                        transient=True,
-                        vertical_overflow="visible",
-                    )
-                    live.start()
-
-                # Throttle Markdown re-renders to reduce CPU overhead
-                now = time.monotonic()
-                if now - _last_render >= _RENDER_INTERVAL:
-                    # Update Markdown rendering in real-time
-                    live.update(assistant_stream_panel(content_buf), refresh=True)
-                    _last_render = now
+                message = (
+                    "Ollama returned an unexpected stream chunk shape; "
+                    f"generation stopped safely: {exc}"
+                )
+                _console.print(f"\n[red]⚠ {message}[/]\n")
+                if not content_buf:
+                    content_buf = message
+                break
 
     except OllamaRuntimeError as exc:
         spinner.stop()
@@ -986,10 +1025,19 @@ def _stream_thinking_response(
         _console.print(f"\n[red]⚠ {message}[/]\n")
         if not content_buf:
             content_buf = message
+    except Exception as exc:
+        spinner.stop()
+        message = f"Ollama stream ended with an unexpected error: {exc}"
+        _console.print(f"\n[red]⚠ {message}[/]\n")
+        if not content_buf:
+            content_buf = message
     finally:
         close = getattr(stream, "close", None)
         if callable(close):
-            close()
+            try:
+                close()
+            except Exception:
+                pass
         if interrupt_signal is not None and old_handler is not None:
             try:
                 signal.signal(interrupt_signal, old_handler)

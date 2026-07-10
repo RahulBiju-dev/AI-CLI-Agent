@@ -638,6 +638,18 @@ def execute_tool_calls(
                     blocked_reason = (
                         f"A prior side-effecting tool ({spec.name}) timed out and may still be finishing"
                     )
+                elif (
+                    result.status is ToolResultStatus.ERROR
+                    and metadata is not None
+                    and metadata.side_effecting
+                    and not metadata.idempotent
+                ):
+                    # Non-idempotent writes that raise leave an uncertain world
+                    # state: do not chain additional side effects in this batch.
+                    blocked_reason = (
+                        f"A prior non-idempotent side-effecting tool ({spec.name}) failed "
+                        "and may have partially applied changes"
+                    )
             continue
 
         if on_parallel_batch:

@@ -579,6 +579,29 @@ def register_vault_alias(alias: str, collection_name: str, file_path: str | None
         _save_aliases(aliases)
 
 
+def register_vault_alias_tool(
+    alias: str,
+    collection: str | None = None,
+    collection_name: str | None = None,
+    file_path: str | None = None,
+) -> str:
+    """JSON tool entry-point for slash-command and runner registration of aliases."""
+    target = collection if collection is not None else collection_name
+    if not target:
+        return _json({"error": "collection is required"})
+    try:
+        register_vault_alias(alias=alias, collection_name=str(target), file_path=file_path)
+    except (OSError, PersistenceError, ValueError) as exc:
+        return _json({"error": str(exc), "alias_file": _ALIAS_FILE})
+    resolved = sanitize_collection_name(str(target))
+    return _json({
+        "success": True,
+        "alias": str(alias or "").strip(),
+        "collection": resolved,
+        "file_path": os.path.abspath(file_path) if file_path else None,
+    })
+
+
 def resolve_vault_alias(name: str) -> str:
     """Resolve a name to a collection name.
 
