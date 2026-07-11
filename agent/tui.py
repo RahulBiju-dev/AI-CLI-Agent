@@ -41,6 +41,20 @@ def _strip_ansi(text: str) -> str:
     return _ANSI_RE.sub("", text or "")
 
 
+def _estimate_tokens(text: str) -> int:
+    """Fast tokenizer-free estimate (~4 ASCII chars / token; non-ASCII ≈ 1 each).
+
+    Matches the heuristic used by the agent context budget so the thinking
+    counter stays consistent with the rest of Selene.
+    """
+    value = str(text or "")
+    if not value:
+        return 0
+    ascii_chars = sum(1 for character in value if ord(character) < 128)
+    non_ascii_chars = len(value) - ascii_chars
+    return ascii_chars // 4 + non_ascii_chars + 1
+
+
 # ── Display sink (bridges core print_* → TUI) ─────────────────────────
 
 
@@ -315,6 +329,105 @@ def build_app_class():
         }}
         """
 
+    class ThinkingFold(Static):
+        """Collapsed thinking summary with optional full-text dropdown.
+
+        After the model finishes thinking, this stays on screen (above the
+        response) so the user can expand and read the chain-of-thought while
+        generation continues or after it completes.
+        """
+
+        can_focus = True
+        DEFAULT_CSS = f"""
+        ThinkingFold {{
+            width: 100%;
+            color: {C_FAINT};
+            border-left: solid {C_BORDER_SOFT};
+            padding: 0 1 0 2;
+            margin: 0 0 1 0;
+            background: transparent;
+        }}
+        ThinkingFold:hover {{
+            background: {C_SURFACE};
+            color: {C_MUTED};
+        }}
+        ThinkingFold:focus {{
+            background: {C_SURFACE};
+            border-left: solid {C_BORDER_FOCUS};
+            color: {C_MUTED};
+        }}
+        ThinkingFold.-expanded {{
+            color: {C_MUTED};
+            max-height: 20;
+            overflow-y: auto;
+            background: {C_ELEVATED};
+            padding: 1 2;
+        }}
+        """
+
+        BINDINGS = [
+            Binding("enter", "toggle", "Expand/collapse", show=False),
+            Binding("space", "toggle", "Expand/collapse", show=False),
+        ]
+
+        def __init__(
+            self,
+            full_text: str,
+            tokens: int,
+            *,
+            title: str = "thinking",
+            interrupted: bool = False,
+            **kwargs,
+        ) -> None:
+            self._full_text = str(full_text or "")
+            self._tokens = max(0, int(tokens or 0))
+            self._title = (title or "thinking").strip() or "thinking"
+            self._interrupted = bool(interrupted)
+            self._expanded = False
+            super().__init__(self._render_view(), **kwargs)
+
+        def _token_label(self) -> str:
+            if self._tokens <= 0:
+                return ""
+            unit = "token" if self._tokens == 1 else "tokens"
+            return f"  ·  ~{self._tokens} {unit}"
+
+        def _header(self) -> Text:
+            chevron = "▾" if self._expanded else "▸"
+            line = Text()
+            if self._interrupted:
+                line.append(f"{chevron}  ", style="#8a8a60")
+                line.append(f"{GLYPH_WARN} {self._title}", style="#8a8a60")
+            else:
+                line.append(f"{chevron}  ", style="#6b6b6b")
+                line.append(f"{GLYPH_OK} {self._title}", style="#6a8a6a")
+            if self._tokens:
+                line.append(self._token_label(), style="#555555")
+            if self._full_text.strip():
+                hint = "click to collapse" if self._expanded else "click to expand"
+                line.append(f"  ·  {hint}", style="#555555")
+            else:
+                line.append("  ·  (empty)", style="#555555")
+            return line
+
+        def _render_view(self) -> object:
+            header = self._header()
+            if not self._expanded or not self._full_text.strip():
+                return header
+            body = Text(self._full_text.rstrip(), style="#6b6b6b")
+            return Group(header, Text(""), body)
+
+        def action_toggle(self) -> None:
+            if not self._full_text.strip():
+                return
+            self._expanded = not self._expanded
+            self.set_class(self._expanded, "-expanded")
+            self.update(self._render_view())
+
+        def on_click(self, event) -> None:  # noqa: ANN001
+            event.stop()
+            self.action_toggle()
+
     class SlashPalette(Static):
         """Command palette above the composer — ranked list with descriptions."""
 
@@ -518,8 +631,9 @@ def build_app_class():
             self._stream_widget: MessageBlock | None = None
             self._thinking_widget: MessageBlock | None = None
             self._thinking_buf = ""
-            self._thinking_chars = 0
+            self._thinking_tokens = 0
             self._activity_widget: MessageBlock | None = None
+
             self._activity_label = "Thinking"
             self._activity_frame = 0
             self._activity_timer = None
@@ -656,8 +770,12 @@ def build_app_class():
             body = Text()
             body.append(f"{frame}  ", style="#6b6b6b")
             body.append("thinking", style="#6b6b6b")
-            if self._thinking_chars:
-                body.append(f"  ·  {self._thinking_chars} chars", style="#555555")
+            if self._thinking_tokens:
+                label = "token" if self._thinking_tokens == 1 else "tokens"
+                body.append(
+                    f"  ·  ~{self._thinking_tokens} {label}",
+                    style="#555555",
+                )
             else:
                 body.append("  ·  collecting", style="#555555")
             preview = self._thinking_buf.strip().replace("\n", " ")
@@ -816,7 +934,7 @@ def build_app_class():
         def ui_thinking_start(self) -> None:
             """Promote the activity line into a compact thinking block."""
             self._thinking_buf = ""
-            self._thinking_chars = 0
+            self._thinking_tokens = 0
             self._activity_label = "thinking"
             self._activity_phase = "thinking"
 
@@ -845,36 +963,49 @@ def build_app_class():
             if self._thinking_widget is None:
                 self.ui_thinking_start()
             self._thinking_buf += text
-            self._thinking_chars = len(self._thinking_buf)
+            self._thinking_tokens = _estimate_tokens(self._thinking_buf)
             if self._thinking_widget is not None:
                 self._thinking_widget.update(self._thinking_renderable())
-                # Throttle scroll to avoid jitter every token.
-                if self._thinking_chars % 120 < max(1, len(text)):
+                # Throttle scroll to avoid jitter every stream chunk.
+                if self._thinking_tokens % 32 < max(1, _estimate_tokens(text)):
                     self._chat().scroll_end(animate=False)
 
         def ui_thinking_end(self, label: str | None = None) -> None:
+            """Finish live thinking and replace it with a collapsible fold."""
             self._stop_activity_timer()
             self._activity_phase = "idle"
             self._activity_widget = None
 
-            if self._thinking_widget is None:
-                return
-
+            full_text = self._thinking_buf
+            tokens = self._thinking_tokens
             title = (label or "thinking").strip() or "thinking"
-            chars = self._thinking_chars
-            body = Text()
-            if label == "interrupted":
-                body.append(f"{GLYPH_WARN}  ", style="#8a8a60")
-                body.append("thinking interrupted", style="#6b6b6b")
-            else:
-                body.append(f"{GLYPH_OK}  ", style="#6a8a6a")
-                body.append(title, style="#6b6b6b")
-                if chars:
-                    body.append(f"  ·  {chars} chars", style="#555555")
-            self._thinking_widget.update(body)
+            interrupted = label == "interrupted"
+            old = self._thinking_widget
             self._thinking_widget = None
             self._thinking_buf = ""
-            self._thinking_chars = 0
+            self._thinking_tokens = 0
+
+            fold = ThinkingFold(
+                full_text,
+                tokens,
+                title=title if not interrupted else "thinking interrupted",
+                interrupted=interrupted,
+            )
+
+            chat = self._chat()
+            try:
+                if old is not None and old.parent is not None:
+                    # Keep position above the (upcoming) response stream.
+                    chat.mount(fold, after=old)
+                    old.remove()
+                else:
+                    chat.mount(fold)
+            except Exception:
+                try:
+                    chat.mount(fold)
+                except Exception:
+                    return
+            chat.scroll_end(animate=False)
 
         def _clear_waiting_activity(self) -> None:
             """Drop a paused/waiting spinner once real output starts."""
@@ -1148,7 +1279,7 @@ def build_app_class():
             self._stream_widget = None
             self._thinking_widget = None
             self._thinking_buf = ""
-            self._thinking_chars = 0
+            self._thinking_tokens = 0
             # Fresh activity line for this turn (Thinking animation).
             self._stop_activity_timer()
             self._remove_activity_widget()
@@ -1166,7 +1297,8 @@ def build_app_class():
                             return
                         base = user_input.strip().split(None, 1)[0].lower()
                         if base == "/clear":
-                            self.call_from_thread(self._reset_transcript)
+                            # Reset UI after core clears history; show one confirmation.
+                            self.call_from_thread(self._clear_conversation_ui)
                     else:
                         self._process_turn(
                             user_input,
@@ -1199,17 +1331,60 @@ def build_app_class():
                 self._capture_file.flush()
 
         def _reset_transcript(self) -> None:
-            """Clear the chat view after /clear (history already wiped by handler)."""
+            """Clear the chat view after /clear (history already wiped by handler).
+
+            Textual's ``remove_children`` / ``remove`` are asynchronous. Remounting
+            a fixed ``id="welcome"`` immediately races the prune and raises
+            ``DuplicateIds``. Keep/update the welcome widget and only prune the
+            rest of the transcript.
+            """
             self._stop_activity_timer()
             self._activity_phase = "idle"
             self._activity_widget = None
             self._thinking_widget = None
             self._thinking_buf = ""
-            self._thinking_chars = 0
+            self._thinking_tokens = 0
             self._stream_widget = None
+
             chat = self._chat()
-            chat.remove_children()
-            chat.mount(Static(self._welcome_renderable(), id="welcome"))
+            welcome = None
+            stale: list = []
+            for child in list(chat.children):
+                if getattr(child, "id", None) == "welcome":
+                    welcome = child
+                else:
+                    stale.append(child)
+            for child in stale:
+                try:
+                    child.remove()
+                except Exception:
+                    pass
+
+            renderable = self._welcome_renderable()
+            if welcome is not None:
+                try:
+                    welcome.update(renderable)
+                    return
+                except Exception:
+                    try:
+                        welcome.remove()
+                    except Exception:
+                        pass
+
+            # No welcome yet (or update failed) — mount without racing a twin id.
+            try:
+                existing = chat.query("#welcome")
+                if existing:
+                    existing.first().update(renderable)
+                    return
+            except Exception:
+                pass
+            chat.mount(Static(renderable, id="welcome"))
+
+        def _clear_conversation_ui(self) -> None:
+            """Reset transcript and confirm (used by /clear and Ctrl+L)."""
+            self._reset_transcript()
+            self.ui_status("Conversation cleared", kind="ok")
 
         def action_quit_app(self) -> None:
             self.exit()
@@ -1219,8 +1394,7 @@ def build_app_class():
                 return
             self.history.clear()
             self.session["system"] = ""
-            self._reset_transcript()
-            self.ui_status("Conversation cleared", kind="ok")
+            self._clear_conversation_ui()
 
         def action_clear_input(self) -> None:
             """Ctrl+K — clear the composer (and dismiss the palette)."""

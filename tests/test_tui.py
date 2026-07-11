@@ -137,6 +137,98 @@ class TuiAppSmokeTests(unittest.TestCase):
 
         asyncio.run(_run())
 
+    def test_clear_command_does_not_duplicate_welcome_id(self):
+        try:
+            import textual  # noqa: F401
+        except ImportError:
+            self.skipTest("textual not installed")
+
+        import asyncio
+
+        from agent.tui import build_app_class
+
+        AppCls = build_app_class()
+        history = [{"role": "user", "content": "hello"}]
+        session = {
+            "history": True,
+            "system": "sys",
+            "options": {},
+            "verbose": False,
+            "wordwrap": True,
+            "format": "",
+            "think": True,
+            "runtime_profile": "manual",
+        }
+        app = AppCls(
+            session=session,
+            history=history,
+            default_system_prompt="sys",
+            process_turn=lambda *a, **k: None,
+            handle_command=lambda *a, **k: True,
+            slash_completions=("/clear", "/help"),
+            slash_descriptions={"/clear": "Clear", "/help": "Help"},
+            status_meta={"profile": "manual", "model": "selene"},
+        )
+
+        async def _run():
+            async with app.run_test() as pilot:
+                app.ui_add_user("hello")
+                app.ui_status("noise", kind="info")
+                await pilot.pause()
+                # Must not raise DuplicateIds / NoMatches.
+                app._clear_conversation_ui()
+                await pilot.pause()
+                welcomes = list(app.query("#welcome"))
+                self.assertEqual(len(welcomes), 1)
+                # Second clear still safe.
+                app._clear_conversation_ui()
+                await pilot.pause()
+                self.assertEqual(len(list(app.query("#welcome"))), 1)
+
+        asyncio.run(_run())
+
+    def test_thinking_fold_is_collapsible_after_stream(self):
+        try:
+            import textual  # noqa: F401
+        except ImportError:
+            self.skipTest("textual not installed")
+
+        import asyncio
+
+        from agent.tui import build_app_class
+
+        AppCls = build_app_class()
+        app = AppCls(
+            session={"history": True, "system": "", "options": {}, "verbose": False,
+                     "wordwrap": True, "format": "", "think": True, "runtime_profile": "manual"},
+            history=[],
+            default_system_prompt="sys",
+            process_turn=lambda *a, **k: None,
+            handle_command=lambda *a, **k: True,
+            slash_completions=("/help",),
+            slash_descriptions={"/help": "Show help"},
+            status_meta={"profile": "manual", "model": "selene"},
+        )
+
+        async def _run():
+            async with app.run_test() as pilot:
+                app.ui_thinking_start()
+                app.ui_thinking_delta("Check the vault, then answer carefully.")
+                app.ui_thinking_end()
+                await pilot.pause()
+                folds = list(app.query("ThinkingFold"))
+                self.assertEqual(len(folds), 1)
+                fold = folds[0]
+                self.assertFalse(fold._expanded)
+                self.assertIn("vault", fold._full_text)
+                fold.action_toggle()
+                self.assertTrue(fold._expanded)
+                self.assertTrue(fold.has_class("-expanded"))
+                fold.action_toggle()
+                self.assertFalse(fold._expanded)
+
+        asyncio.run(_run())
+
 
 class ProcessTurnImportTests(unittest.TestCase):
     def test_process_user_turn_is_callable(self):
