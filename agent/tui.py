@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import re
 import threading
+import time
 from typing import Callable, Sequence
 
 from rich.console import Console, Group
@@ -460,15 +461,19 @@ def build_app_class():
                 self.update("")
                 return
 
+            # Build with rich.Text (not markup strings). Descriptions often
+            # contain [brackets] like "/load [name|index]", which would corrupt
+            # Rich markup and make selection backgrounds bleed onto later rows.
             cmd_width = min(28, max(len(cmd) for cmd, _ in matches))
             total = total if total is not None else len(matches)
-            header = (
-                f"[bold {C_MUTED}]commands[/]  "
-                f"[{C_FAINT}]{len(matches)}"
-                + (f"/{total}" if total > len(matches) else "")
-                + f"  ·  filter {query or '/'}[/]"
-            )
-            lines: list[str] = [header, f"[{C_FAINT}]{'─' * min(56, cmd_width + 28)}[/]"]
+            count = f"{len(matches)}" + (f"/{total}" if total > len(matches) else "")
+
+            body = Text()
+            body.append("commands  ", style=f"bold {C_MUTED}")
+            body.append(f"{count}  ·  filter {query or '/'}", style=C_FAINT)
+            body.append("\n")
+            body.append("─" * min(56, cmd_width + 28), style=C_FAINT)
+            body.append("\n")
 
             for index, (command, description) in enumerate(matches):
                 padded = command.ljust(cmd_width)
@@ -476,24 +481,21 @@ def build_app_class():
                 if len(desc) > 42:
                     desc = desc[:41] + "…"
                 if index == selected:
-                    # High-contrast selected row (near black on light gray).
-                    row = (
-                        f"[bold {C_SELECT_FG} on {C_SELECT_BG}]"
-                        f" ▐ {padded}  {desc} "
-                        f"[/]"
+                    # Single-line high-contrast highlight; style does not span \n.
+                    body.append(
+                        f" ▐ {padded}  {desc} ",
+                        style=f"bold {C_SELECT_FG} on {C_SELECT_BG}",
                     )
                 else:
-                    row = (
-                        f"[{C_MUTED}]   {padded}[/]"
-                        f"  [{C_FAINT}]{desc}[/]"
-                    )
-                lines.append(row)
+                    body.append(f"   {padded}", style=C_MUTED)
+                    body.append(f"  {desc}", style=C_FAINT)
+                body.append("\n")
 
-            lines.append(
-                f"[{C_FAINT}]↑↓ / ctrl+n p  move  ·  tab complete  ·  "
-                f"enter run  ·  esc dismiss[/]"
+            body.append(
+                "↑↓ / ctrl+n p  move  ·  tab complete  ·  enter run  ·  esc dismiss",
+                style=C_FAINT,
             )
-            self.update("\n".join(lines))
+            self.update(body)
             self.add_class("-visible")
 
         def hide_palette(self) -> None:
@@ -547,8 +549,8 @@ def build_app_class():
                 id="prompt-input",
             )
             yield Static(
-                "enter send  ·  ctrl+n/p menu  ·  ctrl+k clear input  ·  "
-                "ctrl+l clear chat  ·  f1 help  ·  ctrl+c quit",
+                "enter send  ·  ctrl+c stop  ·  ctrl+c twice quit  ·  "
+                "ctrl+l clear  ·  f1 help",
                 id="composer-hint",
             )
 
@@ -595,7 +597,7 @@ def build_app_class():
         """
 
         BINDINGS = [
-            Binding("ctrl+c", "quit_app", "Quit", show=True, priority=True),
+            Binding("ctrl+c", "interrupt_or_quit", "Stop / quit", show=True, priority=True),
             Binding("ctrl+d", "quit_app", "Quit", show=False, priority=True),
             Binding("ctrl+l", "clear_chat", "Clear chat", show=True),
             Binding("ctrl+k", "clear_input", "Clear input", show=True),
@@ -604,6 +606,9 @@ def build_app_class():
             Binding("ctrl+j", "submit_input", "Send", show=False, priority=True),
             Binding("escape", "blur_or_clear", "Esc", show=False, priority=True),
         ]
+
+        # Second Ctrl+C within this window exits after a stop (or idle arm).
+        _QUIT_ARM_SECONDS = 2.0
 
         def __init__(
             self,
@@ -628,6 +633,7 @@ def build_app_class():
             self.status_meta = dict(status_meta or {})
             self._busy = False
             self._busy_lock = threading.Lock()
+            self._quit_armed_until = 0.0
             self._stream_widget: MessageBlock | None = None
             self._thinking_widget: MessageBlock | None = None
             self._thinking_buf = ""
@@ -1389,6 +1395,37 @@ def build_app_class():
         def action_quit_app(self) -> None:
             self.exit()
 
+        def action_interrupt_or_quit(self) -> None:
+            """Ctrl+C: stop generation first; press again to exit.
+
+            - While a turn is running: request cooperative stream cancel.
+            - Second Ctrl+C within a short window (or when idle after arming): quit.
+            """
+            now = time.monotonic()
+            with self._busy_lock:
+                busy = self._busy
+
+            if busy:
+                try:
+                    from agent.core import request_generation_interrupt
+
+                    request_generation_interrupt()
+                except Exception:
+                    pass
+                self._quit_armed_until = now + self._QUIT_ARM_SECONDS
+                self.ui_status(
+                    "Generation stopping · press Ctrl+C again to quit",
+                    kind="warn",
+                )
+                return
+
+            if now <= float(self._quit_armed_until or 0):
+                self.exit()
+                return
+
+            self._quit_armed_until = now + self._QUIT_ARM_SECONDS
+            self.ui_status("Press Ctrl+C again to quit", kind="info")
+
         def action_clear_chat(self) -> None:
             if self._busy:
                 return
@@ -1442,6 +1479,8 @@ def build_app_class():
             shortcuts.append("shortcuts\n", style="bold #7a7a7a")
             for key, desc in (
                 ("Enter / Ctrl+J", "Send message"),
+                ("Ctrl+C", "Stop generation"),
+                ("Ctrl+C twice", "Quit application"),
                 ("Ctrl+/", "Open command palette"),
                 ("Tab / →", "Autofill highlighted command"),
                 ("↑↓  Ctrl+N/P", "Move palette selection"),
@@ -1450,7 +1489,6 @@ def build_app_class():
                 ("Ctrl+K", "Clear input"),
                 ("Ctrl+L", "Clear conversation"),
                 ("F1", "Show this help"),
-                ("Ctrl+C", "Quit"),
             ):
                 shortcuts.append(f"  {key:<16}", style="#7a7a7a")
                 shortcuts.append(f"  {desc}\n", style="#555555")

@@ -721,6 +721,26 @@ def _fit_tool_continuation_tail(messages: list[dict], token_budget: int) -> list
 
 _interrupted = False
 
+
+def request_generation_interrupt() -> bool:
+    """Request cooperative cancellation of the in-flight chat stream.
+
+    Used by the TUI (Ctrl+C) and classic SIGQUIT handler. The streaming loop
+    checks the flag between chunks and exits cleanly.
+
+    Returns:
+        bool: True if a generation may be in progress (flag was set).
+    """
+    global _interrupted
+    _interrupted = True
+    return True
+
+
+def generation_interrupt_requested() -> bool:
+    """Return whether cooperative generation cancel has been requested."""
+    return bool(_interrupted)
+
+
 def _sigquit_handler(signum, frame):
     """Handle SIGQUIT signal to interrupt the current LLM generation stream.
     
@@ -731,9 +751,7 @@ def _sigquit_handler(signum, frame):
         signum: The signal number.
         frame: The current stack frame.
     """
-    global _interrupted
-    # Mark as interrupted so the streaming loop can break
-    _interrupted = True
+    request_generation_interrupt()
 
 
 def _trim_history(
@@ -1071,9 +1089,9 @@ def _stream_thinking_response(
                 if in_thinking:
                     in_thinking = False
                     print_thinking_footer("interrupted")
-                shortcut = "Ctrl+\\" if hasattr(signal, "SIGQUIT") else "Ctrl+Break"
-                print_warn(f"Generation interrupted by user ({shortcut})")
-                _console.print()
+                print_warn("Generation interrupted by user")
+                if not display_is_tui():
+                    _console.print()
                 break
 
             try:

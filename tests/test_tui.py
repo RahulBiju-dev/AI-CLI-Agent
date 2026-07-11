@@ -187,6 +187,56 @@ class TuiAppSmokeTests(unittest.TestCase):
 
         asyncio.run(_run())
 
+    def test_ctrl_c_stops_then_quits_on_second_press(self):
+        try:
+            import textual  # noqa: F401
+        except ImportError:
+            self.skipTest("textual not installed")
+
+        import asyncio
+        import time
+
+        from agent import core as core_mod
+        from agent.tui import build_app_class
+
+        AppCls = build_app_class()
+        app = AppCls(
+            session={
+                "history": True,
+                "system": "",
+                "options": {},
+                "verbose": False,
+                "wordwrap": True,
+                "format": "",
+                "think": True,
+                "runtime_profile": "manual",
+            },
+            history=[],
+            default_system_prompt="sys",
+            process_turn=lambda *a, **k: None,
+            handle_command=lambda *a, **k: True,
+            slash_completions=("/help",),
+            slash_descriptions={"/help": "Help"},
+            status_meta={"profile": "manual"},
+        )
+
+        async def _run():
+            async with app.run_test() as pilot:
+                core_mod._interrupted = False
+                app._busy = True
+                app.action_interrupt_or_quit()
+                self.assertTrue(core_mod.generation_interrupt_requested())
+                self.assertGreater(app._quit_armed_until, time.monotonic())
+
+                app._busy = False
+                # Second press while armed should exit the app.
+                app.action_interrupt_or_quit()
+                await pilot.pause()
+                self.assertTrue(app.return_code is not None or not app.is_running)
+
+        asyncio.run(_run())
+        core_mod._interrupted = False
+
     def test_thinking_fold_is_collapsible_after_stream(self):
         try:
             import textual  # noqa: F401
@@ -233,6 +283,93 @@ class TuiAppSmokeTests(unittest.TestCase):
 class ProcessTurnImportTests(unittest.TestCase):
     def test_process_user_turn_is_callable(self):
         self.assertTrue(callable(process_user_turn))
+
+    def test_request_generation_interrupt_sets_flag(self):
+        from agent import core as core_mod
+
+        core_mod._interrupted = False
+        self.assertFalse(core_mod.generation_interrupt_requested())
+        core_mod.request_generation_interrupt()
+        self.assertTrue(core_mod.generation_interrupt_requested())
+        core_mod._interrupted = False
+
+
+class SlashPaletteRenderTests(unittest.TestCase):
+    def test_bracketed_descriptions_do_not_break_selection_highlight(self):
+        """Descriptions with [params] must not corrupt Rich markup styles."""
+        try:
+            import textual  # noqa: F401
+        except ImportError:
+            self.skipTest("textual not installed")
+
+        import asyncio
+
+        from agent.tui import build_app_class
+
+        AppCls = build_app_class()
+        app = AppCls(
+            session={
+                "history": True,
+                "system": "",
+                "options": {},
+                "verbose": False,
+                "wordwrap": True,
+                "format": "",
+                "think": True,
+                "runtime_profile": "manual",
+            },
+            history=[],
+            default_system_prompt="sys",
+            process_turn=lambda *a, **k: None,
+            handle_command=lambda *a, **k: True,
+            slash_completions=("/help", "/save", "/load"),
+            slash_descriptions={
+                "/help": "Commands and usage",
+                "/save": "Save session  ·  /save [name]",
+                "/load": "Load session  ·  /load [name|index]",
+            },
+            status_meta={"profile": "manual"},
+        )
+
+        async def _run():
+            async with app.run_test() as pilot:
+                palette = app.query_one("#slash-palette")
+                matches = [
+                    ("/help", "Commands and usage"),
+                    ("/save", "Save session  ·  /save [name]"),
+                    ("/load", "Load session  ·  /load [name|index]"),
+                ]
+                # Select the middle row (same as the user screenshot case).
+                palette.show_matches(matches, selected=1, query="/", total=3)
+                await pilot.pause()
+                # Content must be a Text object (not a markup string).
+                from rich.text import Text as RichText
+
+                renderable = palette.content
+                self.assertIsInstance(renderable, RichText)
+                plain = renderable.plain
+                self.assertIn("/save", plain)
+                self.assertIn("[name|index]", plain)
+                # Background style spans should only cover the selected row.
+                spans = list(renderable.spans)
+
+                def _has_bg(style) -> bool:
+                    if style is None:
+                        return False
+                    if isinstance(style, str):
+                        return " on " in style
+                    return getattr(style, "bgcolor", None) is not None
+
+                bg_spans = [span for span in spans if _has_bg(span.style)]
+                self.assertEqual(len(bg_spans), 1)
+                selected_plain = plain[bg_spans[0].start : bg_spans[0].end]
+                self.assertIn("/save", selected_plain)
+                self.assertNotIn("/load", selected_plain)
+                # Ensure bracketed desc of the *next* row is outside the bg span.
+                load_at = plain.index("/load")
+                self.assertGreaterEqual(load_at, bg_spans[0].end)
+
+        asyncio.run(_run())
 
 
 class SlashFilterTests(unittest.TestCase):
