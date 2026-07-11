@@ -5,7 +5,7 @@ const DEFAULT_SETTINGS = {
   // backend-selected hardware profile.
   options: {},
   runtime_profile: "auto",
-  verbose: false,
+  verbose: true,
   wordwrap: true,
   system: "",
   history: true,

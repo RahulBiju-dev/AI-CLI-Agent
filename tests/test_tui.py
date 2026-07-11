@@ -372,6 +372,104 @@ class SlashPaletteRenderTests(unittest.TestCase):
         asyncio.run(_run())
 
 
+class ThemeCatalogTests(unittest.TestCase):
+    def test_default_theme_is_first_place(self):
+        from agent.tui_themes import (
+            DEFAULT_THEME,
+            theme_catalog,
+            theme_names,
+            normalize_theme_name,
+            theme_specs_for_slash,
+            textual_theme_name,
+        )
+
+        catalog = theme_catalog()
+        self.assertEqual(len(theme_names()), 14)
+        self.assertEqual(catalog[0][0], "oslo")
+        self.assertEqual(DEFAULT_THEME, "oslo")
+        self.assertIn("oslo", catalog[0][1].casefold())
+        self.assertIn("(default)", catalog[0][1].casefold())
+        self.assertIn("grey", catalog[0][1].casefold())
+        places = {name for name, _ in catalog}
+        for place in (
+            "oslo", "tokyo", "rome", "amazon", "cairo", "kyoto", "bergen",
+            "marrakech", "shanghai", "reykjavik", "venice", "seoul",
+            "santorini", "havana",
+        ):
+            self.assertIn(place, places)
+        specs = theme_specs_for_slash()
+        names = [cmd for cmd, _ in specs]
+        self.assertEqual(names[0], "/theme")
+        self.assertEqual(names[1], "/theme oslo")
+        self.assertIn("(default)", specs[1][1].casefold())
+        self.assertEqual(normalize_theme_name("grey"), "oslo")
+        self.assertEqual(normalize_theme_name("default"), "oslo")
+        self.assertEqual(normalize_theme_name("Oslo (default)"), "oslo")
+        self.assertEqual(normalize_theme_name("tokyo-night"), "tokyo")
+        self.assertEqual(normalize_theme_name("nord"), "bergen")
+        self.assertEqual(normalize_theme_name("Tokyo"), "tokyo")
+        self.assertEqual(textual_theme_name("tokyo"), "Tokyo")
+        self.assertEqual(textual_theme_name("oslo"), "Oslo (default)")
+
+    def test_theme_command_applies_in_tui(self):
+        try:
+            import textual  # noqa: F401
+        except ImportError:
+            self.skipTest("textual not installed")
+
+        import asyncio
+
+        from agent.tui import build_app_class
+
+        AppCls = build_app_class()
+        session = {
+            "history": True,
+            "system": "",
+            "options": {},
+            "verbose": True,
+            "wordwrap": True,
+            "format": "",
+            "think": True,
+            "runtime_profile": "manual",
+            "tui_theme": "oslo",
+        }
+        app = AppCls(
+            session=session,
+            history=[],
+            default_system_prompt="sys",
+            process_turn=lambda *a, **k: None,
+            handle_command=lambda *a, **k: True,
+            slash_completions=("/theme", "/theme tokyo"),
+            slash_descriptions={"/theme": "Theme", "/theme tokyo": "Tokyo"},
+            status_meta={"profile": "manual", "model": "selene"},
+        )
+
+        async def _run():
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                self.assertEqual(app.theme, "Oslo (default)")
+                # Ctrl+P theme list must be place names only (no catppuccin/nord/…).
+                from agent.tui_themes import place_theme_display_names
+
+                available = set(app.available_themes.keys())
+                self.assertEqual(available, set(place_theme_display_names()))
+                self.assertNotIn("nord", available)
+                self.assertNotIn("dracula", available)
+                self.assertNotIn("catppuccin-mocha", available)
+                app.ui_apply_theme("tokyo")
+                await pilot.pause()
+                self.assertEqual(app.theme, "Tokyo")
+                self.assertEqual(session.get("tui_theme"), "tokyo")
+                self.assertIsNotNone(app._selene_palette)
+                # Glyph is ASCII '>'
+                glyph = app.query_one("#prompt-glyph")
+                content = getattr(glyph, "content", None) or getattr(glyph, "_content", ">")
+                plain = content.plain if hasattr(content, "plain") else str(content)
+                self.assertIn(">", plain)
+
+        asyncio.run(_run())
+
+
 class SlashFilterTests(unittest.TestCase):
     COMMANDS = (
         "/help",

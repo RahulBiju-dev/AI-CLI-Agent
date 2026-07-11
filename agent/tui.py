@@ -84,6 +84,9 @@ class TuiDisplaySink:
             return
         self._call("ui_status", message, kind, detail)
 
+    def apply_theme(self, name: str) -> None:
+        self._call("ui_apply_theme", name)
+
     def activity_start(self, label: str = "Thinking") -> None:
         self._call("ui_activity_start", label)
 
@@ -164,8 +167,8 @@ def _import_textual():
     try:
         from textual.app import App, ComposeResult
         from textual.binding import Binding
-        from textual.containers import Vertical, VerticalScroll
-        from textual.widgets import Footer, Input, Static
+        from textual.containers import Horizontal, Vertical, VerticalScroll
+        from textual.widgets import Input, Static
     except ImportError as exc:  # pragma: no cover
         raise RuntimeError(
             "The Selene TUI requires the 'textual' package. "
@@ -175,9 +178,9 @@ def _import_textual():
         "App": App,
         "ComposeResult": ComposeResult,
         "Binding": Binding,
+        "Horizontal": Horizontal,
         "Vertical": Vertical,
         "VerticalScroll": VerticalScroll,
-        "Footer": Footer,
         "Input": Input,
         "Static": Static,
     }
@@ -217,117 +220,103 @@ def build_app_class():
     App = t["App"]
     ComposeResult = t["ComposeResult"]
     Binding = t["Binding"]
+    Horizontal = t["Horizontal"]
     Vertical = t["Vertical"]
     VerticalScroll = t["VerticalScroll"]
-    Footer = t["Footer"]
     Input = t["Input"]
     Static = t["Static"]
 
-    # Visual hierarchy:
-    #   important  → prompts + responses (bright, solid weight)
-    #   chrome     → slash menu, status, tools, thinking (muted, recessed)
-    C_BG = "#101010"
-    C_SURFACE = "#171717"
-    C_ELEVATED = "#1c1c1c"
-    C_CONTENT = "#1f1f1f"       # slightly lifted panel behind chat content
-    C_BORDER = "#333333"
-    C_BORDER_SOFT = "#2a2a2a"
-    C_BORDER_FOCUS = "#9a9a9a"
-    C_TEXT = "#f2f2f2"          # primary content
-    C_TEXT_SOFT = "#d8d8d8"
-    C_MUTED = "#7a7a7a"         # secondary / chrome
-    C_FAINT = "#555555"
-    C_ACCENT = "#cfcfcf"
-    C_SELECT_FG = "#0a0a0a"
-    C_SELECT_BG = "#e8e8e8"     # high-contrast menu highlight
+    # Colors come from Textual CSS variables ($background, $selene-*, …)
+    # driven by agent.tui_themes. Hardcoded greys remain only as Rich fallbacks
+    # until a theme is applied on mount.
 
     class ChatView(VerticalScroll):
         """Scrollable transcript region."""
 
         can_focus = False
-        DEFAULT_CSS = f"""
-        ChatView {{
+        DEFAULT_CSS = """
+        ChatView {
             height: 1fr;
             padding: 0 1;
             scrollbar-gutter: stable;
             background: transparent;
-            scrollbar-background: {C_BG};
-            scrollbar-color: {C_BORDER};
-            scrollbar-color-hover: {C_BORDER_FOCUS};
-        }}
+            scrollbar-background: $background;
+            scrollbar-color: $primary 30%;
+            scrollbar-color-hover: $primary;
+        }
         """
 
     class MessageBlock(Static):
         """One visual block in the transcript."""
 
-        DEFAULT_CSS = f"""
-        MessageBlock {{
+        DEFAULT_CSS = """
+        MessageBlock {
             width: 100%;
             margin: 0 0 1 0;
             padding: 0 1;
-            color: {C_MUTED};
-        }}
+            color: $secondary;
+        }
         /* —— Important: user prompts & model responses —— */
-        MessageBlock.user {{
-            color: {C_TEXT};
-            background: {C_CONTENT};
-            border-left: heavy {C_TEXT_SOFT};
+        MessageBlock.user {
+            color: $foreground;
+            background: $panel;
+            border-left: heavy $accent;
             padding: 1 2;
             margin: 0 0 1 0;
-        }}
-        MessageBlock.assistant {{
-            color: {C_TEXT};
-            background: {C_CONTENT};
-            border-left: heavy #ffffff;
+        }
+        MessageBlock.assistant {
+            color: $foreground;
+            background: $panel;
+            border-left: heavy $accent;
             padding: 1 2;
             margin: 0 0 1 0;
-        }}
+        }
         /* —— Secondary: slash / status / tools / thinking —— */
-        MessageBlock.command {{
-            color: {C_MUTED};
+        MessageBlock.command {
+            color: $secondary;
             background: transparent;
-            border-left: solid {C_BORDER_SOFT};
+            border-left: solid $primary 20%;
             padding: 0 1 0 2;
             margin: 0 0 0 0;
             text-style: dim;
-        }}
-        MessageBlock.thinking {{
-            color: {C_FAINT};
-            border-left: solid {C_BORDER_SOFT};
+        }
+        MessageBlock.thinking {
+            color: $primary 40%;
+            border-left: solid $primary 20%;
             padding-left: 2;
             margin-bottom: 0;
             text-style: dim italic;
-        }}
-        MessageBlock.activity {{
-            color: {C_FAINT};
+        }
+        MessageBlock.activity {
+            color: $primary 40%;
             padding-left: 2;
             margin: 0 0 0 0;
             height: 1;
             text-style: dim;
-        }}
-        MessageBlock.status {{
-            color: {C_FAINT};
+        }
+        MessageBlock.status {
+            color: $primary 40%;
             padding-left: 2;
             margin-bottom: 0;
             text-style: dim;
-        }}
-        MessageBlock.tool {{
-            color: {C_MUTED};
+        }
+        MessageBlock.tool {
+            color: $secondary;
             padding-left: 2;
             margin-bottom: 0;
             text-style: dim;
-        }}
-        MessageBlock.error {{
-            color: #c08080;
-            border-left: wide #8a5050;
+        }
+        MessageBlock.error {
+            color: $error;
+            border-left: wide $error;
             padding-left: 1;
-        }}
-        MessageBlock.system {{
-            color: {C_FAINT};
+        }
+        MessageBlock.system {
+            color: $primary 40%;
             padding-left: 2;
             margin-bottom: 0;
             text-style: dim;
-        }}
+        }
         """
 
     class ThinkingFold(Static):
@@ -339,31 +328,31 @@ def build_app_class():
         """
 
         can_focus = True
-        DEFAULT_CSS = f"""
-        ThinkingFold {{
+        DEFAULT_CSS = """
+        ThinkingFold {
             width: 100%;
-            color: {C_FAINT};
-            border-left: solid {C_BORDER_SOFT};
+            color: $primary 40%;
+            border-left: solid $primary 20%;
             padding: 0 1 0 2;
             margin: 0 0 1 0;
             background: transparent;
-        }}
-        ThinkingFold:hover {{
-            background: {C_SURFACE};
-            color: {C_MUTED};
-        }}
-        ThinkingFold:focus {{
-            background: {C_SURFACE};
-            border-left: solid {C_BORDER_FOCUS};
-            color: {C_MUTED};
-        }}
-        ThinkingFold.-expanded {{
-            color: {C_MUTED};
+        }
+        ThinkingFold:hover {
+            background: $surface;
+            color: $secondary;
+        }
+        ThinkingFold:focus {
+            background: $surface;
+            border-left: solid $primary;
+            color: $secondary;
+        }
+        ThinkingFold.-expanded {
+            color: $secondary;
             max-height: 20;
             overflow-y: auto;
-            background: {C_ELEVATED};
+            background: $boost;
             padding: 1 2;
-        }}
+        }
         """
 
         BINDINGS = [
@@ -432,21 +421,27 @@ def build_app_class():
     class SlashPalette(Static):
         """Command palette above the composer — ranked list with descriptions."""
 
-        DEFAULT_CSS = f"""
-        SlashPalette {{
+        DEFAULT_CSS = """
+        SlashPalette {
             display: none;
             height: auto;
             max-height: 16;
             padding: 1 1;
-            background: {C_ELEVATED};
-            color: {C_MUTED};
-            border: round {C_BORDER_SOFT};
+            background: $boost;
+            color: $secondary;
+            border: round $primary 20%;
             margin: 0 1 1 1;
-        }}
-        SlashPalette.-visible {{
+        }
+        SlashPalette.-visible {
             display: block;
-        }}
+        }
         """
+
+        def _palette(self) -> dict[str, str]:
+            from agent.tui_themes import DEFAULT_THEME, rich_palette
+
+            app = self.app
+            return getattr(app, "_selene_palette", None) or rich_palette(DEFAULT_THEME)
 
         def show_matches(
             self,
@@ -464,15 +459,21 @@ def build_app_class():
             # Build with rich.Text (not markup strings). Descriptions often
             # contain [brackets] like "/load [name|index]", which would corrupt
             # Rich markup and make selection backgrounds bleed onto later rows.
+            pal = self._palette()
+            muted = pal["muted"]
+            faint = pal["faint"]
+            select_fg = pal["select_fg"]
+            select_bg = pal["select_bg"]
+
             cmd_width = min(28, max(len(cmd) for cmd, _ in matches))
             total = total if total is not None else len(matches)
             count = f"{len(matches)}" + (f"/{total}" if total > len(matches) else "")
 
             body = Text()
-            body.append("commands  ", style=f"bold {C_MUTED}")
-            body.append(f"{count}  ·  filter {query or '/'}", style=C_FAINT)
+            body.append("commands  ", style=f"bold {muted}")
+            body.append(f"{count}  ·  filter {query or '/'}", style=faint)
             body.append("\n")
-            body.append("─" * min(56, cmd_width + 28), style=C_FAINT)
+            body.append("─" * min(56, cmd_width + 28), style=faint)
             body.append("\n")
 
             for index, (command, description) in enumerate(matches):
@@ -481,19 +482,18 @@ def build_app_class():
                 if len(desc) > 42:
                     desc = desc[:41] + "…"
                 if index == selected:
-                    # Single-line high-contrast highlight; style does not span \n.
                     body.append(
                         f" ▐ {padded}  {desc} ",
-                        style=f"bold {C_SELECT_FG} on {C_SELECT_BG}",
+                        style=f"bold {select_fg} on {select_bg}",
                     )
                 else:
-                    body.append(f"   {padded}", style=C_MUTED)
-                    body.append(f"  {desc}", style=C_FAINT)
+                    body.append(f"   {padded}", style=muted)
+                    body.append(f"  {desc}", style=faint)
                 body.append("\n")
 
             body.append(
-                "↑↓ / ctrl+n p  move  ·  tab complete  ·  enter run  ·  esc dismiss",
-                style=C_FAINT,
+                "↑↓ / ^N ^P  move  ·  tab complete  ·  enter run  ·  esc dismiss",
+                style=faint,
             )
             self.update(body)
             self.add_class("-visible")
@@ -503,97 +503,173 @@ def build_app_class():
             self.update("")
 
     class Composer(Vertical):
-        """Bottom input chrome: label + text field + hint."""
+        """Boxed prompt line + outside shortcut strip with accented keys."""
 
-        DEFAULT_CSS = f"""
-        Composer {{
+        DEFAULT_CSS = """
+        Composer {
             height: auto;
             dock: bottom;
-            background: {C_SURFACE};
-            border-top: tall {C_BORDER};
+            background: $background;
             padding: 0 1 1 1;
-        }}
-        #composer-label {{
-            color: {C_MUTED};
-            padding: 1 1 0 1;
-            height: 1;
-        }}
-        #prompt-input {{
-            background: {C_BG};
-            color: {C_TEXT};
-            border: round {C_BORDER};
+            margin: 0 0 0 0;
+        }
+        #input-shell {
+            height: 3;
+            border: round $primary 30%;
+            background: $background;
             padding: 0 1;
             margin: 0 0 0 0;
-        }}
-        #prompt-input:focus {{
-            border: round {C_BORDER_FOCUS};
-            background: #141414;
-        }}
-        #prompt-input > .input--placeholder {{
-            color: {C_FAINT};
-        }}
-        #composer-hint {{
-            color: {C_FAINT};
-            padding: 0 1;
+            align: left middle;
+        }
+        #input-shell:focus-within {
+            border: round $primary;
+        }
+        #prompt-glyph {
+            width: 2;
+            height: 3;
+            color: $foreground;
+            content-align: left middle;
+            background: transparent;
+            text-style: bold;
+            padding: 0 0;
+            margin: 0 0;
+        }
+        #prompt-input {
+            width: 1fr;
+            height: 3;
+            background: transparent;
+            color: $foreground;
+            border: none;
+            padding: 0 0;
+            margin: 0 0;
+        }
+        #prompt-input:focus {
+            background: transparent;
+            border: none;
+        }
+        #prompt-input > .input--placeholder {
+            color: $primary 40%;
+        }
+        #composer-meta {
+            width: auto;
+            height: 3;
+            color: $primary 40%;
+            content-align: right middle;
+            padding: 0 0 0 1;
+            text-style: dim;
+            background: transparent;
+        }
+        #composer-footer {
             height: 1;
-        }}
+            padding: 0 1;
+            background: transparent;
+            align: left middle;
+        }
+        #composer-hint {
+            width: 1fr;
+            height: 1;
+            color: $primary 40%;
+            background: transparent;
+        }
+        #composer-context {
+            width: auto;
+            height: 1;
+            color: $primary 50%;
+            content-align: right middle;
+            text-style: dim;
+            background: transparent;
+            padding: 0 0 0 1;
+        }
         """
 
+        def __init__(self, meta_text: str = "", **kwargs) -> None:
+            super().__init__(**kwargs)
+            self._meta_text = meta_text
+
+        def _shortcut_strip(self) -> Text:
+            """Outside-the-box key strip: accented keys, dim actions, ^ for Ctrl."""
+            from agent.tui_themes import DEFAULT_THEME, rich_palette
+
+            pal = getattr(self.app, "_selene_palette", None) or rich_palette(DEFAULT_THEME)
+            faint = pal["faint"]
+            soft = pal["text_soft"]
+            items = (
+                ("↵", "send"),
+                ("/", "palette"),
+                ("⇥", "complete"),
+                ("^C", "stop"),
+                ("^C^C", "quit"),
+                ("F1", "help"),
+            )
+            line = Text()
+            for index, (key, action) in enumerate(items):
+                if index:
+                    line.append("  |  ", style=faint)
+                line.append(key, style=f"bold {soft}")
+                line.append(":", style=faint)
+                line.append(action, style=faint)
+            return line
+
         def compose(self) -> ComposeResult:
-            yield Static(
-                f"{GLYPH_MARK} [bold]selene[/] {GLYPH_PROMPT}  message",
-                id="composer-label",
-            )
-            yield Input(
-                placeholder="Message Selene — / commands  ·  ctrl+/ palette  ·  tab complete",
-                id="prompt-input",
-            )
-            yield Static(
-                "enter send  ·  ctrl+c stop  ·  ctrl+c twice quit  ·  "
-                "ctrl+l clear  ·  f1 help",
-                id="composer-hint",
-            )
+            with Horizontal(id="input-shell"):
+                # Clear ASCII prompt arrow at the start of the chatbox.
+                yield Static(">", id="prompt-glyph", markup=False)
+                yield Input(placeholder="", id="prompt-input")
+                if self._meta_text:
+                    yield Static(self._meta_text, id="composer-meta")
+            # Shortcuts left, context usage right — outside the chatbox shell.
+            with Horizontal(id="composer-footer"):
+                yield Static(self._shortcut_strip(), id="composer-hint")
+                yield Static("0 / 0", id="composer-context")
+
+        def on_mount(self) -> None:
+            # Ensure the prompt arrow stays visible after theme/CSS apply.
+            try:
+                glyph = self.query_one("#prompt-glyph", Static)
+                glyph.update(">")
+            except Exception:
+                pass
+            # Rebuild shortcut colors after the app theme is applied.
+            try:
+                self.query_one("#composer-hint", Static).update(self._shortcut_strip())
+            except Exception:
+                pass
+            try:
+                app = self.app
+                if hasattr(app, "refresh_context_usage"):
+                    app.refresh_context_usage()
+            except Exception:
+                pass
 
     class StatusBar(Static):
-        DEFAULT_CSS = f"""
-        StatusBar {{
+        DEFAULT_CSS = """
+        StatusBar {
             dock: top;
             height: 1;
-            background: {C_SURFACE};
-            color: {C_MUTED};
+            background: $background;
+            color: $primary 40%;
             padding: 0 2;
-            border-bottom: solid {C_BORDER};
-        }}
+            text-style: dim;
+        }
         """
 
     class SeleneTui(App[None]):
         """Full-screen Selene agent interface."""
 
         TITLE = "Selene"
-        CSS = f"""
-        Screen {{
-            background: {C_BG};
-            color: {C_TEXT};
-        }}
-        #body {{
+        CSS = """
+        Screen {
+            background: $background;
+            color: $foreground;
+        }
+        #body {
             height: 1fr;
-        }}
-        #welcome {{
+        }
+        #welcome {
             margin: 1 2;
-            color: {C_MUTED};
+            color: $secondary;
             text-align: center;
-        }}
-        Footer {{
-            background: {C_SURFACE};
-            color: {C_FAINT};
-        }}
-        Footer > .footer--key {{
-            background: {C_ELEVATED};
-            color: {C_ACCENT};
-        }}
-        Footer > .footer--description {{
-            color: {C_MUTED};
-        }}
+        }
         """
 
         BINDINGS = [
@@ -634,6 +710,7 @@ def build_app_class():
             self._busy = False
             self._busy_lock = threading.Lock()
             self._quit_armed_until = 0.0
+            self._selene_palette = None  # filled on mount via ui_apply_theme
             self._stream_widget: MessageBlock | None = None
             self._thinking_widget: MessageBlock | None = None
             self._thinking_buf = ""
@@ -654,17 +731,15 @@ def build_app_class():
 
         def compose(self) -> ComposeResult:
             meta = self._format_meta()
-            yield StatusBar(
-                f"{GLYPH_MARK}  selene  {GLYPH_DOT}  {meta}  {GLYPH_DOT}  /  commands"
-            )
-
+            yield StatusBar(f"{GLYPH_MARK}  selene  {GLYPH_DOT}  {meta}")
             with Vertical(id="body"):
                 yield ChatView(id="chat")
                 yield SlashPalette(id="slash-palette")
-                yield Composer()
-            yield Footer()
+                yield Composer(meta_text=self._composer_meta())
 
         def on_mount(self) -> None:
+            from agent.tui_themes import DEFAULT_THEME, normalize_theme_name, register_all_themes
+
             self._sink = TuiDisplaySink(self)
             set_display_sink(self._sink)
             # Redirect classic Rich prints into the transcript.
@@ -680,10 +755,22 @@ def build_app_class():
                 soft_wrap=True,
             )
 
+            register_all_themes(self)
+            initial_theme = normalize_theme_name(
+                (self.session or {}).get("tui_theme") or DEFAULT_THEME
+            )
+            self._apply_selene_theme(initial_theme, announce=False)
+            # Keep the chatbox prompt arrow visible after theme CSS settles.
+            try:
+                self.query_one("#prompt-glyph", Static).update(">")
+            except Exception:
+                pass
+
             chat = self.query_one("#chat", ChatView)
             welcome = self._welcome_renderable()
             chat.mount(Static(welcome, id="welcome"))
             self.query_one("#prompt-input", Input).focus()
+            self.refresh_context_usage()
 
         def on_unmount(self) -> None:
             set_display_sink(None)
@@ -700,28 +787,183 @@ def build_app_class():
                     parts.append(f"{key} {value}")
             return f" {GLYPH_DOT} ".join(parts) if parts else "local agent runtime"
 
+        def _composer_meta(self) -> str:
+            """Short right-side chip inside the input shell (model · profile)."""
+            bits = []
+            model = self.status_meta.get("model")
+            profile = self.status_meta.get("profile")
+            if model:
+                bits.append(str(model))
+            if profile:
+                bits.append(str(profile))
+            return f" {GLYPH_DOT} ".join(bits)
+
+        def _context_budget(self) -> int:
+            """Effective num_ctx for the active session."""
+            try:
+                from agent.core import effective_session_model_options
+
+                runtime, _ = effective_session_model_options(self.session or {})
+                return max(1, int(runtime.num_ctx))
+            except Exception:
+                try:
+                    return max(1, int(self.status_meta.get("ctx") or 8192))
+                except Exception:
+                    return 8192
+
+        def _estimate_context_used(self) -> int:
+            """Match web UI / core heuristics: history + draft input tokens."""
+            from agent.core import _estimate_message_tokens, _estimate_messages_tokens
+
+            history = list(self.history or [])
+            used = 0
+            try:
+                used = int(_estimate_messages_tokens(history))
+            except Exception:
+                used = 0
+
+            # Draft text in the composer (mirrors web estimatedContextTokens).
+            try:
+                draft = self.query_one("#prompt-input", Input).value or ""
+            except Exception:
+                draft = ""
+            if draft.strip():
+                try:
+                    used += int(
+                        _estimate_message_tokens({"role": "user", "content": draft})
+                    )
+                except Exception:
+                    used += max(1, len(draft) // 4)
+
+            return max(0, used)
+
+        def refresh_context_usage(self) -> None:
+            """Update bottom-right ``used / budget`` context label (no bar)."""
+            try:
+                label = self.query_one("#composer-context", Static)
+            except Exception:
+                return
+            used = self._estimate_context_used()
+            budget = self._context_budget()
+            from agent.tui_themes import DEFAULT_THEME, rich_palette
+
+            pal = self._selene_palette or rich_palette(DEFAULT_THEME)
+            pct = (used / budget) if budget else 0.0
+            if pct >= 0.90:
+                color = pal["error"]
+            elif pct >= 0.75:
+                color = pal["warning"]
+            else:
+                color = pal["faint"]
+            text = Text()
+            text.append(f"{used} / {budget}", style=color)
+            label.update(text)
+
+        def _pal(self) -> dict[str, str]:
+            from agent.tui_themes import DEFAULT_THEME, rich_palette
+
+            return self._selene_palette or rich_palette(DEFAULT_THEME)
+
+        def _apply_selene_theme(self, name: str, *, announce: bool = True) -> None:
+            from agent.tui_themes import (
+                normalize_theme_name,
+                rich_palette,
+                textual_theme_name,
+                theme_label,
+            )
+
+            key = normalize_theme_name(name)
+            self._selene_palette = rich_palette(key)
+            try:
+                # Textual registers place themes as Title Case (Oslo, Tokyo, …).
+                self.theme = textual_theme_name(key)
+            except Exception:
+                pass
+            if isinstance(self.session, dict):
+                self.session["tui_theme"] = key
+            # Refresh shortcut strip colors for the active palette.
+            try:
+                composer = self.query_one(Composer)
+                hint = self.query_one("#composer-hint", Static)
+                hint.update(composer._shortcut_strip())
+            except Exception:
+                pass
+            if announce:
+                self.ui_status(
+                    f"Theme · {textual_theme_name(key)}",
+                    kind="ok",
+                    detail=theme_label(key),
+                )
+
+        def ui_apply_theme(self, name: str) -> None:
+            self._apply_selene_theme(name, announce=True)
+            self.refresh_context_usage()
+
+        def watch_theme(self, theme: str) -> None:
+            """Keep Selene palette/session in sync when Ctrl+P picks a place theme."""
+            if not theme:
+                return
+            from agent.tui_themes import (
+                normalize_theme_name,
+                place_theme_display_names,
+                rich_palette,
+                textual_theme_name,
+            )
+
+            # Ignore non-place names (should be purged, but be defensive).
+            if theme not in place_theme_display_names():
+                return
+            key = normalize_theme_name(theme)
+            # Avoid re-entry loops when we set theme ourselves.
+            if textual_theme_name(key) != theme:
+                return
+            self._selene_palette = rich_palette(key)
+            if isinstance(self.session, dict):
+                self.session["tui_theme"] = key
+            try:
+                self.query_one("#prompt-glyph", Static).update(">")
+            except Exception:
+                pass
+            try:
+                composer = self.query_one(Composer)
+                hint = self.query_one("#composer-hint", Static)
+                hint.update(composer._shortcut_strip())
+            except Exception:
+                pass
+            try:
+                self.refresh_context_usage()
+            except Exception:
+                pass
+
         def _welcome_renderable(self):
+            pal = self._pal()
             brand = Text()
-            brand.append(f"{GLYPH_MARK}  ", style="bold #d0d0d0")
-            brand.append("SELENE\n", style="bold #e8e8e8")
-            brand.append("local agent runtime\n", style="#9a9a9a")
+            brand.append(f"{GLYPH_MARK}  ", style=f"bold {pal['text_soft']}")
+            brand.append("SELENE\n", style=f"bold {pal['text']}")
+            brand.append("local agent runtime\n", style=pal["muted"])
             brand.append(
                 f"tools {GLYPH_DOT} vault {GLYPH_DOT} ollama\n\n",
-                style="#6b6b6b",
+                style=pal["faint"],
             )
-            brand.append("Type a message below", style="#9a9a9a")
-            brand.append("  ·  ", style="#6b6b6b")
-            brand.append("/", style="bold #d0d0d0")
-            brand.append(" commands  ·  ", style="#9a9a9a")
-            brand.append("Ctrl+/", style="bold #d0d0d0")
-            brand.append(" palette  ·  ", style="#9a9a9a")
-            brand.append("F1", style="bold #d0d0d0")
-            brand.append(" help", style="#9a9a9a")
+            brand.append("Type a message below", style=pal["muted"])
+            brand.append("  ·  ", style=pal["faint"])
+            brand.append("/", style=f"bold {pal['text_soft']}")
+            brand.append(" commands  ·  ", style=pal["muted"])
+            brand.append("/theme", style=f"bold {pal['text_soft']}")
+            brand.append(" colors  ·  ", style=pal["muted"])
+            brand.append("F1", style=f"bold {pal['text_soft']}")
+            brand.append(" help", style=pal["muted"])
+            from agent.tui_themes import DEFAULT_THEME, theme_label
+
+            theme_name = DEFAULT_THEME
+            if isinstance(self.session, dict):
+                theme_name = str(self.session.get("tui_theme") or DEFAULT_THEME)
+
             return Panel(
                 brand,
-                border_style="#3f3f3f",
-                title=f"[bold #d0d0d0]{GLYPH_MARK}[/] [bold #e8e8e8]selene[/]",
-                subtitle="[dim]frontier local[/]",
+                border_style=pal["border"],
+                title=f"[bold {pal['text_soft']}]{GLYPH_MARK}[/] [bold {pal['text']}]selene[/]",
+                subtitle=f"[dim]{theme_label(theme_name)}[/]",
                 padding=(1, 2),
             )
 
@@ -1142,6 +1384,7 @@ def build_app_class():
             if event.input.id != "prompt-input":
                 return
             self._update_slash_palette(event.value, reset_selection=True)
+            self.refresh_context_usage()
 
         def on_input_submitted(self, event: Input.Submitted) -> None:
             if event.input.id != "prompt-input":
@@ -1335,6 +1578,7 @@ def build_app_class():
             # Flush any remaining capture buffer.
             if self._capture_file is not None:
                 self._capture_file.flush()
+            self.refresh_context_usage()
 
         def _reset_transcript(self) -> None:
             """Clear the chat view after /clear (history already wiped by handler).
@@ -1391,6 +1635,7 @@ def build_app_class():
             """Reset transcript and confirm (used by /clear and Ctrl+L)."""
             self._reset_transcript()
             self.ui_status("Conversation cleared", kind="ok")
+            self.refresh_context_usage()
 
         def action_quit_app(self) -> None:
             self.exit()

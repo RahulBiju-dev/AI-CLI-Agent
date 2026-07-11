@@ -1291,7 +1291,7 @@ def _stream_complete_response(
         messages=messages,
         tools=tools,
         options=effective_session_model_options(session)[1],
-        verbose=session.get("verbose", False),
+        verbose=session.get("verbose", True),
         think=session.get("think", True),
         fmt=session.get("format") or None,
         extra_reserved_tokens=extra_reserved_tokens,
@@ -1329,7 +1329,7 @@ def _stream_complete_response(
             messages=continuation_messages,
             tools=None,
             options=effective_session_model_options(session)[1],
-            verbose=session.get("verbose", False),
+            verbose=session.get("verbose", True),
             think=False,
             fmt=session.get("format") or None,
         )
@@ -1522,6 +1522,15 @@ def _build_cli_slash_specs() -> tuple[tuple[str, str], ...]:
         specs.append((f"/profile {name}", desc))
         specs.append((f"/set profile {name}", desc))
 
+    # TUI themes (default first via tui_themes.theme_specs_for_slash).
+    try:
+        from agent.tui_themes import theme_specs_for_slash
+
+        specs.extend(theme_specs_for_slash())
+    except Exception:
+        specs.append(("/theme", "TUI color theme  ·  /theme <place>"))
+        specs.append(("/theme oslo", "Oslo — monochrome grey & white (default)"))
+
     specs.extend(
         [
             ("/set parameter", "Set model knob  ·  /set parameter <name> <value>"),
@@ -1540,8 +1549,8 @@ def _build_cli_slash_specs() -> tuple[tuple[str, str], ...]:
             ("/set format", "Force output format  ·  /set format json"),
             ("/set format json", "JSON-only model output"),
             ("/set noformat", "Normal free-form output (default)"),
-            ("/set verbose", "Show generation timing/stats"),
-            ("/set quiet", "Hide generation stats (default)"),
+            ("/set verbose", "Show generation timing/stats (default)"),
+            ("/set quiet", "Hide generation stats"),
             ("/set think", "Stream model thinking (default)"),
             ("/set nothink", "Answer without thinking stream"),
             ("/show parameters", "Active profile + model options"),
@@ -1577,6 +1586,7 @@ _COMMAND_HELP_ENTRIES: tuple[tuple[str, str], ...] = (
     ("/load [name|index]", "Load a session (lists if no arg)"),
     ("/profile [name]", "Show or set profile (manual · auto · low-vram · balanced)"),
     ("/set profile <name>", "Same as /profile <name>"),
+    ("/theme [place]", "TUI colors (oslo · tokyo · rome · amazon · …)"),
     ("/set parameter <name> <val>", "Model option (temperature, num_ctx, …)"),
     ("/set system \"…\"|default", "Override or reset system prompt"),
     ("/set history | nohistory", "Multi-turn context on/off"),
@@ -1615,6 +1625,56 @@ def _print_profile_catalog() -> None:
     for name, description in _PROFILE_SPECS:
         _console.print(f"    [bold]{name:<10}[/]  [dim]{description}[/]")
     print_info("Usage · /profile <name>  or  /set profile <name>")
+    _console.print()
+
+
+def _handle_theme(args: str, session: dict) -> None:
+    """Show or apply a TUI place-named color theme (default is Oslo)."""
+    try:
+        from agent.tui_themes import (
+            DEFAULT_THEME,
+            is_valid_theme,
+            normalize_theme_name,
+            theme_catalog,
+            theme_label,
+        )
+    except Exception as exc:
+        print_error(f"Themes unavailable · {exc}")
+        _console.print()
+        return
+
+    raw = str(args or "").strip()
+    if not raw:
+        current = normalize_theme_name(session.get("tui_theme") or DEFAULT_THEME)
+        print_info(f"Current theme · {current}  ({theme_label(current)})")
+        print_info("TUI themes (places)")
+        for name, label in theme_catalog():
+            mark = "  ←" if name == current else ""
+            _console.print(f"    [bold]{name:<12}[/]  [dim]{label}{mark}[/]")
+        print_info("Usage · /theme <place>")
+        _console.print()
+        return
+
+    if not is_valid_theme(raw):
+        print_error(f"Unknown theme · {raw}")
+        print_info("Try · " + " · ".join(name for name, _ in theme_catalog()))
+        _console.print()
+        return
+
+    key = normalize_theme_name(raw)
+    session["tui_theme"] = key
+    # Apply live when the full-screen TUI is active.
+    try:
+        from agent.terminal import get_display_sink
+
+        sink = get_display_sink()
+        if sink is not None and hasattr(sink, "apply_theme"):
+            sink.apply_theme(key)
+            return
+    except Exception:
+        pass
+    print_ok(f"Theme · {key}", detail=theme_label(key))
+    print_info("Applies the next time the TUI is opened")
     _console.print()
 
 
@@ -1987,13 +2047,14 @@ def _handle_save(args: str, session: dict, history: list[dict]) -> None:
         "model": MODEL_NAME,
         "session": {
             "options": session.get("options", {}),
-            "verbose": session.get("verbose", False),
+            "verbose": session.get("verbose", True),
             "wordwrap": session.get("wordwrap", True),
             "system": session.get("system", ""),
             "history": session.get("history", True),
             "format": session.get("format", ""),
             "think": session.get("think", True),
             "runtime_profile": session.get("runtime_profile", "manual"),
+            "tui_theme": session.get("tui_theme", "oslo"),
         },
         "history": history,
     }
@@ -2111,13 +2172,14 @@ def _handle_load(args: str, session: dict, history: list[dict]) -> None:
     history.clear()
     history.extend(saved_history)
     session["options"] = restored_options
-    session["verbose"] = saved_session.get("verbose", False)
+    session["verbose"] = saved_session.get("verbose", True)
     session["wordwrap"] = saved_session.get("wordwrap", True)
     session["system"] = saved_session.get("system", "")
     session["history"] = saved_session.get("history", True)
     session["format"] = saved_session.get("format", "")
     session["think"] = saved_session.get("think", True)
     session["runtime_profile"] = runtime_profile
+    session["tui_theme"] = saved_session.get("tui_theme", "oslo")
 
     display_name = os.path.basename(target_path).replace(".json", "")
     msg_count = sum(1 for m in history if m.get("role") == "user")
@@ -2532,6 +2594,10 @@ def _handle_command(cmd: str, session: dict, history: list[dict]) -> bool | None
         _console.print()
         return True
 
+    if base == "/theme":
+        _handle_theme(rest, session)
+        return True
+
     if base == "/set":
         _handle_set(rest, session, history)
         return True
@@ -2585,13 +2651,14 @@ def _new_session_state() -> dict:
     """Fresh session options for a CLI/TUI conversation."""
     return {
         "options": {},
-        "verbose": False,
+        "verbose": True,
         "wordwrap": True,
         "system": "",
         "history": True,
         "format": "",
         "think": True,
         "runtime_profile": "manual",
+        "tui_theme": "oslo",
     }
 
 

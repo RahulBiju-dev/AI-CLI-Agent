@@ -79,7 +79,7 @@ def _session_from_runtime(runtime: RuntimeConfig) -> dict:
         # from the selected profile for every model request.
         "options": {},
         "runtime_profile": runtime.requested_profile.value,
-        "verbose": False,
+        "verbose": True,
         "wordwrap": True,
         "system": "",
         "history": True,
