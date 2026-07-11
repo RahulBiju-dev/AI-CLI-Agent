@@ -31,9 +31,14 @@ Response style:
 
 # Default runtime parameters for new systems (profile=manual). Hardware
 # auto-selection only applies when the user explicitly chooses profile=auto.
+#
+# num_predict is an output *token budget per generation call*, not a VRAM
+# hard limit. With num_ctx 8192, 2048 leaves room for prompt/tools/history;
+# Selene still trims this per call when the context is full and can continue
+# long answers across multiple calls.
 PARAMETER temperature 0.25
 PARAMETER top_p 0.85
 PARAMETER top_k 40
 PARAMETER num_ctx 8192
-PARAMETER num_predict 768
+PARAMETER num_predict 2048
 PARAMETER num_batch 128

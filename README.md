@@ -722,7 +722,7 @@ Selene selects a **hardware profile** at startup (`auto`, `low-vram`, `balanced`
 | Setting | low-vram (default safeguard) | balanced (larger GPU) | Purpose |
 |---------|------------------------------|------------------------|---------|
 | `num_ctx` | 4096 | 8192 | Context window |
-| `num_predict` | 768 | 1536 | Output ceiling |
+| `num_predict` | 768 | 2048 | Output ceiling (per call; manual/Modelfile default is 2048) |
 | `num_batch` | 128 | 512 | Prefill batch size |
 | model slots | 1 | 2 | Concurrent model-heavy ops under the coordinator |
 | tool workers | 2 | 4 | Bounded parallel tool execution |

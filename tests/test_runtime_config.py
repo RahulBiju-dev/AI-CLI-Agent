@@ -41,7 +41,7 @@ class RuntimeConfigTests(unittest.TestCase):
         self.assertEqual(config.profile, RuntimeProfile.MANUAL)
         # Bundled Modelfile PARAMETER values.
         self.assertEqual(config.num_ctx, 8192)
-        self.assertEqual(config.num_predict, 768)
+        self.assertEqual(config.num_predict, 2048)
         self.assertEqual(config.num_batch, 128)
         self.assertEqual(config.temperature, 0.25)
         self.assertEqual(config.top_p, 0.85)

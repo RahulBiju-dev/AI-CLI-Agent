@@ -137,7 +137,9 @@ _MODELFILE_DEFAULTS: dict[str, Any] = {
     "embedding_model": "embeddinggemma",
     "vision_model": "moondream",
     "num_ctx": 8192,
-    "num_predict": 768,
+    # Per-call generation ceiling (not a VRAM hard limit). Raised for longer
+    # answers while still leaving the majority of num_ctx for the prompt.
+    "num_predict": 2048,
     "num_batch": 128,
     "temperature": 0.25,
     "top_p": 0.85,
@@ -165,6 +167,7 @@ _PROFILE_DEFAULTS: dict[RuntimeProfile, dict[str, Any]] = {
     RuntimeProfile.LOW_VRAM: {
         **_MODELFILE_DEFAULTS,
         "num_ctx": 4096,
+        "num_predict": 768,  # smaller window → keep a tighter output budget
         "model_concurrency": 1,
         "heavy_tool_concurrency": 1,
         "tool_workers": 2,
@@ -174,7 +177,7 @@ _PROFILE_DEFAULTS: dict[RuntimeProfile, dict[str, Any]] = {
     RuntimeProfile.BALANCED: {
         **_MODELFILE_DEFAULTS,
         "num_ctx": 8192,
-        "num_predict": 1536,
+        "num_predict": 2048,
         "num_batch": 512,
         "keep_alive": "30m",
         "model_concurrency": 2,
@@ -541,10 +544,27 @@ def resolve_runtime_config(
     _apply_layer(values, sources, environment_values, "environment")
     _apply_layer(values, sources, session_values, "session override")
 
-    if values["num_predict"] > values["num_ctx"] - 512:
-        raise RuntimeConfigurationError(
-            "num_predict must leave at least 512 tokens in num_ctx for prompt and safety overhead"
-        )
+    # num_predict is a per-call output budget, not VRAM. It must leave prompt
+    # headroom inside num_ctx. When only num_ctx was tightened, softly cap a
+    # default/profile output budget instead of failing the whole resolve.
+    _soft_predict_sources = {
+        "Modelfile default",
+        "conservative default",
+        "low-vram profile",
+        "balanced profile",
+        "manual profile",
+        "auto-capped for num_ctx headroom",
+    }
+    min_prompt_reserve = 512
+    max_predict = max(64, int(values["num_ctx"]) - min_prompt_reserve)
+    if values["num_predict"] > max_predict:
+        if sources.get("num_predict") in _soft_predict_sources:
+            values["num_predict"] = max_predict
+            sources["num_predict"] = "auto-capped for num_ctx headroom"
+        else:
+            raise RuntimeConfigurationError(
+                "num_predict must leave at least 512 tokens in num_ctx for prompt and safety overhead"
+            )
     if values["heavy_tool_concurrency"] > values["tool_workers"]:
         raise RuntimeConfigurationError("heavy_tool_concurrency cannot exceed tool_workers")
 

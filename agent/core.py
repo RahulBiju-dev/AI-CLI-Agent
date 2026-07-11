@@ -1482,7 +1482,7 @@ _PARAMETER_SPECS: tuple[tuple[str, str], ...] = (
     ("top_p", "Nucleus sampling  ·  e.g. 0.85"),
     ("top_k", "Top-k sampling  ·  e.g. 40"),
     ("num_ctx", "Context window tokens  ·  e.g. 8192"),
-    ("num_predict", "Max output tokens  ·  e.g. 768"),
+    ("num_predict", "Max output tokens per call  ·  e.g. 2048"),
     ("num_batch", "Prompt batch size  ·  e.g. 128"),
     ("repeat_penalty", "Repetition penalty  ·  e.g. 1.08"),
 )

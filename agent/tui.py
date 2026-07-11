@@ -208,17 +208,23 @@ def build_app_class():
     Input = t["Input"]
     Static = t["Static"]
 
-    # Neutral light-gray lab palette (no cyan/blue chrome).
-    C_BG = "#121212"
-    C_SURFACE = "#1a1a1a"
-    C_ELEVATED = "#222222"
-    C_BORDER = "#3f3f3f"
-    C_BORDER_FOCUS = "#8a8a8a"
-    C_TEXT = "#e8e8e8"
-    C_MUTED = "#9a9a9a"
-    C_FAINT = "#6b6b6b"
-    C_ACCENT = "#d0d0d0"
-    C_SELECT_BG = "#2c2c2c"
+    # Visual hierarchy:
+    #   important  → prompts + responses (bright, solid weight)
+    #   chrome     → slash menu, status, tools, thinking (muted, recessed)
+    C_BG = "#101010"
+    C_SURFACE = "#171717"
+    C_ELEVATED = "#1c1c1c"
+    C_CONTENT = "#1f1f1f"       # slightly lifted panel behind chat content
+    C_BORDER = "#333333"
+    C_BORDER_SOFT = "#2a2a2a"
+    C_BORDER_FOCUS = "#9a9a9a"
+    C_TEXT = "#f2f2f2"          # primary content
+    C_TEXT_SOFT = "#d8d8d8"
+    C_MUTED = "#7a7a7a"         # secondary / chrome
+    C_FAINT = "#555555"
+    C_ACCENT = "#cfcfcf"
+    C_SELECT_FG = "#0a0a0a"
+    C_SELECT_BG = "#e8e8e8"     # high-contrast menu highlight
 
     class ChatView(VerticalScroll):
         """Scrollable transcript region."""
@@ -244,51 +250,68 @@ def build_app_class():
             width: 100%;
             margin: 0 0 1 0;
             padding: 0 1;
-            color: {C_TEXT};
+            color: {C_MUTED};
         }}
+        /* —— Important: user prompts & model responses —— */
         MessageBlock.user {{
             color: {C_TEXT};
-            border-left: wide {C_BORDER_FOCUS};
-            padding-left: 1;
-            margin-bottom: 1;
+            background: {C_CONTENT};
+            border-left: heavy {C_TEXT_SOFT};
+            padding: 1 2;
+            margin: 0 0 1 0;
         }}
         MessageBlock.assistant {{
             color: {C_TEXT};
-            border-left: wide {C_ACCENT};
-            padding-left: 1;
-            margin-bottom: 1;
+            background: {C_CONTENT};
+            border-left: heavy #ffffff;
+            padding: 1 2;
+            margin: 0 0 1 0;
+        }}
+        /* —— Secondary: slash / status / tools / thinking —— */
+        MessageBlock.command {{
+            color: {C_MUTED};
+            background: transparent;
+            border-left: solid {C_BORDER_SOFT};
+            padding: 0 1 0 2;
+            margin: 0 0 0 0;
+            text-style: dim;
         }}
         MessageBlock.thinking {{
-            color: {C_MUTED};
-            border-left: wide {C_BORDER};
-            padding-left: 1;
+            color: {C_FAINT};
+            border-left: solid {C_BORDER_SOFT};
+            padding-left: 2;
             margin-bottom: 0;
+            text-style: dim italic;
         }}
         MessageBlock.activity {{
-            color: {C_MUTED};
+            color: {C_FAINT};
             padding-left: 2;
             margin: 0 0 0 0;
             height: 1;
+            text-style: dim;
         }}
         MessageBlock.status {{
+            color: {C_FAINT};
+            padding-left: 2;
+            margin-bottom: 0;
+            text-style: dim;
+        }}
+        MessageBlock.tool {{
             color: {C_MUTED};
             padding-left: 2;
             margin-bottom: 0;
-        }}
-        MessageBlock.tool {{
-            color: {C_ACCENT};
-            padding-left: 2;
-            margin-bottom: 0;
+            text-style: dim;
         }}
         MessageBlock.error {{
-            color: #e0a0a0;
-            border-left: wide #a06060;
+            color: #c08080;
+            border-left: wide #8a5050;
             padding-left: 1;
         }}
         MessageBlock.system {{
-            color: {C_MUTED};
+            color: {C_FAINT};
             padding-left: 2;
             margin-bottom: 0;
+            text-style: dim;
         }}
         """
 
@@ -303,7 +326,7 @@ def build_app_class():
             padding: 1 1;
             background: {C_ELEVATED};
             color: {C_MUTED};
-            border: round {C_BORDER};
+            border: round {C_BORDER_SOFT};
             margin: 0 1 1 1;
         }}
         SlashPalette.-visible {{
@@ -327,12 +350,12 @@ def build_app_class():
             cmd_width = min(28, max(len(cmd) for cmd, _ in matches))
             total = total if total is not None else len(matches)
             header = (
-                f"[bold {C_ACCENT}]commands[/]  "
-                f"[dim]{len(matches)}"
+                f"[bold {C_MUTED}]commands[/]  "
+                f"[{C_FAINT}]{len(matches)}"
                 + (f"/{total}" if total > len(matches) else "")
-                + f"  ·  filter [/][dim]{query or '/'}[/]"
+                + f"  ·  filter {query or '/'}[/]"
             )
-            lines: list[str] = [header, f"[dim]{'─' * min(56, cmd_width + 28)}[/]"]
+            lines: list[str] = [header, f"[{C_FAINT}]{'─' * min(56, cmd_width + 28)}[/]"]
 
             for index, (command, description) in enumerate(matches):
                 padded = command.ljust(cmd_width)
@@ -340,14 +363,21 @@ def build_app_class():
                 if len(desc) > 42:
                     desc = desc[:41] + "…"
                 if index == selected:
-                    # Inverse-style row for the active match.
-                    row = f"[bold reverse {C_TEXT}] › {padded}  {desc} [/]"
+                    # High-contrast selected row (near black on light gray).
+                    row = (
+                        f"[bold {C_SELECT_FG} on {C_SELECT_BG}]"
+                        f" ▐ {padded}  {desc} "
+                        f"[/]"
+                    )
                 else:
-                    row = f"[dim]   {padded}[/]  [dim]{desc}[/]"
+                    row = (
+                        f"[{C_MUTED}]   {padded}[/]"
+                        f"  [{C_FAINT}]{desc}[/]"
+                    )
                 lines.append(row)
 
             lines.append(
-                f"[dim]↑↓ / ctrl+n p  move  ·  tab complete  ·  "
+                f"[{C_FAINT}]↑↓ / ctrl+n p  move  ·  tab complete  ·  "
                 f"enter run  ·  esc dismiss[/]"
             )
             self.update("\n".join(lines))
@@ -369,7 +399,7 @@ def build_app_class():
             padding: 0 1 1 1;
         }}
         #composer-label {{
-            color: {C_ACCENT};
+            color: {C_MUTED};
             padding: 1 1 0 1;
             height: 1;
         }}
@@ -382,6 +412,7 @@ def build_app_class():
         }}
         #prompt-input:focus {{
             border: round {C_BORDER_FOCUS};
+            background: #141414;
         }}
         #prompt-input > .input--placeholder {{
             color: {C_FAINT};
@@ -589,10 +620,18 @@ def build_app_class():
             return block
 
         def ui_add_user(self, text: str) -> None:
+            # Slash commands are chrome; real prompts are primary content.
+            if str(text).startswith("/"):
+                line = Text()
+                line.append(f"{GLYPH_PROMPT} ", style="#555555")
+                line.append("command  ", style="bold #6b6b6b")
+                line.append(text, style="#7a7a7a")
+                self._mount_block(line, "command")
+                return
             header = Text()
-            header.append(f"{GLYPH_MARK} ", style="bold #d0d0d0")
-            header.append("you\n", style="bold #e8e8e8")
-            header.append(text, style="#e8e8e8")
+            header.append(f"{GLYPH_MARK} ", style="bold #f2f2f2")
+            header.append("you\n", style="bold #ffffff")
+            header.append(text, style="#f2f2f2")
             self._mount_block(header, "user")
 
         # ── Activity animation (pre-thinking / in-progress) ───────────
@@ -605,9 +644,9 @@ def build_app_class():
             # Soft pulse dots after the label.
             dots = "." * (1 + (self._activity_frame % 3))
             line = Text()
-            line.append(f"{frame}  ", style="#c8c8c8")
-            line.append(label, style="#9a9a9a")
-            line.append(dots.ljust(3), style="#6b6b6b")
+            line.append(f"{frame}  ", style="#6b6b6b")
+            line.append(label, style="#6b6b6b")
+            line.append(dots.ljust(3), style="#555555")
             return line
 
         def _thinking_renderable(self) -> Text:
@@ -615,18 +654,18 @@ def build_app_class():
                 self._activity_frame % len(self._spinner_frames)
             ]
             body = Text()
-            body.append(f"{frame}  ", style="#c8c8c8")
-            body.append("thinking", style="bold #9a9a9a")
+            body.append(f"{frame}  ", style="#6b6b6b")
+            body.append("thinking", style="#6b6b6b")
             if self._thinking_chars:
-                body.append(f"  ·  {self._thinking_chars} chars", style="#6b6b6b")
+                body.append(f"  ·  {self._thinking_chars} chars", style="#555555")
             else:
-                body.append("  ·  collecting", style="#6b6b6b")
+                body.append("  ·  collecting", style="#555555")
             preview = self._thinking_buf.strip().replace("\n", " ")
             if preview:
                 if len(preview) > 72:
                     preview = "…" + preview[-72:]
                 body.append("\n  ", style="")
-                body.append(preview, style="#6b6b6b")
+                body.append(preview, style="#555555")
             return body
 
         def _ensure_activity_widget(self) -> "MessageBlock":
@@ -733,19 +772,19 @@ def build_app_class():
                     return
 
             glyphs = {
-                "info": (GLYPH_MARK, "#b0b0b0"),
-                "run": (GLYPH_RUN, "#c8c8a0"),
-                "ok": (GLYPH_OK, "#a8c8a8"),
-                "warn": (GLYPH_WARN, "#c8c8a0"),
-                "error": (GLYPH_ERR, "#e0a0a0"),
-                "tool": (GLYPH_TOOL, "#d0d0d0"),
+                "info": (GLYPH_MARK, "#6b6b6b"),
+                "run": (GLYPH_RUN, "#7a7a60"),
+                "ok": (GLYPH_OK, "#6a8a6a"),
+                "warn": (GLYPH_WARN, "#8a8a60"),
+                "error": (GLYPH_ERR, "#c08080"),
+                "tool": (GLYPH_TOOL, "#6b6b6b"),
             }
             glyph, color = glyphs.get(kind, glyphs["info"])
             line = Text()
             line.append(f"{glyph}  ", style=color)
-            line.append(message, style=color if kind == "error" else "#c8c8c8")
+            line.append(message, style=color if kind == "error" else "#6b6b6b")
             if detail:
-                line.append(f"  {detail}", style="#6b6b6b")
+                line.append(f"  {detail}", style="#555555")
             cls = "error" if kind == "error" else "status"
             self._mount_block(line, cls)
 
@@ -772,7 +811,7 @@ def build_app_class():
                     return
                 if len(stripped) < 3:
                     return
-            self._mount_block(Text(stripped, style="#9a9a9a"), "system")
+            self._mount_block(Text(stripped, style="#555555"), "system")
 
         def ui_thinking_start(self) -> None:
             """Promote the activity line into a compact thinking block."""
@@ -825,13 +864,13 @@ def build_app_class():
             chars = self._thinking_chars
             body = Text()
             if label == "interrupted":
-                body.append(f"{GLYPH_WARN}  ", style="#c8c8a0")
-                body.append("thinking interrupted", style="#c8c8a0")
+                body.append(f"{GLYPH_WARN}  ", style="#8a8a60")
+                body.append("thinking interrupted", style="#6b6b6b")
             else:
-                body.append(f"{GLYPH_OK}  ", style="#a8c8a8")
-                body.append(title, style="#9a9a9a")
+                body.append(f"{GLYPH_OK}  ", style="#6a8a6a")
+                body.append(title, style="#6b6b6b")
                 if chars:
-                    body.append(f"  ·  {chars} chars", style="#6b6b6b")
+                    body.append(f"  ·  {chars} chars", style="#555555")
             self._thinking_widget.update(body)
             self._thinking_widget = None
             self._thinking_buf = ""
@@ -848,8 +887,8 @@ def build_app_class():
             self._clear_waiting_activity()
             rendered = Markdown(_render_terminal_markdown(text or " "))
             title = Text()
-            title.append(f"{GLYPH_SECTION} ", style="bold #d0d0d0")
-            title.append("response\n", style="bold #e8e8e8")
+            title.append(f"{GLYPH_SECTION} ", style="bold #ffffff")
+            title.append("response\n", style="bold #f2f2f2")
             panel = Group(title, rendered)
             if self._stream_widget is None:
                 self._stream_widget = self._mount_block(panel, "assistant")
@@ -864,8 +903,8 @@ def build_app_class():
                 self.ui_thinking_end()
             rendered = Markdown(_render_terminal_markdown(text or " "))
             title = Text()
-            title.append(f"{GLYPH_SECTION} ", style="bold #d0d0d0")
-            title.append("response\n", style="bold #e8e8e8")
+            title.append(f"{GLYPH_SECTION} ", style="bold #ffffff")
+            title.append("response\n", style="bold #f2f2f2")
             panel = Group(title, rendered)
             if self._stream_widget is None:
                 self._mount_block(panel, "assistant")
@@ -879,7 +918,7 @@ def build_app_class():
                 f"{GLYPH_DOT}  {elapsed:.1f}s  {GLYPH_DOT}  "
                 f"~{total_tokens} tokens  {GLYPH_DOT}  ~{tokens_per_sec:.1f} tok/s"
             )
-            self._mount_block(Text(line, style="#6b6b6b"), "status")
+            self._mount_block(Text(line, style="#555555"), "status")
 
         def ui_help(
             self,
@@ -888,15 +927,15 @@ def build_app_class():
             subtitle: str | None,
         ) -> None:
             body = Text()
-            body.append(f"{GLYPH_SECTION} ", style="bold #d0d0d0")
-            body.append(f"{title}\n", style="bold #e8e8e8")
+            body.append(f"{GLYPH_SECTION} ", style="#6b6b6b")
+            body.append(f"{title}\n", style="bold #7a7a7a")
             if subtitle:
-                body.append(f"{subtitle}\n\n", style="#6b6b6b")
+                body.append(f"{subtitle}\n\n", style="#555555")
             else:
                 body.append("\n")
             for command, description in entries:
-                body.append(f"  {command}", style="bold #d0d0d0")
-                body.append(f"  {description}\n", style="#9a9a9a")
+                body.append(f"  {command}", style="#7a7a7a")
+                body.append(f"  {description}\n", style="#555555")
             self._mount_block(body, "system")
 
         # ── Slash palette ─────────────────────────────────────────────
@@ -1225,8 +1264,8 @@ def build_app_class():
                 "ctrl+/ palette  ·  tab complete  ·  enter run",
             )
             shortcuts = Text()
-            shortcuts.append(f"{GLYPH_SECTION} ", style="bold #d0d0d0")
-            shortcuts.append("shortcuts\n", style="bold #e8e8e8")
+            shortcuts.append(f"{GLYPH_SECTION} ", style="#6b6b6b")
+            shortcuts.append("shortcuts\n", style="bold #7a7a7a")
             for key, desc in (
                 ("Enter / Ctrl+J", "Send message"),
                 ("Ctrl+/", "Open command palette"),
@@ -1239,8 +1278,8 @@ def build_app_class():
                 ("F1", "Show this help"),
                 ("Ctrl+C", "Quit"),
             ):
-                shortcuts.append(f"  {key:<16}", style="bold #d0d0d0")
-                shortcuts.append(f"  {desc}\n", style="#9a9a9a")
+                shortcuts.append(f"  {key:<16}", style="#7a7a7a")
+                shortcuts.append(f"  {desc}\n", style="#555555")
             self._mount_block(shortcuts, "system")
 
         def action_submit_input(self) -> None:
