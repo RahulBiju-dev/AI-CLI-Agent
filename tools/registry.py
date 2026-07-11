@@ -33,7 +33,8 @@ from tools.vault_indexer import (
     register_vault_alias_tool,
     rename_vault,
 )
-from tools.vault_search import search_vault
+from tools.vault_search import read_vault, search_vault
+from tools.pdf_writer import build_vault_notes_pdf, create_pdf, export_vault_pdf
 from tools.obsi_vault_writer import create_structured_note
 from tools.vision_describer import describe_image
 from tools.knowledge_graph_builder import knowledge_graph_builder
@@ -475,7 +476,10 @@ TOOL_SCHEMAS.extend([
         "type": "function",
         "function": {
             "name": "index_vault",
-            "description": "Index a folder or file into ChromaDB vault. Use before vault_search.",
+            "description": (
+                "Incrementally index a folder or file into a persistent ChromaDB vault. "
+                "Large PDFs checkpoint after every page and resume across calls. Use action=status for progress."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -484,8 +488,99 @@ TOOL_SCHEMAS.extend([
                     "file_path": {"type": "string", "description": "File to index."},
                     "chunk_size": {"type": "integer", "description": "Chunk size (default 1800)."},
                     "chunk_overlap": {"type": "integer", "description": "Overlap between chunks (default 250)."},
-                    "include_vision": {"type": "boolean", "description": "Include moondream page descriptions for PDFs (default true; false is faster for text-only PDFs)."}
+                    "include_vision": {"type": "boolean", "description": "Include moondream page descriptions for PDFs (default true; false is faster for text-only PDFs)."},
+                    "vision_mode": {"type": "string", "enum": ["off", "auto", "all"], "description": "PDF vision policy. auto analyzes image-bearing/low-text pages; all runs Moondream on every page."},
+                    "max_pages": {"type": "integer", "minimum": 1, "maximum": 500, "description": "PDF pages processed per resumable call (default 20)."},
+                    "resume_page": {"type": "integer", "minimum": 1, "description": "For recursive resume calls, pass the previous PDF job's next_page exactly."},
+                    "action": {"type": "string", "enum": ["index", "status"], "description": "Index/resume content or inspect durable PDF checkpoints."}
                 }
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "vault_read",
+            "description": (
+                "Read a vault exhaustively in deterministic source/page/chunk order. "
+                "Use next_cursor repeatedly to traverse every character without semantic-search gaps."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "collection": {"type": "string"},
+                    "cursor": {"type": ["string", "integer"], "description": "Start at 0, then pass the returned next_cursor exactly."},
+                    "source": {"type": "string", "description": "Optional source filename/path filter."},
+                    "start_page": {"type": "integer", "minimum": 1},
+                    "end_page": {"type": "integer", "minimum": 1},
+                    "max_chunks": {"type": "integer", "minimum": 1, "maximum": 50},
+                    "max_chars": {"type": "integer", "minimum": 500, "maximum": 3200}
+                }
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_pdf",
+            "description": "Create a styled, paginated PDF atomically from Markdown-like content or a UTF-8 text file. Existing PDFs are never overwritten without explicit confirmation.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file_path": {"type": "string", "description": "Relative paths go under Selene vault exports; absolute paths must stay in the workspace or Selene data directory."},
+                    "title": {"type": "string"},
+                    "content": {"type": "string", "description": "Markdown-like PDF body."},
+                    "content_file": {"type": "string", "description": "Optional UTF-8 source file for a long PDF body."},
+                    "overwrite": {"type": "boolean"},
+                    "confirmed": {"type": "boolean", "description": "Required when overwriting an existing PDF after explicit user approval."}
+                },
+                "required": ["file_path"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "export_vault_pdf",
+            "description": "Export every matching vault chunk in source/page order to a complete reference PDF without model summarization.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "collection": {"type": "string"},
+                    "file_path": {"type": "string"},
+                    "title": {"type": "string"},
+                    "source": {"type": "string"},
+                    "start_page": {"type": "integer", "minimum": 1},
+                    "end_page": {"type": "integer", "minimum": 1},
+                    "overwrite": {"type": "boolean"},
+                    "confirmed": {"type": "boolean"}
+                },
+                "required": ["collection", "file_path"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "build_vault_notes_pdf",
+            "description": (
+                "Recursively turn an entire vault into refined grounded notes and a final PDF. "
+                "Processes bounded ordered windows, saves every note section durably, and returns next_cursor until complete."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "collection": {"type": "string"},
+                    "file_path": {"type": "string"},
+                    "title": {"type": "string"},
+                    "source": {"type": "string"},
+                    "cursor": {"type": ["string", "integer"], "description": "Omit initially; on resume pass returned next_cursor exactly."},
+                    "sections_per_run": {"type": "integer", "minimum": 1, "maximum": 12},
+                    "action": {"type": "string", "enum": ["build", "status"]},
+                    "overwrite": {"type": "boolean"},
+                    "confirmed": {"type": "boolean"}
+                },
+                "required": ["collection", "file_path"]
             }
         }
     },
@@ -735,12 +830,16 @@ TOOL_DISPATCH: dict[str, Callable] = {
     "launch_apps": launch_apps,
     "open_terminal_at_path": open_terminal_at_path,
     "describe_image": describe_image,
+    "create_pdf": create_pdf,
+    "export_vault_pdf": export_vault_pdf,
+    "build_vault_notes_pdf": build_vault_notes_pdf,
 }
 
 # Dispatch RAG tools
 TOOL_DISPATCH.update({
     "index_vault": index_vault,
     "vault_search": search_vault,
+    "vault_read": read_vault,
     "delete_vault_item": delete_vault_item,
     "list_vaults": list_vaults,
     "list_vault_aliases": list_vault_aliases,
@@ -859,6 +958,20 @@ TOOL_METADATA: dict[str, ToolMetadata] = {
         default_timeout_seconds=300, max_output_chars=24_000,
         optional_dependencies=("ollama",),
     ),
+    "create_pdf": _metadata(
+        "create_pdf", read_only=False, cpu_heavy=True, default_timeout_seconds=180,
+        max_output_chars=8_000, optional_dependencies=("reportlab",),
+    ),
+    "export_vault_pdf": _metadata(
+        "export_vault_pdf", read_only=False, cpu_heavy=True, supports_cancellation=True,
+        default_timeout_seconds=900, max_output_chars=10_000,
+        optional_dependencies=("chromadb", "reportlab"),
+    ),
+    "build_vault_notes_pdf": _metadata(
+        "build_vault_notes_pdf", read_only=False, cpu_heavy=True, supports_cancellation=True,
+        default_timeout_seconds=900, max_output_chars=12_000,
+        optional_dependencies=("chromadb", "ollama", "reportlab"),
+    ),
     "open_terminal_at_path": _metadata(
         "open_terminal_at_path", read_only=False, default_timeout_seconds=15, max_output_chars=8_000
     ),
@@ -890,6 +1003,11 @@ TOOL_METADATA: dict[str, ToolMetadata] = {
         "vault_search", gpu_heavy=True, supports_cancellation=True,
         default_timeout_seconds=180, max_output_chars=20_000,
         optional_dependencies=("chromadb", "ollama"),
+    ),
+    "vault_read": _metadata(
+        "vault_read", cpu_heavy=True, supports_cancellation=True,
+        default_timeout_seconds=120, max_output_chars=4_000,
+        optional_dependencies=("chromadb",),
     ),
     "delete_vault_item": _metadata(
         "delete_vault_item", read_only=False, cpu_heavy=True,

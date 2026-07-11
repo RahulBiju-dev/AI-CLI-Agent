@@ -23,12 +23,15 @@ Generated from the live tool registry (`tools/registry.py`). Fedora Linux is the
 | `codebase_indexer` | `tools.codebase_indexer` | supported | supported | yes | chromadb, ollama | side-effecting | 900 | 25000 |
 | `context_memory_optimizer` | `tools.context_memory_optimizer` | supported | supported | yes | — | read-only | 30 | 25000 |
 | `create_file` | `tools.file` | supported | supported | yes | — | side-effecting | 120 | 12000 |
+| `create_pdf` | `tools.pdf_writer` | supported | supported | yes | reportlab | side-effecting | 180 | 8000 |
 | `create_structured_note` | `tools.obsi_vault_writer` | supported | supported | yes | — | side-effecting | 60 | 12000 |
 | `delete_vault_item` | `tools.vault_indexer` | supported | supported | yes | chromadb | side-effecting | 120 | 12000 |
 | `describe_image` | `tools.vision_describer` | supported | supported | yes | ollama | read-only | 300 | 24000 |
+| `export_vault_pdf` | `tools.pdf_writer` | supported | supported | yes | chromadb, reportlab | side-effecting | 900 | 10000 |
 | `get_current_datetime` | `tools.current_datetime` | supported | supported | yes | — | read-only | 5 | 4000 |
 | `google_workspace` | `tools.google_workspace` | supported | supported | yes | google-api-python-client, cryptography | side-effecting | 120 | 25000 |
 | `index_vault` | `tools.vault_indexer` | supported | supported | yes | chromadb, ollama | side-effecting | 900 | 20000 |
+| `build_vault_notes_pdf` | `tools.pdf_writer` | supported | supported | yes | chromadb, ollama, reportlab | side-effecting | 900 | 12000 |
 | `knowledge_graph_builder` | `tools.knowledge_graph_builder` | supported | supported | yes | — | read-only | 60 | 30000 |
 | `launch_apps` | `tools.app_launcher` | supported | supported | yes | — | side-effecting | 45 | 12000 |
 | `list_vault_aliases` | `tools.vault_indexer` | supported | supported | yes | — | read-only | 10 | 12000 |
@@ -45,6 +48,7 @@ Generated from the live tool registry (`tools/registry.py`). Fedora Linux is the
 | `spotify_play` | `tools.spotify` | supported | partial | yes | dbus-python | side-effecting | 30 | 8000 |
 | `spreadsheet` | `tools.spreadsheet` | supported | supported | yes | openpyxl | side-effecting | 120 | 30000 |
 | `vault_search` | `tools.vault_search` | supported | supported | yes | chromadb, ollama | read-only | 180 | 20000 |
+| `vault_read` | `tools.vault_search` | supported | supported | yes | chromadb | read-only | 120 | 4000 |
 | `view_code` | `tools.code` | supported | supported | yes | — | read-only | 20 | 20000 |
 | `web_scrape` | `tools.web_scraper` | supported | supported | yes | requests, beautifulsoup4 | read-only | 90 | 50000 |
 | `web_search` | `tools.search` | supported | supported | yes | ddgs | read-only | 90 | 35000 |

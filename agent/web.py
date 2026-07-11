@@ -523,6 +523,8 @@ _COMMANDS_HELP_MD = """
 * `/vault alias <name> <coll>` — Register a friendly alias for a collection
 * `/vault rename <old> <new>` — Rename a vault collection
 * `/vault add <path>` — Add a file or folder to the searchable vault
+* `/vault status <path>` — Show resumable large-PDF progress
+* `/vault read [--cursor n]` — Read all chunks in source order
 * `/vault search <query>` — Search the indexed vault
 * `/vault delete <source>` — Delete indexed chunks
 * `/quit` or `/exit` or `/q` — Quit/exit the session
@@ -752,6 +754,8 @@ def execute_command_web(
 * `/vault alias <name> <coll>` — Register a friendly alias for a collection
 * `/vault rename <old> <new>` — Rename a vault collection
 * `/vault add <path>` — Add a file or folder to the searchable vault
+* `/vault status <path>` — Show resumable large-PDF progress
+* `/vault read [--cursor n]` — Read all chunks in source order
 * `/vault search <query>` — Search the indexed vault
 * `/vault delete <source>` — Delete indexed chunks
 """
@@ -769,7 +773,8 @@ def execute_command_web(
                         return val
             return default
             
-        collection_raw = extract_option(tokens, ("--collection", "-c"), "vault") or "vault"
+        collection_option = extract_option(tokens, ("--collection", "-c"), None)
+        collection_raw = collection_option or "vault"
         
         try:
             from tools.vault_indexer import resolve_vault_alias
@@ -852,7 +857,13 @@ def execute_command_web(
         elif sub == "add":
             if not tokens:
                 return "Usage: `/vault add <path>`"
-            path = tokens[0]
+            vision_mode = extract_option(tokens, ("--vision",), "auto") or "auto"
+            max_pages_raw = extract_option(tokens, ("--max-pages",), "20") or "20"
+            try:
+                max_pages = int(max_pages_raw)
+            except ValueError:
+                return f"Invalid --max-pages value: `{max_pages_raw}`"
+            path = " ".join(tokens)
             abs_path = os.path.abspath(path)
             if not os.path.exists(abs_path):
                 return f"Path does not exist: `{path}`"
@@ -864,15 +875,65 @@ def execute_command_web(
                 vault_path = abs_path
                 file_path = None
                 
-            data = call_tool("index_vault", vault_path=vault_path, file_path=file_path, collection=collection)
+            index_args = {
+                "vault_path": vault_path,
+                "file_path": file_path,
+                "vision_mode": vision_mode,
+                "max_pages": max_pages,
+            }
+            if collection_option:
+                index_args["collection"] = collection
+            data = call_tool("index_vault", **index_args)
             if "error" in data:
                 return f"Vault indexing failed: {data['error']}"
                 
-            indexed = data.get("indexed_files", [])
-            out = [f"✓ Vault indexing complete (collection: `{collection}`):"]
-            for f in indexed:
-                out.append(f"- `{f}`")
+            incomplete = data.get("incomplete_pdf_count", 0)
+            out = [
+                f"✓ Vault {'checkpoint saved' if incomplete else 'indexing complete'} "
+                f"(collection: `{data.get('collection', collection)}`, chunks: {data.get('indexed_chunks', 0)})"
+            ]
+            for job in data.get("pdf_jobs", []):
+                out.append(
+                    f"- `{job.get('source')}`: pages {job.get('indexed_pages')}/{job.get('page_count')}, "
+                    f"vision pages {job.get('vision_pages')}, next page {job.get('next_page')}"
+                )
             return "\n".join(out)
+
+        elif sub == "status":
+            if not tokens:
+                return "Usage: `/vault status <pdf-path> [--collection name]`"
+            path = " ".join(tokens)
+            status_args = {
+                "vault_path": os.path.dirname(path) or ".",
+                "file_path": path,
+                "action": "status",
+            }
+            if collection_option:
+                status_args["collection"] = collection
+            data = call_tool("index_vault", **status_args)
+            if data.get("error"):
+                return f"Vault status failed: {data['error']}"
+            jobs = data.get("jobs", [])
+            if not jobs:
+                return "No PDF checkpoint exists for that path and collection."
+            return "\n".join(
+                f"- `{job.get('source', os.path.basename(path))}`: "
+                f"pages {job.get('indexed_pages', 0)}/{job.get('page_count', '?')}, "
+                f"chunks {job.get('indexed_chunks', 0)}, "
+                f"{'complete' if job.get('complete') else 'next page ' + str(job.get('next_page', 1))}"
+                for job in jobs
+            )
+
+        elif sub == "read":
+            cursor = extract_option(tokens, ("--cursor",), "0") or "0"
+            source_filter = extract_option(tokens, ("--source", "-s"), None)
+            data = call_tool(
+                "vault_read", collection=collection, cursor=cursor, source=source_filter,
+            )
+            if data.get("error"):
+                return f"Vault read failed: {data['error']}"
+            suffix = f"\n\nNext cursor: `{data['next_cursor']}`" if data.get("next_cursor") is not None else ""
+            return f"```text\n{data.get('content', '')}\n```{suffix}"
             
         elif sub == "search":
             if not tokens:
@@ -1159,7 +1220,24 @@ def _generate_chat_events_impl(
                         history_data.append(tool_msg)
                     else:
                         pre_tool_message = tool_msg
-                    yield {"type": "status", "message": "Indexing complete.", "color": "green"}
+                    try:
+                        index_payload = json.loads(tool_content)
+                    except (TypeError, json.JSONDecodeError):
+                        index_payload = {}
+                    if index_payload.get("incomplete_pdf_count"):
+                        job = (index_payload.get("pdf_jobs") or [{}])[0]
+                        yield {
+                            "type": "status",
+                            "message": (
+                                f"Index checkpoint saved — pages {job.get('indexed_pages', '?')}/"
+                                f"{job.get('page_count', '?')}; resume required."
+                            ),
+                            "color": "yellow",
+                        }
+                    elif index_result.ok:
+                        yield {"type": "status", "message": "Indexing complete.", "color": "green"}
+                    else:
+                        yield {"type": "status", "message": "Indexing did not complete.", "color": "yellow"}
     except Exception as e:
         if isinstance(e, OperationCancelled):
             raise

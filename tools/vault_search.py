@@ -12,6 +12,7 @@ from tools.vault_indexer import CHROMA_DIR, get_chroma_client, resolve_vault_ali
 
 DEFAULT_TOP_K = 6
 DEFAULT_MAX_CHARS = 7000
+DEFAULT_READ_CHARS = 2800
 
 
 def _json(data: dict) -> str:
@@ -216,6 +217,193 @@ def search_vault(
         raise
     except Exception as exc:
         return _json({"error": str(exc), "collection": collection_name, "persist_directory": CHROMA_DIR})
+
+
+def _source_matches(meta: dict, source: str | None) -> bool:
+    if not source:
+        return True
+    requested = str(source).strip().casefold()
+    if not requested:
+        return True
+    candidates = (
+        str(meta.get("source") or ""),
+        str(meta.get("source_path") or ""),
+        str(meta.get("filename") or ""),
+    )
+    if os.path.isabs(source):
+        return os.path.abspath(str(meta.get("source_path") or "")) == os.path.abspath(source)
+    return any(requested in candidate.casefold() for candidate in candidates)
+
+
+def ordered_vault_records(
+    collection_name: str,
+    source: str | None = None,
+    start_page: int | None = None,
+    end_page: int | None = None,
+    cancellation_token: CancellationToken | None = None,
+) -> list[dict]:
+    """Return lightweight collection records in deterministic source/page order."""
+    if cancellation_token:
+        cancellation_token.raise_if_cancelled()
+    client = get_chroma_client()
+    collection_obj = client.get_collection(name=resolve_vault_alias(collection_name))
+    raw = collection_obj.get(include=["metadatas"])
+    ids = raw.get("ids", [])
+    metadatas = raw.get("metadatas", [])
+    records = []
+    for item_id, metadata in zip(ids, metadatas):
+        meta = metadata or {}
+        if not _source_matches(meta, source):
+            continue
+        page = meta.get("page")
+        try:
+            page_number = int(page) if page is not None else None
+        except (TypeError, ValueError):
+            page_number = None
+        if start_page is not None and (page_number is None or page_number < start_page):
+            continue
+        if end_page is not None and (page_number is None or page_number > end_page):
+            continue
+        records.append({"id": item_id, "metadata": meta})
+
+    records.sort(key=lambda item: (
+        str(item["metadata"].get("source") or "").casefold(),
+        int(item["metadata"].get("page") or 0),
+        int(item["metadata"].get("chunk_index") or 0),
+        int(item["metadata"].get("char_start") or 0),
+        str(item["id"]),
+    ))
+    if cancellation_token:
+        cancellation_token.raise_if_cancelled()
+    return records
+
+
+def read_vault(
+    collection: str = "vault",
+    cursor: int | str = 0,
+    source: str | None = None,
+    start_page: int | str | None = None,
+    end_page: int | str | None = None,
+    max_chunks: int | str = 8,
+    max_chars: int | str = DEFAULT_READ_CHARS,
+    cancellation_token: CancellationToken | None = None,
+) -> str:
+    """Read every vault chunk through a stable cursor instead of similarity search."""
+    collection_name = resolve_vault_alias(collection)
+    raw_cursor = str(cursor or "0").strip()
+    try:
+        if ":" in raw_cursor:
+            record_raw, char_raw = raw_cursor.split(":", 1)
+            cursor_int = max(0, min(int(record_raw), 10_000_000))
+            cursor_char = max(0, min(int(char_raw), 10_000_000))
+        else:
+            cursor_int = max(0, min(int(raw_cursor), 10_000_000))
+            cursor_char = 0
+    except ValueError:
+        return _json({"error": "cursor must be an integer or '<chunk>:<character>'"})
+    max_chunks_int = _positive_int(max_chunks, 8, minimum=1, maximum=50)
+    # Keep the complete cursor envelope below the shared low-VRAM tool-output cap.
+    max_chars_int = _positive_int(max_chars, DEFAULT_READ_CHARS, minimum=500, maximum=3200)
+
+    def optional_page(value) -> int | None:
+        if value is None or str(value).strip() == "":
+            return None
+        return _positive_int(value, 1, minimum=1, maximum=1_000_000)
+
+    start_page_int = optional_page(start_page)
+    end_page_int = optional_page(end_page)
+    if start_page_int and end_page_int and start_page_int > end_page_int:
+        start_page_int, end_page_int = end_page_int, start_page_int
+
+    try:
+        records = ordered_vault_records(
+            collection_name,
+            source=source,
+            start_page=start_page_int,
+            end_page=end_page_int,
+            cancellation_token=cancellation_token,
+        )
+        selected = records[cursor_int:cursor_int + max_chunks_int]
+        if not selected:
+            return _json({
+                "collection": collection_name,
+                "cursor": raw_cursor,
+                "next_cursor": None,
+                "total_chunks": len(records),
+                "returned_chunks": 0,
+                "complete": True,
+                "content": "",
+            })
+
+        client = get_chroma_client()
+        collection_obj = client.get_collection(name=collection_name)
+        raw = collection_obj.get(
+            ids=[item["id"] for item in selected],
+            include=["documents", "metadatas"],
+        )
+        by_id = {
+            item_id: (document, metadata or {})
+            for item_id, document, metadata in zip(
+                raw.get("ids", []), raw.get("documents", []), raw.get("metadatas", [])
+            )
+        }
+        parts = []
+        used = 0
+        consumed = 0
+        next_cursor: int | str | None = cursor_int
+        for selected_index, item in enumerate(selected):
+            if cancellation_token:
+                cancellation_token.raise_if_cancelled()
+            document, meta = by_id.get(item["id"], ("", item["metadata"]))
+            document = str(document or "")
+            offset = cursor_char if selected_index == 0 else 0
+            if offset >= len(document):
+                consumed += 1
+                next_cursor = cursor_int + consumed
+                continue
+            header = (
+                f"[source={meta.get('source', 'unknown')}"
+                f" page={meta.get('page', '?')}"
+                f" chunk={meta.get('chunk_index', '?')}"
+                f" kind={meta.get('content_kind', 'text')}]"
+            )
+            remaining = max_chars_int - used
+            text_budget = remaining - len(header) - 1
+            if text_budget <= 0:
+                break
+            text_slice = document[offset:offset + text_budget]
+            block = f"{header}\n{text_slice}"
+            if not block:
+                break
+            parts.append(block)
+            used += len(block) + 2
+            if offset + len(text_slice) < len(document):
+                next_cursor = f"{cursor_int + selected_index}:{offset + len(text_slice)}"
+                break
+            consumed += 1
+            next_cursor = cursor_int + selected_index + 1
+
+        complete = isinstance(next_cursor, int) and next_cursor >= len(records)
+        return _json({
+            "collection": collection_name,
+            "cursor": raw_cursor,
+            "next_cursor": None if complete else next_cursor,
+            "total_chunks": len(records),
+            "returned_chunks": consumed,
+            "complete": complete,
+            "source": source,
+            "start_page": start_page_int,
+            "end_page": end_page_int,
+            "content": "\n\n".join(parts),
+            "guidance": (
+                "If complete is false, call vault_read again with next_cursor. "
+                "Keep the same collection/source/page filters to walk the vault without gaps."
+            ),
+        })
+    except OperationCancelled:
+        raise
+    except Exception as exc:
+        return _json({"error": str(exc), "collection": collection_name})
 
 
 def format_for_gemma(results: Dict[str, Any] | str, token_limit: int = 2048) -> str:

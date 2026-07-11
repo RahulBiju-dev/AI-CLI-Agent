@@ -28,6 +28,8 @@ class VaultSlashCommandTests(unittest.TestCase):
         text = execute_command_web("/vault help", self.session, self.history)
         self.assertIn("/vault list", text)
         self.assertIn("/vault search", text)
+        self.assertIn("/vault status", text)
+        self.assertIn("/vault read", text)
 
     def test_vault_list_uses_registered_tool(self):
         with patch("agent.web.execute_tool_call") as mock_execute:
@@ -94,6 +96,65 @@ class VaultSlashCommandTests(unittest.TestCase):
                 text = execute_command_web("/vault aliases", self.session, self.history)
         self.assertIn("Notes", text)
         self.assertIn("notes", text)
+
+    def test_vault_read_passes_cursor_to_ordered_reader(self):
+        with patch("agent.web.execute_tool_call") as mock_execute:
+            mock_execute.return_value = _ok_result(
+                "vault_read",
+                {"content": "page text", "next_cursor": "2:100", "complete": False},
+            )
+            with patch("agent.web.normalize_tool_calls", side_effect=normalize_tool_calls):
+                text = execute_command_web(
+                    "/vault read --cursor 1:20 --collection lecture",
+                    self.session,
+                    self.history,
+                )
+        self.assertIn("page text", text)
+        self.assertIn("2:100", text)
+        spec = mock_execute.call_args[0][0]
+        self.assertEqual(spec.name, "vault_read")
+        self.assertEqual(spec.arguments["cursor"], "1:20")
+
+    def test_vault_status_uses_checkpoint_action(self):
+        with patch("agent.web.execute_tool_call") as mock_execute:
+            mock_execute.return_value = _ok_result(
+                "index_vault",
+                {"jobs": [{"source": "slides.pdf", "indexed_pages": 20, "page_count": 900, "next_page": 21}]},
+            )
+            with patch("agent.web.normalize_tool_calls", side_effect=normalize_tool_calls):
+                text = execute_command_web(
+                    "/vault status /tmp/slides.pdf --collection lecture",
+                    self.session,
+                    self.history,
+                )
+        self.assertIn("20/900", text)
+        spec = mock_execute.call_args[0][0]
+        self.assertEqual(spec.name, "index_vault")
+        self.assertEqual(spec.arguments["action"], "status")
+
+    def test_vault_add_forwards_visual_batch_options_without_forcing_generic_collection(self):
+        with (
+            patch("agent.web.execute_tool_call") as mock_execute,
+            patch("agent.web.normalize_tool_calls", side_effect=normalize_tool_calls),
+            patch("agent.web.os.path.exists", return_value=True),
+            patch("agent.web.os.path.isfile", return_value=True),
+        ):
+            mock_execute.return_value = _ok_result(
+                "index_vault",
+                {"collection": "slides", "indexed_chunks": 20, "incomplete_pdf_count": 1,
+                 "pdf_jobs": [{"source": "slides.pdf", "indexed_pages": 5, "page_count": 900,
+                                "vision_pages": 5, "next_page": 6}]},
+            )
+            text = execute_command_web(
+                "/vault add /tmp/slides.pdf --vision all --max-pages 5",
+                self.session,
+                self.history,
+            )
+        self.assertIn("checkpoint", text)
+        spec = mock_execute.call_args[0][0]
+        self.assertEqual(spec.arguments["vision_mode"], "all")
+        self.assertEqual(spec.arguments["max_pages"], 5)
+        self.assertNotIn("collection", spec.arguments)
 
 
 if __name__ == "__main__":

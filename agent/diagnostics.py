@@ -238,6 +238,7 @@ def _check_optional_dependencies() -> dict[str, Any]:
         "python-docx": "docx",
         "openpyxl": "openpyxl",
         "pdf2image": "pdf2image",
+        "reportlab": "reportlab",
         "cryptography": "cryptography",
         "google-api-python-client": "googleapiclient",
         "keyring": "keyring",

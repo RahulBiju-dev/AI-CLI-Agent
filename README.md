@@ -111,22 +111,23 @@ To avoid CPU overhead from re-rendering the entire Markdown buffer on every toke
 The vault system implements a local RAG pipeline for long-term document memory:
 
 ```
-Documents ──→ Chunk ──→ Embed ──→ ChromaDB
-                                      │
-                          Query ──→ Embed ──→ Vector Search ──→ Top-K Chunks ──→ LLM Context
+Documents ──→ Page/Text/Vision ──→ Chunk ──→ Embed ──→ ChromaDB
+                                                     │
+                    Focused query ──→ Vector Search ──┤
+                    Complete read  ──→ Ordered Cursor ┴──→ Notes / PDF
 ```
 
 **How RAG works:**
 
-1. **Chunking:** Documents (PDF, DOCX, Markdown, reStructuredText, plain text) are split into overlapping segments of ~1800 characters. The splitter prefers natural boundaries (paragraphs, sentences) over hard character cuts, producing more coherent retrieval snippets.
+1. **Extraction and chunking:** Documents (PDF, DOCX, Markdown, reStructuredText, plain text) are split into overlapping segments of ~1800 characters. PDFs are processed page by page. Extracted text and optional Moondream visual analysis retain page, content-kind, chunk, and character-offset metadata.
 
 2. **Embedding:** Each chunk is converted into a dense vector (a list of floating-point numbers) using an embedding model (`embeddinggemma` by default, running locally via Ollama). This vector captures the *semantic meaning* of the text — chunks about similar topics will have vectors that are close together in the embedding space, regardless of exact wording.
 
-3. **Storage:** Vectors and their source metadata (file path, chunk index, character offsets) are stored in [ChromaDB](https://www.trychroma.com/). Runtime data lives under `~/.selene-agent/` by default (`.chroma/` for vectors and `vaults/` for files); set `SELENE_DATA_DIR` to relocate both.
+3. **Storage and checkpoints:** Vectors and source metadata are stored in [ChromaDB](https://www.trychroma.com/). Large-PDF progress is atomically checkpointed after every committed page under `vaults/.index_jobs/`. Repeating `index_vault` resumes at `next_page`; changed files get a new fingerprint, and stale chunks are removed only after the replacement generation completes.
 
-4. **Retrieval:** When the agent (or user via `/vault search`) queries the vault, the query text is embedded with the same model, and ChromaDB performs an **approximate nearest neighbour (ANN) search** to find the top-K most semantically similar chunks.
+4. **Retrieval:** `vault_search` performs approximate nearest-neighbour retrieval for focused questions. `vault_read` instead walks every matching source/page/chunk through a stable `next_cursor`; oversized chunks use a character sub-cursor so exhaustive reads do not skip text.
 
-5. **Augmentation:** Retrieved chunks are injected into the model's context window alongside the user's question, giving the model grounded, relevant information to draw from.
+5. **Long-form output:** `export_vault_pdf` creates a complete source-preserving reference PDF. `build_vault_notes_pdf` maps bounded ordered excerpts into grounded note sections, saves each section durably under `vaults/.pdf_jobs/`, and automatically assembles the final PDF after the last cursor. `create_pdf` handles ordinary Markdown-like content or a UTF-8 content file.
 
 **Why local RAG?** Unlike cloud RAG services, everything runs on your machine. Your documents never leave your filesystem. The embedding model and vector database are both local — no API keys, no data exfiltration risks.
 
@@ -199,6 +200,9 @@ The agent autonomously decides when to call tools based on the user's query:
 | 👁️ **Vision Describer** | Describes images, diagrams, and slides using the local `moondream` vision model |
 | 🗄️ **Vault Index** | Chunk and embed local files into ChromaDB for semantic search; auto-registers aliases |
 | 🔎 **Vault Search** | Query the vault using vector similarity; resolves friendly aliases automatically |
+| 📚 **Vault Read** | Traverse every indexed chunk in deterministic source/page order with a lossless resume cursor |
+| 🧾 **PDF Creator** | Atomically render styled, paginated PDFs from Markdown-like content without silent overwrite |
+| 📑 **Vault PDF Export** | Export an entire vault as a source-preserving reference PDF, or build resumable model-refined lecture notes |
 | 🗑️ **Vault Delete** | Remove indexed entries by source path or delete entire collections |
 | 🏷️ **Vault Aliases** | List registered human-friendly names that map to vault collections |
 | 📓 **Obsidian Notes** | Create structured Obsidian-optimised notes with YAML frontmatter, WikiLinks, and version control |
@@ -214,7 +218,7 @@ The agent autonomously decides when to call tools based on the user's query:
 | 📅 **Google Calendar** | List calendars and upcoming events, search a time range, and create or edit events; deletion requires explicit confirmation |
 | ✅ **Google Tasks** | List task lists and tasks, create tasks with notes or due dates, and update status or details; deletion requires explicit confirmation |
 
-Legacy tools have also been hardened for current workloads: web results retain source URLs, code scans skip dependency/cache trees and cap traversal, binary documents route through the document reader, PDF vision runs one page at a time, embedding vectors are shape/number validated, and failed re-indexing preserves the previous good vault records. Set `include_vision=false` on `index_vault` for substantially faster text-only PDF indexing.
+Large PDF indexing is deliberately resumable rather than one enormous tool call. The conservative default processes up to 20 pages per call so full Moondream runs stay within the bounded tool timeout on slower local GPUs. `vision_mode=auto` uses Moondream on image-bearing or low-text pages, `vision_mode=all` analyzes every page, and `vision_mode=off` is text-only. Call the tool again with the same file/collection and `resume_page=next_page` until `complete=true`, or use `action=status` to inspect the durable checkpoint. This is suitable for 900–1,200-page slide collections without retaining rendered page batches or the whole extracted document in RAM.
 
 ### Spreadsheet Tool
 
@@ -430,8 +434,8 @@ Critical JSON (sessions, aliases, routines metadata, and similar) is written wit
 
 - **Fedora:** Spotify uses MPRIS over DBus (`dbus-python` is Linux-only in `requirements.txt`).
 - **Windows:** Spotify uses a URI launch backend and never claims confirmed playback.
-- **PDF text** works with `pypdf` alone. **PDF-to-image** needs Poppler (`poppler-utils` on Fedora; set `POPPLER_PATH` / `SELENE_POPPLER_PATH` on Windows if needed).
-- Optional packages (Google APIs, Chroma, vision/PDF image tooling, `dbus-python`) fail with capability errors for those features only — they must not block core import or startup.
+- **PDF text** works with `pypdf` alone. **PDF-to-image** needs Poppler (`poppler-utils` on Fedora; set `POPPLER_PATH` / `SELENE_POPPLER_PATH` on Windows if needed). **PDF creation** uses `reportlab` from `requirements.txt`.
+- Optional packages (Google APIs, Chroma, vision/PDF image tooling, PDF writing, `dbus-python`) fail with capability errors for those features only — they must not block core import or startup.
 
 ---
 
@@ -643,15 +647,18 @@ The vault provides persistent semantic search over your local documents:
 | `/vault alias <name> <coll>` | `register` | Register a friendly alias for a collection |
 | `/vault rename <old> <new>` | `mv` | Rename a vault collection |
 | `/vault add <path>` | `index` | Index a file or folder into the vault |
+| `/vault status <path>` | | Show the durable large-PDF page checkpoint |
+| `/vault read --cursor <n>` | | Read the vault exhaustively; repeat with the returned cursor |
 | `/vault search <query>` | `find` | Search indexed content for relevant chunks |
 | `/vault delete <source>` | `remove`, `rm` | Remove indexed entries by source path |
 | `/vault help` | `-h`, `--help` | Show vault command help |
 | `/vault add <path> --collection notes` | | Index into a named collection |
+| `/vault add <path> --vision all --max-pages 25` | | Analyze every PDF page with Moondream in 25-page resumable runs |
 | `/vault search <query> --top-k 10` | | Return more results |
 | `/vault search <query> --source file.md` | | Restrict search to a specific source |
 | `/vault delete --all` | | Delete an entire collection |
 
-**Auto-indexing:** When you paste a file path as input and the file is large (>200KB) or binary (PDF/DOCX), the agent automatically indexes it into its own vault collection before processing. The collection name is derived from the filename (e.g., `DAA_Notes.pdf` → collection `DAA_Notes`).
+**Auto-indexing:** When you paste a file path as input and the file is large (>200KB) or binary (PDF/DOCX), the agent indexes it into its own vault collection before processing. The collection name is derived from the filename (e.g., `DAA_Notes.pdf` → collection `DAA_Notes`). Large PDFs return a truthful page checkpoint rather than claiming the entire document finished in one call.
 
 **Auto-naming:** When no collection name is specified, the vault automatically derives one from the filename or folder name instead of dumping everything into a generic bucket. This means each document gets its own isolated, searchable collection:
 
@@ -666,7 +673,9 @@ The vault provides persistent semantic search over your local documents:
 
 **Vault Aliases:** Vaults are automatically given friendly aliases derived from the filename. When searching, you can use the original name (e.g., `"physics_notes"`) instead of remembering the sanitized ChromaDB collection name. Aliases are atomically stored in `~/.selene-agent/vaults/.vault_aliases.json`; substring resolution is used only when it identifies one unique collection.
 
-**Multimodal Support:** For PDFs, the agent uses `moondream` via Ollama to generate visual descriptions of diagrams and slides. This is integrated directly into the vault indexing pipeline. Ensure you have run `ollama pull moondream` and installed `poppler-utils`.
+**Multimodal Support:** For PDFs, the agent combines `pypdf` text with local Moondream descriptions of visible text, equations, labels, tables, chart values, diagrams, and relationships. `auto` is the efficient default; choose `all` when every page must be sent through Moondream. Ensure you have run `ollama pull moondream` and installed Poppler.
+
+**Complete notes workflow:** Finish the resumable index first. Use `vault_search` for focused questions, `vault_read` with `next_cursor` for exhaustive logs, `export_vault_pdf` for a lossless reference export, or `build_vault_notes_pdf` for refined notes. The refined workflow returns a new cursor until every ordered excerpt has a durable note section; it never treats one top-K search as the whole lecture deck.
 
 ### Runtime Configuration
 

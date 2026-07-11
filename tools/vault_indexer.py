@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
 import tempfile
 import threading
+from pathlib import Path
 from typing import Optional
 
 import chromadb
@@ -29,10 +31,13 @@ SUPPORTED_INDEX_EXTENSIONS = {
 DEFAULT_CHUNK_SIZE = 1800
 DEFAULT_CHUNK_OVERLAP = 250
 DEFAULT_BATCH_SIZE = 16
+DEFAULT_PDF_PAGES_PER_RUN = 20
+PDF_VISION_TEXT_THRESHOLD = 500
 DATA_DIR = str(get_runtime_paths().data_dir)
 CHROMA_DIR = os.path.join(DATA_DIR, ".chroma")
 VAULTS_DIR = os.path.join(DATA_DIR, "vaults")
 _ALIAS_LOCK = threading.RLock()
+_INDEX_JOB_LOCK = threading.RLock()
 
 
 def _json(data: dict) -> str:
@@ -239,6 +244,322 @@ def _iter_indexable_files(vault_path: str):
                 yield os.path.join(root, fname)
 
 
+def _pdf_fingerprint(path: str) -> str:
+    stat = os.stat(path)
+    payload = f"{os.path.abspath(path)}:{stat.st_size}:{stat.st_mtime_ns}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:20]
+
+
+def _index_job_path(collection_name: str, path: str) -> Path:
+    key = hashlib.sha256(
+        f"{collection_name}:{os.path.abspath(path)}".encode("utf-8")
+    ).hexdigest()[:24]
+    return Path(VAULTS_DIR) / ".index_jobs" / f"{key}.json"
+
+
+def _load_index_job(collection_name: str, path: str) -> dict:
+    job_path = _index_job_path(collection_name, path)
+    try:
+        return read_json_preserved(job_path, expected_type=dict)
+    except FileNotFoundError:
+        return {}
+
+
+def _save_index_job(collection_name: str, path: str, state: dict) -> None:
+    job_path = _index_job_path(collection_name, path)
+    job_path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(job_path, state)
+
+
+def _page_has_images(page) -> bool:
+    """Inspect PDF resources without decoding embedded image streams."""
+    try:
+        resources = page.get("/Resources") or {}
+        resources = resources.get_object() if hasattr(resources, "get_object") else resources
+        xobjects = resources.get("/XObject") or {}
+        xobjects = xobjects.get_object() if hasattr(xobjects, "get_object") else xobjects
+        for value in xobjects.values():
+            item = value.get_object() if hasattr(value, "get_object") else value
+            if item.get("/Subtype") == "/Image":
+                return True
+    except Exception:
+        return False
+    return False
+
+
+def _describe_pdf_page(
+    path: str,
+    page_number: int,
+    image_dir: str,
+    cancellation_token: CancellationToken | None,
+) -> str:
+    try:
+        from pdf2image import convert_from_path
+        from tools.vision_describer import describe_image
+    except ImportError as exc:
+        raise RuntimeError(
+            "PDF visual indexing requires pdf2image and Poppler; text indexing remains available"
+        ) from exc
+
+    conversion_options = {
+        "first_page": page_number,
+        "last_page": page_number,
+        "dpi": 120,
+        "fmt": "jpeg",
+        "output_folder": image_dir,
+        "paths_only": True,
+        "thread_count": 1,
+        "jpegopt": {"quality": 82, "optimize": True},
+    }
+    poppler_path = os.environ.get("SELENE_POPPLER_PATH") or os.environ.get("POPPLER_PATH")
+    if poppler_path:
+        conversion_options["poppler_path"] = poppler_path
+    image_paths = convert_from_path(path, **conversion_options)
+    if not image_paths:
+        return ""
+    description = describe_image(
+        str(image_paths[0]),
+        prompt=(
+            "Capture this lecture slide completely for a searchable knowledge vault. "
+            "Transcribe visible text, equations, labels, tables, chart values, diagram relationships, "
+            "and any information conveyed visually. Be factual and dense; do not add outside knowledge."
+        ),
+        cancellation_token=cancellation_token,
+    )
+    if description.startswith("Error"):
+        raise RuntimeError(description)
+    return description.strip()
+
+
+def _index_pdf_incremental(
+    *,
+    path: str,
+    rel: str,
+    collection_name: str,
+    collection_obj,
+    chunk_size: int,
+    chunk_overlap: int,
+    model: str,
+    vision_mode: str,
+    max_pages: int,
+    resume_page: int | None,
+    cancellation_token: CancellationToken | None,
+) -> dict:
+    """Index a bounded PDF page range and checkpoint after every committed page."""
+    try:
+        import pypdf
+    except ImportError as exc:
+        raise RuntimeError("Missing required dependency: pypdf") from exc
+
+    fingerprint = _pdf_fingerprint(path)
+    with _INDEX_JOB_LOCK:
+        state = _load_index_job(collection_name, path)
+    if state.get("fingerprint") != fingerprint:
+        state = {
+            "version": 1,
+            "collection": collection_name,
+            "source": rel,
+            "source_path": os.path.abspath(path),
+            "fingerprint": fingerprint,
+            "next_page": 1,
+            "indexed_pages": 0,
+            "indexed_chunks": 0,
+            "vision_pages": 0,
+            "page_chunk_counts": {},
+            "vision_completed_pages": [],
+            "vision_failed_pages": [],
+            "warning_count": 0,
+            "warnings": [],
+            "complete": False,
+        }
+
+    with open(path, "rb") as stream:
+        reader = pypdf.PdfReader(stream)
+        if reader.is_encrypted:
+            try:
+                if not reader.decrypt(""):
+                    raise ValueError("password required")
+            except Exception as exc:
+                raise ValueError("PDF is encrypted and cannot be indexed without a password") from exc
+        total_pages = len(reader.pages)
+        next_page = max(1, min(int(state.get("next_page", 1)), total_pages + 1))
+        if resume_page is not None and int(resume_page) != next_page:
+            raise ValueError(
+                f"resume_page {resume_page} does not match durable checkpoint next_page {next_page}"
+            )
+        stop_page = min(total_pages, next_page + max_pages - 1)
+        generation_prefix = f"{rel}::pdf::{fingerprint}::"
+        failed_at_start = {
+            int(value) for value in state.get("vision_failed_pages", [])
+        }
+        retrying_vision = bool(failed_at_start) and int(state.get("indexed_pages", 0)) >= total_pages
+        if retrying_vision and vision_mode == "off":
+            state["complete"] = True
+            state["next_page"] = total_pages + 1
+            with _INDEX_JOB_LOCK:
+                _save_index_job(collection_name, path, state)
+            stop_page = total_pages
+            next_page = total_pages + 1
+
+        with tempfile.TemporaryDirectory(prefix="selene-pdf-page-") as image_dir:
+            for page_number in range(next_page, stop_page + 1):
+                if cancellation_token:
+                    cancellation_token.raise_if_cancelled()
+                if retrying_vision and page_number not in failed_at_start:
+                    state["next_page"] = page_number + 1
+                    reached_end = page_number >= total_pages
+                    if reached_end and state.get("vision_failed_pages"):
+                        state["complete"] = False
+                        state["next_page"] = min(
+                            int(value) for value in state["vision_failed_pages"]
+                        )
+                    elif reached_end:
+                        state["complete"] = True
+                    with _INDEX_JOB_LOCK:
+                        _save_index_job(collection_name, path, state)
+                    continue
+                page = reader.pages[page_number - 1]
+                warnings = state.setdefault("warnings", [])
+                try:
+                    page_text = (page.extract_text() or "").strip()
+                except Exception as exc:
+                    page_text = ""
+                    warnings.append(f"Page {page_number} text extraction failed: {exc}")
+
+                should_describe = vision_mode == "all" or (
+                    vision_mode == "auto"
+                    and (len(page_text) < PDF_VISION_TEXT_THRESHOLD or _page_has_images(page))
+                )
+                visual_text = ""
+                if should_describe:
+                    try:
+                        visual_text = _describe_pdf_page(
+                            path, page_number, image_dir, cancellation_token
+                        )
+                        if visual_text:
+                            completed_vision = {
+                                int(value) for value in state.get("vision_completed_pages", [])
+                            }
+                            completed_vision.add(page_number)
+                            state["vision_completed_pages"] = sorted(completed_vision)
+                            state["vision_pages"] = len(completed_vision)
+                            state["vision_failed_pages"] = [
+                                value for value in state.get("vision_failed_pages", [])
+                                if int(value) != page_number
+                            ]
+                    except OperationCancelled:
+                        raise
+                    except Exception as exc:
+                        warnings.append(f"Page {page_number} visual extraction failed: {exc}")
+                        failed_pages = {
+                            int(value) for value in state.get("vision_failed_pages", [])
+                        }
+                        failed_pages.add(page_number)
+                        state["vision_failed_pages"] = sorted(failed_pages)
+
+                parts = []
+                if page_text:
+                    parts.append(f"[Page {page_number} extracted text]\n{page_text}")
+                if visual_text:
+                    parts.append(f"[Page {page_number} visual analysis]\n{visual_text}")
+                page_content = "\n\n".join(parts)
+                chunks = chunk_text_with_offsets(
+                    page_content,
+                    chunk_size=chunk_size,
+                    chunk_overlap=chunk_overlap,
+                ) if page_content else []
+
+                if chunks:
+                    documents = [chunk["text"] for chunk in chunks]
+                    embeddings = embed_texts(
+                        documents,
+                        model=model,
+                        cancellation_token=cancellation_token,
+                    )
+                    ids = [
+                        f"{generation_prefix}page::{page_number}::chunk::{chunk['index']}"
+                        for chunk in chunks
+                    ]
+                    metadatas = [
+                        {
+                            "source": rel,
+                            "source_path": os.path.abspath(path),
+                            "filename": os.path.basename(path),
+                            "extension": ".pdf",
+                            "document_type": "pdf",
+                            "page": page_number,
+                            "page_count": total_pages,
+                            "chunk_index": chunk["index"],
+                            "char_start": chunk["char_start"],
+                            "char_end": chunk["char_end"],
+                            "content_kind": (
+                                "text+vision" if page_text and visual_text
+                                else "vision" if visual_text else "text"
+                            ),
+                            "index_generation": fingerprint,
+                        }
+                        for chunk in chunks
+                    ]
+                    collection_obj.upsert(
+                        ids=ids,
+                        documents=documents,
+                        embeddings=embeddings,
+                        metadatas=metadatas,
+                    )
+                page_chunk_counts = dict(state.get("page_chunk_counts", {}))
+                page_chunk_counts[str(page_number)] = len(chunks)
+                state["page_chunk_counts"] = page_chunk_counts
+                state["indexed_chunks"] = sum(int(value) for value in page_chunk_counts.values())
+
+                state["indexed_pages"] = max(int(state.get("indexed_pages", 0)), page_number)
+                state["next_page"] = page_number + 1
+                state["page_count"] = total_pages
+                state["warning_count"] = len(warnings)
+                state["warnings"] = warnings[-50:]
+                reached_end = page_number >= total_pages
+                failed_vision_pages = state.get("vision_failed_pages", [])
+                if reached_end and vision_mode != "off" and failed_vision_pages:
+                    state["complete"] = False
+                    state["next_page"] = min(int(value) for value in failed_vision_pages)
+                else:
+                    state["complete"] = reached_end
+                with _INDEX_JOB_LOCK:
+                    _save_index_job(collection_name, path, state)
+
+    if state.get("complete"):
+        try:
+            existing = collection_obj.get(where={"source": rel}, include=["metadatas"])
+            stale_ids = [
+                item_id for item_id in existing.get("ids", [])
+                if not str(item_id).startswith(generation_prefix)
+            ]
+            if stale_ids:
+                collection_obj.delete(ids=stale_ids)
+        except Exception as exc:
+            state.setdefault("warnings", []).append(
+                f"New index completed but stale-generation cleanup failed: {exc}"
+            )
+            state["warning_count"] = len(state["warnings"])
+            with _INDEX_JOB_LOCK:
+                _save_index_job(collection_name, path, state)
+
+    return {
+        "source": rel,
+        "page_count": int(state.get("page_count", 0)),
+        "indexed_pages": int(state.get("indexed_pages", 0)),
+        "indexed_chunks": int(state.get("indexed_chunks", 0)),
+        "vision_pages": int(state.get("vision_pages", 0)),
+        "vision_failed_pages": list(state.get("vision_failed_pages", [])),
+        "vision_complete": not bool(state.get("vision_failed_pages", [])),
+        "next_page": None if state.get("complete") else int(state.get("next_page", 1)),
+        "complete": bool(state.get("complete")),
+        "warning_count": int(state.get("warning_count", 0)),
+        "warnings": list(state.get("warnings", []))[-20:],
+        "checkpoint": str(_index_job_path(collection_name, path)),
+        "fingerprint": fingerprint,
+    }
+
+
 def index_vault(
     vault_path: Optional[str] = None,
     collection_name: str = "vault",
@@ -249,6 +570,10 @@ def index_vault(
     file_path: Optional[str] = None,
     collection: Optional[str] = None,
     include_vision: bool = True,
+    vision_mode: str | None = None,
+    max_pages: int = DEFAULT_PDF_PAGES_PER_RUN,
+    resume_page: int | None = None,
+    action: str = "index",
     cancellation_token: CancellationToken | None = None,
 ):
     """
@@ -268,8 +593,14 @@ def index_vault(
         batch_size (int): Number of chunks to process in a single batch.
         file_path (str | None): A single explicit file path to index.
         collection (str | None): An alias for collection_name.
-        include_vision (bool): For PDFs, include local moondream page descriptions.
-            Disable for substantially faster text-only indexing.
+        include_vision (bool): Backward-compatible visual indexing toggle.
+        vision_mode (str | None): ``off``, ``auto``, or ``all``. Auto uses
+            Moondream for low-text or image-bearing pages; all analyzes every page.
+        max_pages (int): PDF pages processed per invocation (default 20). Progress
+            is checkpointed after every page, so repeated calls resume safely.
+        resume_page (int | None): Optional optimistic checkpoint token. Pass the
+            prior result's next_page so recursive calls remain distinct and safe.
+        action (str): ``index`` (default) or ``status`` for checkpoint inspection.
 
     Returns:
         str: A JSON-encoded string containing status metrics (e.g., number of indexed
@@ -285,6 +616,22 @@ def index_vault(
             collection_name = os.path.basename(os.path.abspath(vault_path))
 
     collection_name = sanitize_collection_name(collection_name)
+    action = str(action or "index").strip().lower()
+    if action not in {"index", "status"}:
+        return _json({"error": "action must be 'index' or 'status'"})
+    if vision_mode is None:
+        vision_mode = "auto" if include_vision else "off"
+    vision_mode = str(vision_mode).strip().lower()
+    if vision_mode not in {"off", "auto", "all"}:
+        return _json({"error": "vision_mode must be off, auto, or all"})
+    max_pages = _positive_int(
+        max_pages,
+        DEFAULT_PDF_PAGES_PER_RUN,
+        minimum=1,
+        maximum=500,
+    )
+    if resume_page is not None:
+        resume_page = _positive_int(resume_page, 1, minimum=1, maximum=1_000_000)
 
     if not vault_path:
         vault_path = os.path.dirname(file_path) if file_path else VAULTS_DIR
@@ -299,6 +646,28 @@ def index_vault(
             return _json({"error": f"vault_path must be a folder when file_path is not provided: {vault_path}"})
         candidates = list(_iter_indexable_files(vault_path))
 
+    if action == "status":
+        jobs = []
+        for path in candidates:
+            if os.path.splitext(path)[1].lower() != ".pdf":
+                continue
+            try:
+                state = _load_index_job(collection_name, path)
+            except PersistenceError as exc:
+                jobs.append({"source_path": path, "error": str(exc), "preserved": True})
+                continue
+            jobs.append({
+                "source_path": path,
+                "checkpoint": str(_index_job_path(collection_name, path)),
+                **state,
+            })
+        return _json({
+            "collection": collection_name,
+            "action": "status",
+            "jobs": jobs,
+            "job_count": len(jobs),
+        })
+
     batch_size = _positive_int(batch_size, DEFAULT_BATCH_SIZE, minimum=1, maximum=128)
     chunk_size = _positive_int(chunk_size, DEFAULT_CHUNK_SIZE, minimum=500, maximum=20000)
     chunk_overlap = _positive_int(chunk_overlap, DEFAULT_CHUNK_OVERLAP, minimum=0, maximum=max(0, chunk_size // 2))
@@ -312,6 +681,7 @@ def index_vault(
     indexed_chunks = 0
     indexed_files = 0
     skipped_files: list[dict] = []
+    pdf_jobs: list[dict] = []
 
     for path in candidates:
         if cancellation_token:
@@ -325,6 +695,35 @@ def index_vault(
         ext = os.path.splitext(path)[1].lower()
         if ext not in SUPPORTED_INDEX_EXTENSIONS:
             skipped_files.append({"file": path, "error": f"unsupported extension: {ext}"})
+            continue
+
+        rel = os.path.relpath(path, vault_path) if os.path.isdir(vault_path) else os.path.basename(path)
+        if ext == ".pdf":
+            try:
+                job = _index_pdf_incremental(
+                    path=path,
+                    rel=rel,
+                    collection_name=collection_name,
+                    collection_obj=collection_obj,
+                    chunk_size=chunk_size,
+                    chunk_overlap=chunk_overlap,
+                    model=model,
+                    vision_mode=vision_mode,
+                    max_pages=max_pages,
+                    resume_page=resume_page,
+                    cancellation_token=cancellation_token,
+                )
+                pdf_jobs.append(job)
+                indexed_chunks += int(job.get("indexed_chunks", 0))
+                if job.get("complete"):
+                    indexed_files += 1
+            except OperationCancelled:
+                raise
+            except Exception as exc:
+                skipped_files.append({
+                    "file": path,
+                    "error": f"incremental PDF indexing failed; checkpoint and previous index preserved: {exc}",
+                })
             continue
 
         try:
@@ -347,7 +746,6 @@ def index_vault(
             skipped_files.append({"file": path, "error": "no extractable text"})
             continue
 
-        rel = os.path.relpath(path, vault_path) if os.path.isdir(vault_path) else os.path.basename(path)
         file_ids: list[str] = []
         file_docs: list[str] = []
         file_metadatas: list[dict] = []
@@ -414,7 +812,8 @@ def index_vault(
         indexed_chunks += len(file_docs)
 
     # Auto-register an alias when a single file was indexed
-    if file_path and indexed_files == 1:
+    has_pdf_chunks = any(int(job.get("indexed_chunks", 0)) > 0 for job in pdf_jobs)
+    if file_path and (indexed_files == 1 or has_pdf_chunks):
         stem = os.path.splitext(os.path.basename(file_path))[0]
         register_vault_alias(
             alias=stem,
@@ -432,8 +831,15 @@ def index_vault(
         "chunk_size": chunk_size,
         "chunk_overlap": chunk_overlap,
         "include_vision": bool(include_vision),
-        "alias": os.path.splitext(os.path.basename(file_path))[0] if file_path and indexed_files == 1 else None,
-        "guidance": "Use vault_search with a focused query to retrieve relevant chunks from large indexed files.",
+        "vision_mode": vision_mode,
+        "max_pages_per_run": max_pages,
+        "pdf_jobs": pdf_jobs,
+        "incomplete_pdf_count": sum(not job.get("complete", False) for job in pdf_jobs),
+        "alias": os.path.splitext(os.path.basename(file_path))[0] if file_path and (indexed_files == 1 or has_pdf_chunks) else None,
+        "guidance": (
+            "Call index_vault again with the same file and collection plus resume_page=next_page to resume incomplete PDF jobs. "
+            "Use action=status to inspect progress, vault_search for semantic lookup, and vault_read for exhaustive ordered retrieval."
+        ),
     })
 
 

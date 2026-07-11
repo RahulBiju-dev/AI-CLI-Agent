@@ -15,6 +15,8 @@ ollama>=0.4.0
 pdf2image
 pypdf>=5.1.0
 python-docx>=1.2.0
+# Styled, paginated PDF note/reference generation (optional tool capability).
+reportlab>=4.0.0
 # Excel spreadsheet reading and writing (.xlsx and legacy .xls)
 openpyxl>=3.1.0
 xlrd>=2.0.1
