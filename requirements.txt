@@ -34,5 +34,10 @@ rich>=13.0.0
 # Full-screen CLI TUI (Claude Code / Grok Build style). Optional at import
 # time — classic scrollback mode works without it; --cli prefers Textual.
 textual>=1.0.0
+# Optional CLI voice input (/speech, Ctrl+S). Mirrors the Web UI mic stack
+# (Google web speech via SpeechRecognition). Missing packages only disable
+# voice — core chat still starts. PyAudio needs a system PortAudio install.
+# SpeechRecognition>=3.10.0
+# PyAudio>=0.2.13
 # HTML parsing for web_scrape (optional; tool reports a capability error if absent)
 beautifulsoup4>=4.12.0

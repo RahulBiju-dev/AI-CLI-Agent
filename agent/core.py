@@ -1512,6 +1512,9 @@ def _build_cli_slash_specs() -> tuple[tuple[str, str], ...]:
         ("/help", "Commands and usage"),
         ("/?", "Commands and usage"),
         ("/clear", "Reset conversation + system override"),
+        ("/speech", "Open speech menu  ·  /speech [start|stop]  ·  Ctrl+S in TUI"),
+        ("/speech start", "Open speech menu and start listening"),
+        ("/speech stop", "Stop listening (menu stays open)"),
         ("/save", "Save session  ·  /save [name]"),
         ("/load", "Load session  ·  /load [name|index]"),
         # Profiles — first-class + /set form for discoverability.
@@ -1582,6 +1585,7 @@ CLI_SLASH_DESCRIPTIONS = {command: description for command, description in CLI_S
 _COMMAND_HELP_ENTRIES: tuple[tuple[str, str], ...] = (
     ("/help", "Show this help"),
     ("/clear", "Clear history and system override"),
+    ("/speech [start|stop]", "Open speech menu (Ctrl+S in TUI)"),
     ("/save [name]", "Save this session"),
     ("/load [name|index]", "Load a session (lists if no arg)"),
     ("/profile [name]", "Show or set profile (manual · auto · low-vram · balanced)"),
@@ -1625,6 +1629,75 @@ def _print_profile_catalog() -> None:
     for name, description in _PROFILE_SPECS:
         _console.print(f"    [bold]{name:<10}[/]  [dim]{description}[/]")
     print_info("Usage · /profile <name>  or  /set profile <name>")
+    _console.print()
+
+
+def _handle_speech(args: str, session: dict | None = None) -> None:
+    """Toggle or one-shot voice input (Web UI mic parity for CLI/TUI).
+
+    In the full-screen TUI, this opens the centered speech menu (same path as
+    Ctrl+S). In classic CLI mode it does a single listen pass and prints text.
+    """
+    action = str(args or "").strip().lower()
+    if action in {"", "toggle", "start", "stop", "on", "off", "status"}:
+        pass
+    else:
+        print_error(f"Unknown /speech argument · {args}")
+        print_info("Usage · /speech  |  /speech start  |  /speech stop")
+        _console.print()
+        return
+
+    # Prefer live TUI controller when available (same menu as Ctrl+S).
+    try:
+        from agent.terminal import get_display_sink
+
+        sink = get_display_sink()
+        if sink is not None and hasattr(sink, "toggle_speech"):
+            sink.toggle_speech(action or "toggle")
+            return
+    except Exception:
+        pass
+
+    if action in {"stop", "off"}:
+        print_info("Voice input is only active in the TUI (Ctrl+S / /speech)")
+        _console.print()
+        return
+
+    if action == "status":
+        try:
+            from agent.speech_input import speech_capability
+
+            cap = speech_capability()
+            if cap.available:
+                print_ok("Voice input available", detail=cap.detail)
+            else:
+                print_warn("Voice input unavailable", detail=cap.detail)
+        except Exception as exc:
+            print_error(f"Voice input check failed · {exc}")
+        _console.print()
+        return
+
+    # Classic CLI one-shot listen.
+    print_lab_status("Listening…", kind="run", detail="speak now")
+    try:
+        from agent.speech_input import capture_once
+
+        text, error = capture_once()
+    except Exception as exc:
+        print_error(f"Voice input failed · {exc}")
+        _console.print()
+        return
+
+    if error:
+        print_warn(error)
+        _console.print()
+        return
+    if not text:
+        print_warn("I didn't hear anything")
+        _console.print()
+        return
+    print_ok("Heard", detail=text)
+    print_info("Tip · in the TUI, Ctrl+S or /speech opens the speech menu")
     _console.print()
 
 
@@ -2651,6 +2724,10 @@ def _handle_command(cmd: str, session: dict, history: list[dict]) -> bool | None
         session["system"] = ""
         print_ok("Conversation history and system prompt cleared")
         _console.print()
+        return True
+
+    if base == "/speech":
+        _handle_speech(rest, session)
         return True
 
     if base == "/theme":

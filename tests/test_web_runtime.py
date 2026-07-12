@@ -271,6 +271,44 @@ class TestChatEventTerminalState(unittest.TestCase):
         self.assertEqual(terminal[0]["error"], "Cancelled by test owner")
         self.assertFalse(any(event.get("type") == "content_chunk" for event in events))
 
+    def test_terminal_event_returns_updated_effective_runtime(self):
+        from agent import web
+
+        session = {
+            "runtime_profile": "manual",
+            "options": {},
+            "history": True,
+            "system": "",
+            "think": True,
+            "verbose": True,
+            "wordwrap": True,
+            "format": "",
+        }
+        with (
+            patch.object(web, "list_saved_sessions", return_value=[]),
+            patch.object(
+                web,
+                "_runtime_payload",
+                side_effect=lambda current: {
+                    "effective_options": {"num_ctx": current["options"].get("num_ctx", 4096)}
+                },
+            ),
+        ):
+            events = list(web.generate_chat_events(
+                "/set parameter num_ctx 8192",
+                session,
+                [],
+                "Active Session",
+                cancellation_token=CancellationToken(),
+                generation_id="generation-one",
+                publish_global=False,
+                client_id="client-one",
+            ))
+
+        terminal = next(event for event in events if event.get("type") == "done")
+        self.assertEqual(terminal["settings"]["options"]["num_ctx"], 8192)
+        self.assertEqual(terminal["runtime"]["effective_options"]["num_ctx"], 8192)
+
     def test_tool_round_cap_never_persists_an_unmatched_tool_call(self):
         from agent import web
 

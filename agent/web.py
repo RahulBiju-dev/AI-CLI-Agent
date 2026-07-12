@@ -1788,6 +1788,11 @@ def generate_chat_events(
         "type": "done",
         "state": terminal_state.value,
         "generation_id": generation_id,
+        # The command path can change profiles and model options without a
+        # separate settings request. Keep the web UI synchronized with the
+        # effective runtime that will own the next turn.
+        "settings": deepcopy(session_data),
+        "runtime": _runtime_payload(session_data),
     })
     if terminal_detail:
         payload["error"] = terminal_detail

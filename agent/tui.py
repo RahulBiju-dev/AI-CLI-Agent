@@ -87,6 +87,10 @@ class TuiDisplaySink:
     def apply_theme(self, name: str) -> None:
         self._call("ui_apply_theme", name)
 
+    def toggle_speech(self, action: str = "toggle") -> None:
+        """Bridge ``/speech`` from the core command handler into the TUI."""
+        self._call("ui_toggle_speech", action)
+
     def activity_start(self, label: str = "Thinking") -> None:
         self._call("ui_activity_start", label)
 
@@ -590,6 +594,259 @@ def build_app_class():
             self.remove_class("-visible")
             self.update("")
 
+    class SpeechMenu(Vertical):
+        """Centered voice popup: animated mic + editable transcript.
+
+        Visual states:
+          • idle      — soft breathing mic, quiet wave dots
+          • recording — solid pulse + VU-style wave bars
+          • finishing/error — stable state with concise in-popup detail
+        """
+
+        DEFAULT_CSS = """
+        SpeechMenu {
+            display: none;
+            dock: top;
+            layer: overlay;
+            width: 100%;
+            height: 100%;
+            align: center middle;
+            background: $background 82%;
+        }
+        SpeechMenu.-visible {
+            display: block;
+        }
+        #speech-card {
+            width: 76;
+            max-width: 96%;
+            height: auto;
+            background: $boost;
+            border: round $primary;
+            padding: 1 2 1 2;
+        }
+        SpeechMenu.-recording #speech-card {
+            border: round $error;
+        }
+        #speech-title {
+            height: 1;
+            width: 100%;
+            color: $primary 50%;
+            text-style: dim;
+            background: transparent;
+            margin: 0 0 1 0;
+        }
+        #speech-row {
+            height: 3;
+            width: 100%;
+            align: left middle;
+        }
+        #speech-mic {
+            width: 3;
+            height: 3;
+            min-width: 3;
+            content-align: center middle;
+            color: $primary;
+            text-style: bold;
+            background: transparent;
+            padding: 0;
+        }
+        SpeechMenu.-recording #speech-mic {
+            color: $error;
+            text-style: bold;
+        }
+        #speech-wave {
+            width: 10;
+            height: 3;
+            min-width: 10;
+            content-align: center middle;
+            color: $primary 45%;
+            text-style: dim;
+            background: transparent;
+            padding: 0 1 0 0;
+        }
+        SpeechMenu.-recording #speech-wave {
+            color: $error;
+            text-style: none;
+        }
+        #speech-input {
+            width: 1fr;
+            height: 3;
+            background: transparent;
+            color: $foreground;
+            border: none;
+            padding: 0;
+            margin: 0;
+        }
+        #speech-input:focus {
+            background: transparent;
+            border: none;
+        }
+        #speech-input > .input--placeholder {
+            color: $primary 40%;
+        }
+        #speech-hint {
+            height: 1;
+            width: 100%;
+            color: $primary 40%;
+            text-style: dim;
+            background: transparent;
+            padding: 0;
+            margin: 1 0 0 0;
+        }
+        """
+
+        # Idle: soft “breathing” mic. Recording: hard pulse.
+        _IDLE_MIC = ("○", "◔", "◑", "◕", "◉", "◕", "◑", "◔")
+        _REC_MIC = ("●", "◉", "◎", "◉")
+        # Idle dots vs VU meter when live.
+        _IDLE_WAVE = ("· · · ·", " · · · ", "· · · ·", " · · · ")
+        _REC_WAVE = (
+            "▁▂▃▄▅▄▃▂",
+            "▂▃▄▅▆▅▄▃",
+            "▃▄▅▆▇▆▅▄",
+            "▄▅▆▇█▇▆▅",
+            "▅▆▇█▇▆▅▄",
+            "▆▇█▇▆▅▄▃",
+            "▇█▇▆▅▄▃▂",
+            "█▇▆▅▄▃▂▁",
+            "▇▆▅▄▃▂▁▂",
+            "▆▅▄▃▂▁▂▃",
+            "▅▄▃▂▁▂▃▄",
+            "▄▃▂▁▂▃▄▅",
+        )
+
+        def __init__(self, **kwargs) -> None:
+            super().__init__(**kwargs)
+            self._anim_frame = 0
+            self._anim_timer = None
+            self._recording = False
+
+        def compose(self) -> ComposeResult:
+            with Vertical(id="speech-card"):
+                yield Static("voice", id="speech-title", markup=False)
+                with Horizontal(id="speech-row"):
+                    yield Static(self._IDLE_MIC[0], id="speech-mic", markup=False)
+                    yield Static(self._IDLE_WAVE[0], id="speech-wave", markup=False)
+                    yield Input(
+                        placeholder="Speak or type…",
+                        id="speech-input",
+                    )
+                yield Static(
+                    "enter start  ·  enter again send  ·  esc close",
+                    id="speech-hint",
+                    markup=False,
+                )
+
+        def on_mount(self) -> None:
+            # Keep the timer alive; _tick_anim no-ops while hidden.
+            self._anim_timer = self.set_interval(0.11, self._tick_anim)
+
+        def on_unmount(self) -> None:
+            timer = self._anim_timer
+            self._anim_timer = None
+            if timer is not None:
+                try:
+                    timer.stop()
+                except Exception:
+                    pass
+
+        def _tick_anim(self) -> None:
+            if not self.has_class("-visible"):
+                return
+            self._anim_frame = (self._anim_frame + 1) % 64
+            recording = self._recording
+            mic_frames = self._REC_MIC if recording else self._IDLE_MIC
+            wave_frames = self._REC_WAVE if recording else self._IDLE_WAVE
+            try:
+                self.query_one("#speech-mic", Static).update(
+                    mic_frames[self._anim_frame % len(mic_frames)]
+                )
+            except Exception:
+                pass
+            try:
+                self.query_one("#speech-wave", Static).update(
+                    wave_frames[self._anim_frame % len(wave_frames)]
+                )
+            except Exception:
+                pass
+
+        def show_menu(self) -> None:
+            self._recording = False
+            self._anim_frame = 0
+            self.remove_class("-recording")
+            try:
+                self.query_one("#speech-mic", Static).update(self._IDLE_MIC[0])
+                self.query_one("#speech-wave", Static).update(self._IDLE_WAVE[0])
+            except Exception:
+                pass
+            try:
+                self.query_one("#speech-title", Static).update("voice")
+            except Exception:
+                pass
+            try:
+                self.query_one("#speech-hint", Static).update(
+                    "enter start  ·  enter again send  ·  esc close"
+                )
+            except Exception:
+                pass
+            self.add_class("-visible")
+
+        def hide_menu(self) -> None:
+            self.remove_class("-visible")
+            self.remove_class("-recording")
+            self._recording = False
+            self._anim_frame = 0
+            try:
+                self.query_one("#speech-mic", Static).update(self._IDLE_MIC[0])
+                self.query_one("#speech-wave", Static).update(self._IDLE_WAVE[0])
+            except Exception:
+                pass
+            try:
+                self.query_one("#speech-input", Input).value = ""
+            except Exception:
+                pass
+
+        def set_recording(self, active: bool) -> None:
+            active = bool(active)
+            self._recording = active
+            self.set_class(active, "-recording")
+            try:
+                title = "voice  ·  listening" if active else "voice"
+                self.query_one("#speech-title", Static).update(title)
+            except Exception:
+                pass
+            try:
+                if active:
+                    hint = "enter send  ·  esc cancel"
+                else:
+                    hint = "enter start  ·  enter again send  ·  esc close"
+                self.query_one("#speech-hint", Static).update(hint)
+            except Exception:
+                pass
+            # Snap animation frame so the state change is immediate.
+            self._tick_anim()
+
+        def set_finishing(self) -> None:
+            self.set_recording(False)
+            try:
+                self.query_one("#speech-title", Static).update("voice  ·  finishing")
+                self.query_one("#speech-hint", Static).update(
+                    "transcribing final phrase  ·  esc cancel"
+                )
+            except Exception:
+                pass
+
+        def set_error(self, message: str) -> None:
+            self.set_recording(False)
+            detail = " ".join(str(message or "Voice input unavailable").split())
+            if len(detail) > 72:
+                detail = detail[:69].rstrip() + "…"
+            try:
+                self.query_one("#speech-title", Static).update("voice  ·  unavailable")
+                self.query_one("#speech-hint", Static).update(detail)
+            except Exception:
+                pass
+
     class Composer(Vertical):
         """Boxed prompt line + outside shortcut strip with accented keys."""
 
@@ -687,6 +944,7 @@ def build_app_class():
                 ("↵", "send"),
                 ("/", "palette"),
                 ("^O", "chats"),
+                ("^S", "speech"),
                 ("⇥", "complete"),
                 ("^C", "stop"),
                 ("^C^C", "quit"),
@@ -752,9 +1010,11 @@ def build_app_class():
         Screen {
             background: $background;
             color: $foreground;
+            layers: base overlay;
         }
         #body {
             height: 1fr;
+            layer: base;
         }
         #welcome {
             margin: 1 2;
@@ -770,6 +1030,7 @@ def build_app_class():
             Binding("ctrl+k", "clear_input", "Clear input", show=True),
             Binding("ctrl+slash", "open_commands", "Commands", show=True),
             Binding("ctrl+o", "open_sessions", "Conversations", show=True, priority=True),
+            Binding("ctrl+s", "toggle_speech", "Speech", show=True, priority=True),
             Binding("f1", "show_help", "Help", show=True),
             Binding("ctrl+j", "submit_input", "Send", show=False, priority=True),
             Binding("escape", "blur_or_clear", "Esc", show=False, priority=True),
@@ -821,6 +1082,12 @@ def build_app_class():
             self._session_rows: list[tuple[str, str, str]] = []
             self._session_selected = 0
             self._session_catalog_total = 0
+            self._voice = None  # lazy VoiceInputController
+            self._voice_active = False
+            self._speech_open = False  # centered speech popup visible
+            self._speech_armed = False  # True after first Enter (start); second Enter sends
+            self._speech_pending_submit = False
+            self._voice_error_message = ""
             self._sink: TuiDisplaySink | None = None
             self._saved_console = None
             self._capture_file = None
@@ -835,6 +1102,7 @@ def build_app_class():
                 yield SlashPalette(id="slash-palette")
                 yield SessionsMenu(id="sessions-menu")
                 yield Composer(meta_text=self._composer_meta())
+            yield SpeechMenu(id="speech-menu")
 
         def on_mount(self) -> None:
             from agent.tui_themes import DEFAULT_THEME, normalize_theme_name, register_all_themes
@@ -872,6 +1140,7 @@ def build_app_class():
             self.refresh_context_usage()
 
         def on_unmount(self) -> None:
+            self._stop_voice(silent=True, abort=True)
             set_display_sink(None)
             if self._saved_console is not None:
                 import agent.terminal as terminal_mod
@@ -1583,6 +1852,7 @@ def build_app_class():
             )
 
         def _open_sessions_menu(self, *, reset_selection: bool = True) -> None:
+            self._dismiss_speech_menu()
             self._dismiss_slash_palette()
             self._sessions_open = True
             query = self._session_filter_query()
@@ -1718,6 +1988,17 @@ def build_app_class():
                 self.ui_status(str(warning), kind="warn")
 
         def on_input_changed(self, event: Input.Changed) -> None:
+            if event.input.id == "speech-input":
+                # Keep the recognizer base in sync so live phrases append to edits.
+                voice = self._voice
+                if voice is not None and (
+                    self._voice_active or getattr(voice, "active", False)
+                ):
+                    try:
+                        voice.set_base_text(event.value or "")
+                    except Exception:
+                        pass
+                return
             if event.input.id != "prompt-input":
                 return
             if self._sessions_open:
@@ -1728,6 +2009,9 @@ def build_app_class():
             self.refresh_context_usage()
 
         def on_input_submitted(self, event: Input.Submitted) -> None:
+            if event.input.id == "speech-input":
+                self._speech_on_enter()
+                return
             if event.input.id != "prompt-input":
                 return
             if self._sessions_open:
@@ -1736,6 +2020,9 @@ def build_app_class():
             self._submit_from_input()
 
         def _submit_from_input(self) -> None:
+            if self._speech_open:
+                self._speech_on_enter()
+                return
             if self._sessions_open:
                 self._accept_session_selection()
                 return
@@ -1767,7 +2054,11 @@ def build_app_class():
             # Esc must close menus even if focus left the composer (e.g. after
             # opening the palette with Ctrl+/). Handle before the focus gate.
             if key == "escape":
-                if self._sessions_open or self._slash_palette_visible():
+                if (
+                    self._speech_open
+                    or self._sessions_open
+                    or self._slash_palette_visible()
+                ):
                     event.prevent_default()
                     event.stop()
                     self.action_blur_or_clear()
@@ -1778,7 +2069,11 @@ def build_app_class():
                 focused = self.focused
             except Exception:
                 focused = None
-            if focused is None or getattr(focused, "id", None) != "prompt-input":
+            focused_id = getattr(focused, "id", None) if focused is not None else None
+            if focused_id == "speech-input":
+                # Speech popup owns Enter/typing; no slash/session navigation.
+                return
+            if focused is None or focused_id != "prompt-input":
                 return
 
             # Conversations menu navigation takes priority while open.
@@ -1915,11 +2210,23 @@ def build_app_class():
         # ── Turn execution ────────────────────────────────────────────
 
         def _submit(self, user_input: str) -> None:
+            stripped = str(user_input or "").strip()
+            base = stripped.split(None, 1)[0].lower() if stripped else ""
+            # Voice toggle must stay on the UI thread (no generation lock).
+            if base == "/speech":
+                rest = stripped.split(None, 1)[1] if len(stripped.split(None, 1)) > 1 else ""
+                self.ui_add_user(user_input)
+                self.ui_toggle_speech(rest or "toggle")
+                return
+
             with self._busy_lock:
                 if self._busy:
                     self.ui_status("Still generating — wait for the current turn", kind="warn")
                     return
                 self._busy = True
+
+            # Match web: stop mic when a turn starts.
+            self._stop_voice(silent=True, abort=True)
 
             self.ui_add_user(user_input)
             self._stream_widget = None
@@ -2080,6 +2387,8 @@ def build_app_class():
 
         def action_clear_input(self) -> None:
             """Ctrl+K — clear the composer (and dismiss menus)."""
+            if self._dismiss_speech_menu():
+                return
             inp = self.query_one("#prompt-input", Input)
             inp.value = ""
             inp.focus()
@@ -2091,6 +2400,7 @@ def build_app_class():
             inp = self.query_one("#prompt-input", Input)
             if self._busy:
                 return
+            self._dismiss_speech_menu()
             self._dismiss_sessions_menu()
             # Second Ctrl+/ closes the palette cleanly (same as Esc).
             if self._slash_palette_visible():
@@ -2144,7 +2454,7 @@ def build_app_class():
             self.ui_help(
                 unique,
                 "commands",
-                "ctrl+/ palette  ·  ctrl+o conversations  ·  tab complete  ·  enter run",
+                "ctrl+/ palette  ·  ctrl+o chats  ·  ctrl+s speech  ·  tab complete",
             )
             shortcuts = Text()
             shortcuts.append(f"{GLYPH_SECTION} ", style="#6b6b6b")
@@ -2155,10 +2465,11 @@ def build_app_class():
                 ("Ctrl+C twice", "Quit application"),
                 ("Ctrl+/", "Open command palette"),
                 ("Ctrl+O", "Open conversations menu"),
+                ("Ctrl+S", "Open speech menu (/speech)"),
                 ("Tab / →", "Autofill highlighted command"),
                 ("↑↓  Ctrl+N/P", "Move menu selection"),
                 ("PgUp / PgDn", "Jump menu selection"),
-                ("Esc", "Dismiss menu (palette or chats)"),
+                ("Esc", "Dismiss menu / speech / clear input"),
                 ("Ctrl+K", "Clear input + dismiss menus"),
                 ("Ctrl+L", "Clear conversation"),
                 ("F1", "Show this help"),
@@ -2173,12 +2484,341 @@ def build_app_class():
                 return
             self._submit_from_input()
 
+        # ── Voice input (centered speech popup) ───────────────────────
+
+        def _ensure_voice(self):
+            if self._voice is not None:
+                return self._voice
+            from agent.speech_input import VoiceInputController
+
+            def _on_transcript(text: str) -> None:
+                try:
+                    self.call_from_thread(self._voice_apply_transcript, text)
+                except Exception:
+                    pass
+
+            def _on_active(active: bool) -> None:
+                try:
+                    self.call_from_thread(self._voice_set_active_ui, bool(active))
+                except Exception:
+                    pass
+
+            def _on_error(_code: str, message: str) -> None:
+                try:
+                    self.call_from_thread(self._voice_on_error, message)
+                except Exception:
+                    pass
+
+            def _on_finished() -> None:
+                try:
+                    self.call_from_thread(self._speech_finish_submit)
+                except Exception:
+                    pass
+
+            self._voice = VoiceInputController(
+                on_transcript=_on_transcript,
+                on_active=_on_active,
+                on_error=_on_error,
+                on_finished=_on_finished,
+            )
+            return self._voice
+
+        def _voice_on_error(self, message: str) -> None:
+            """Keep audio failures contained and visible inside the popup."""
+            self._voice_active = False
+            self._voice_error_message = str(message or "Voice input unavailable")
+            if not self._speech_open:
+                return
+            try:
+                self.query_one("#speech-menu", SpeechMenu).set_error(
+                    self._voice_error_message
+                )
+            except Exception:
+                pass
+            # Armed stays True so a second Enter still sends typed text.
+            try:
+                self.query_one("#speech-input", Input).focus()
+            except Exception:
+                pass
+            try:
+                self.refresh()
+            except Exception:
+                pass
+
+        def _open_speech_menu(self, *, start_recording: bool = False) -> None:
+            """Show the centered mic + transcript popup."""
+            if self._busy:
+                return
+            self._dismiss_sessions_menu()
+            self._dismiss_slash_palette(clear_slash_draft=True)
+            try:
+                menu = self.query_one("#speech-menu", SpeechMenu)
+            except Exception:
+                return
+
+            # Prefill from the main composer when it holds a normal draft.
+            draft = ""
+            try:
+                main = self.query_one("#prompt-input", Input)
+                draft = main.value or ""
+                if draft.strip().startswith("/"):
+                    draft = ""
+            except Exception:
+                draft = ""
+
+            try:
+                speech = self.query_one("#speech-input", Input)
+                speech.value = draft
+                speech.cursor_position = len(speech.value or "")
+            except Exception:
+                pass
+
+            menu.show_menu()
+            self._speech_open = True
+            self._speech_armed = False
+            self._speech_pending_submit = False
+            self._voice_error_message = ""
+            try:
+                self.query_one("#speech-input", Input).focus()
+            except Exception:
+                pass
+            try:
+                self.refresh()
+            except Exception:
+                pass
+
+            if start_recording:
+                self._speech_armed = True
+                self._speech_start_recording()
+
+        def _dismiss_speech_menu(self, *, stop_voice: bool = True) -> bool:
+            """Hide the speech popup. Returns True when it was open."""
+            closed = bool(self._speech_open)
+            try:
+                menu = self.query_one("#speech-menu", SpeechMenu)
+                if menu.has_class("-visible"):
+                    closed = True
+                menu.hide_menu()
+            except Exception:
+                pass
+            self._speech_open = False
+            self._speech_armed = False
+            self._speech_pending_submit = False
+            self._voice_error_message = ""
+            if stop_voice:
+                self._stop_voice(silent=True, abort=True)
+            else:
+                self._voice_active = False
+                try:
+                    self.query_one("#speech-menu", SpeechMenu).set_recording(False)
+                except Exception:
+                    pass
+            if closed:
+                try:
+                    self.query_one("#prompt-input", Input).focus()
+                except Exception:
+                    pass
+                try:
+                    self.refresh()
+                except Exception:
+                    pass
+            return closed
+
+        def _speech_start_recording(self) -> None:
+            """Begin capture into the speech popup textbox."""
+            if self._busy or not self._speech_open:
+                return
+            voice = self._ensure_voice()
+            if voice.active or self._voice_active:
+                return
+            try:
+                base = self.query_one("#speech-input", Input).value or ""
+            except Exception:
+                base = ""
+            self._voice_error_message = ""
+            # Optimistic UI — flip to recording animation immediately.
+            try:
+                self.query_one("#speech-menu", SpeechMenu).set_recording(True)
+            except Exception:
+                pass
+            try:
+                started = bool(voice.start(base_text=base))
+            except Exception:
+                started = False
+            if not started:
+                # A worker-side capability error updates the popup asynchronously.
+                self._voice_active = False
+                try:
+                    from agent.speech_input import speech_capability
+
+                    capability = speech_capability()
+                    if not capability.available:
+                        self._voice_on_error(capability.detail)
+                    else:
+                        self.query_one("#speech-menu", SpeechMenu).set_recording(False)
+                except Exception:
+                    pass
+                try:
+                    self.refresh()
+                except Exception:
+                    pass
+
+        def _speech_on_enter(self) -> None:
+            """Enter: start recording once; Enter again stops and sends the prompt."""
+            if not self._speech_open or self._busy:
+                return
+            if self._speech_pending_submit:
+                return
+            if not self._speech_armed:
+                # First Enter — arm and begin listening.
+                self._speech_armed = True
+                self._speech_start_recording()
+                return
+
+            # Second Enter requests a clean stop. Keep the popup alive until
+            # the in-flight phrase has been recognized so the last words are
+            # not lost merely because Enter was pressed quickly.
+            voice = self._voice
+            if voice is not None and (voice.active or self._voice_active):
+                self._speech_pending_submit = True
+                self._stop_voice(silent=False, abort=False)
+                try:
+                    self.query_one("#speech-menu", SpeechMenu).set_finishing()
+                except Exception:
+                    pass
+                return
+            self._speech_finish_submit(force=True)
+
+        def _speech_finish_submit(self, *, force: bool = False) -> None:
+            """Submit after clean speech shutdown has delivered its final text."""
+            if not self._speech_open or (not force and not self._speech_pending_submit):
+                return
+            try:
+                text = (self.query_one("#speech-input", Input).value or "").strip()
+            except Exception:
+                text = ""
+            self._speech_pending_submit = False
+            if text:
+                self._dismiss_speech_menu(stop_voice=False)
+                self._submit(text)
+                return
+            # Nothing was recognized. Keep the typed fallback available and
+            # let Enter retry instead of closing an apparently broken popup.
+            self._speech_armed = False
+            try:
+                menu = self.query_one("#speech-menu", SpeechMenu)
+                if self._voice_error_message:
+                    menu.set_error(self._voice_error_message)
+                else:
+                    menu.set_recording(False)
+                self.query_one("#speech-input", Input).focus()
+            except Exception:
+                pass
+
+        def _voice_apply_transcript(self, text: str) -> None:
+            """Put live speech text into the speech popup textbox."""
+            if not self._speech_open:
+                return
+            try:
+                inp = self.query_one("#speech-input", Input)
+            except Exception:
+                return
+            inp.value = str(text or "")
+            try:
+                inp.cursor_position = len(inp.value or "")
+            except Exception:
+                pass
+
+        def _voice_set_active_ui(self, active: bool) -> None:
+            was = self._voice_active
+            self._voice_active = bool(active)
+            if not self._speech_open:
+                return
+            try:
+                menu = self.query_one("#speech-menu", SpeechMenu)
+                if not active and self._voice_error_message:
+                    menu.set_error(self._voice_error_message)
+                elif not active and self._speech_pending_submit:
+                    menu.set_finishing()
+                else:
+                    menu.set_recording(active)
+            except Exception:
+                pass
+            # If the mic stopped unexpectedly, repaint so any residual driver
+            # noise under the alternate screen is overwritten.
+            if was and not active:
+                try:
+                    self.refresh()
+                except Exception:
+                    pass
+
+        def _stop_voice(self, *, silent: bool = False, abort: bool = False) -> None:
+            voice = self._voice
+            if voice is None:
+                self._voice_active = False
+                try:
+                    if self._speech_open:
+                        self.query_one("#speech-menu", SpeechMenu).set_recording(False)
+                except Exception:
+                    pass
+                return
+            try:
+                # Aborts are expected; clean stops still report recognition errors.
+                voice.stop(abort=abort, silent=silent)
+            except Exception:
+                pass
+            self._voice_active = False
+            try:
+                if self._speech_open:
+                    self.query_one("#speech-menu", SpeechMenu).set_recording(False)
+            except Exception:
+                pass
+
+        def ui_toggle_speech(self, action: str = "toggle") -> None:
+            """Handle /speech or Ctrl+S — same centered speech menu.
+
+            Enter starts recording; Enter again finalizes and sends. Errors stay
+            contained inside the speech popup instead of corrupting TUI output.
+            """
+            action = str(action or "toggle").strip().lower() or "toggle"
+            if action in {"status"}:
+                # Capability check stays silent in the TUI.
+                return
+
+            if self._busy and action not in {"stop", "off"}:
+                return
+
+            if action in {"stop", "off"}:
+                # Stop listening but keep the popup open so the draft remains editable.
+                self._stop_voice(silent=True, abort=False)
+                return
+
+            if action in {"start", "on"}:
+                if not self._speech_open:
+                    self._open_speech_menu(start_recording=True)
+                else:
+                    self._speech_armed = True
+                    self._speech_start_recording()
+                return
+
+            # toggle (default) — open/close the speech popup
+            if self._speech_open:
+                self._dismiss_speech_menu()
+                return
+            self._open_speech_menu(start_recording=False)
+
+        def action_toggle_speech(self) -> None:
+            """Ctrl+S — open or close the centered speech menu."""
+            self.ui_toggle_speech("toggle")
+
         def action_blur_or_clear(self) -> None:
-            """Esc — dismiss menus first (chats, then palette), then clear input.
+            """Esc — dismiss speech, then chats, then palette, then input.
 
             One Esc always exits the open menu (including palette opened via
             Ctrl+/). A further Esc clears leftover composer text.
             """
+            if self._dismiss_speech_menu():
+                return
             if self._dismiss_sessions_menu():
                 try:
                     self.query_one("#prompt-input", Input).focus()

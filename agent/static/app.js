@@ -18,7 +18,6 @@ const FALLBACK_MODEL_OPTIONS = {
   top_p: 0.85,
   top_k: 40,
   repeat_penalty: 1.08,
-  num_ctx: 4096,
   num_predict: 768,
   num_batch: 128
 };
@@ -397,8 +396,11 @@ function syncSettingsUI() {
   if (el.temperature) el.temperature.value = String(temp);
   if (el.temperatureValue) el.temperatureValue.textContent = temp.toFixed(2);
 
-  const ctx = String(contextBudget());
-  if (el.context) {
+  const budget = contextBudget();
+  if (el.context) el.context.disabled = !budget;
+  if (el.context && budget) {
+    const ctx = String(budget);
+    el.context.querySelector('option[value=""]')?.remove();
     const hasOption = [...el.context.options].some((option) => option.value === ctx);
     if (!hasOption) {
       const option = document.createElement("option");
@@ -421,9 +423,11 @@ function persistSettings() {
       });
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       const data = await response.json();
+      state.settings = mergeSettings(data.settings || state.settings);
       state.runtime = data.runtime || state.runtime;
       reportRuntimeWarnings(state.runtime);
-      // Refresh meter after server returns active/default system prompt text.
+      syncSettingsUI();
+      // Refresh after the server resolves profile defaults and session overrides.
       updateContextMeter();
     } catch {
       toast("Settings could not be saved.");
@@ -994,9 +998,15 @@ function handleStreamEvent(event, generation) {
       if (event.saved_sessions) state.savedSessions = event.saved_sessions;
       if (visible) {
         if (event.history) state.history = event.history;
+        if (event.settings) state.settings = mergeSettings(event.settings);
+        if (event.runtime) {
+          state.runtime = event.runtime;
+          reportRuntimeWarnings(state.runtime);
+        }
         state.activeSessionName = finishedName;
         el.title.textContent = cleanSessionName(state.activeSessionName);
         document.title = titleForSession(state.activeSessionName);
+        syncSettingsUI();
         renderSessions();
         updateContextMeter();
         finishGeneration(generation);
@@ -1374,11 +1384,12 @@ function closeSlashMenu() {
 }
 
 function updateContextMeter(forcedUsed = null, forcedBudget = null) {
-  const budget = forcedBudget || contextBudget();
+  const candidate = Number(forcedBudget ?? contextBudget());
+  const budget = Number.isFinite(candidate) && candidate > 0 ? candidate : null;
   const used = forcedUsed ?? estimatedContextTokens();
-  const pct = budget > 0 ? Math.min(100, Math.round((used / budget) * 100)) : 0;
+  const pct = budget ? Math.min(100, Math.round((used / budget) * 100)) : 0;
 
-  if (el.contextLabel) el.contextLabel.textContent = `${used} / ${budget}`;
+  if (el.contextLabel) el.contextLabel.textContent = `${used} / ${budget ?? "—"}`;
   if (el.contextFill) el.contextFill.style.width = `${pct}%`;
   if (el.contextMeter) {
     el.contextMeter.classList.toggle("warn", pct >= 75 && pct < 90);
@@ -1440,11 +1451,11 @@ function estimateTokens(text) {
 }
 
 function contextBudget() {
-  return Number(
+  const budget = Number(
     state.settings.options?.num_ctx
       ?? state.runtime?.effective_options?.num_ctx
-      ?? FALLBACK_MODEL_OPTIONS.num_ctx
   );
+  return Number.isFinite(budget) && budget > 0 ? budget : null;
 }
 
 function resizeComposer() {
