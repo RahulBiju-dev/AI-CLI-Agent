@@ -11,6 +11,7 @@ import os
 
 MAX_OUTPUT_CHARS = 25000
 MAX_SCAN_FILES = 1000
+MAX_SOURCE_FILE_BYTES = 25 * 1024 * 1024
 SKIP_DIRECTORIES = {".git", ".chroma", ".venv", "venv", "node_modules", "dist", "build", "__pycache__"}
 
 # Comprehensive supported source code file extensions covering all common languages
@@ -184,6 +185,9 @@ def view_code(file_path: str, lines: str | None = None, extension: str | None = 
     Returns:
         A JSON string containing the code with line numbers, file list, or an error message.
     """
+    if not isinstance(file_path, str) or not file_path.strip() or len(file_path) > 4096 or "\0" in file_path:
+        return json.dumps({"error": "file_path must be a valid path"})
+    file_path = file_path.strip()
     if not os.path.exists(file_path):
         return json.dumps({"error": f"Path not found: {file_path}"})
 
@@ -270,6 +274,15 @@ def view_code(file_path: str, lines: str | None = None, extension: str | None = 
             })
 
     # Handle single file
+    try:
+        file_size = os.path.getsize(file_path)
+    except OSError as exc:
+        return json.dumps({"error": f"Could not inspect source file: {exc}"})
+    if file_size > MAX_SOURCE_FILE_BYTES:
+        return json.dumps({
+            "error": f"Source file exceeds the {MAX_SOURCE_FILE_BYTES}-byte direct-view limit",
+            "guidance": "Use codebase_indexer for bounded retrieval of very large source files.",
+        })
     file_ext = os.path.splitext(file_path)[1].lower()
     
     # Check if it's a special file (Dockerfile, Makefile, etc.)

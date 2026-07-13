@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 from typing import Any, Dict, List
 
@@ -28,6 +29,23 @@ def _positive_int(value: int | str | None, default: int, minimum: int = 1, maxim
     if maximum is not None:
         parsed = min(parsed, maximum)
     return parsed
+
+
+def _sortable_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+
+
+def _similarity(value: Any) -> float | None:
+    try:
+        distance = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(distance):
+        return None
+    return round(1.0 / (1.0 + max(0.0, distance)), 6)
 
 
 def _embed_query(
@@ -88,6 +106,7 @@ def _query_collection(
 
         f_docs, f_metas, f_dists = [], [], []
         for d, m, dist in zip(docs, metas, dists):
+            m = m if isinstance(m, dict) else {}
             m_source = str(m.get("source", "")).lower()
             m_file = str(m.get("filename", "")).lower()
             if source_lower in m_source or source_lower in m_file:
@@ -117,8 +136,9 @@ def _flatten_results(results: Dict[str, Any], max_chars: int) -> tuple[list[dict
 
     for index, doc in enumerate(docs[0] if docs else []):
         meta = metadatas[0][index] if metadatas and metadatas[0] and index < len(metadatas[0]) else {}
+        meta = meta if isinstance(meta, dict) else {}
         distance = distances[0][index] if distances and distances[0] and index < len(distances[0]) else None
-        text = (doc or "").strip()
+        text = str(doc or "").strip()
         header = (
             f"Source: {meta.get('source', 'unknown')} | "
             f"chunk: {meta.get('chunk_index', index)} | "
@@ -142,7 +162,7 @@ def _flatten_results(results: Dict[str, Any], max_chars: int) -> tuple[list[dict
             "char_start": meta.get("char_start"),
             "char_end": meta.get("char_end"),
             "distance": distance,
-            "similarity": round(1.0 / (1.0 + max(0.0, float(distance))), 6) if isinstance(distance, (int, float)) else None,
+            "similarity": _similarity(distance),
             "text": text[:1200] + ("..." if len(text) > 1200 else ""),
         })
 
@@ -252,7 +272,7 @@ def ordered_vault_records(
     metadatas = raw.get("metadatas", [])
     records = []
     for item_id, metadata in zip(ids, metadatas):
-        meta = metadata or {}
+        meta = metadata if isinstance(metadata, dict) else {}
         if not _source_matches(meta, source):
             continue
         page = meta.get("page")
@@ -268,9 +288,9 @@ def ordered_vault_records(
 
     records.sort(key=lambda item: (
         str(item["metadata"].get("source") or "").casefold(),
-        int(item["metadata"].get("page") or 0),
-        int(item["metadata"].get("chunk_index") or 0),
-        int(item["metadata"].get("char_start") or 0),
+        _sortable_int(item["metadata"].get("page")),
+        _sortable_int(item["metadata"].get("chunk_index")),
+        _sortable_int(item["metadata"].get("char_start")),
         str(item["id"]),
     ))
     if cancellation_token:

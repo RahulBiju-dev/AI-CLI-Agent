@@ -136,6 +136,231 @@ class SpeechCapabilityTests(unittest.TestCase):
         self.assertEqual(transcripts, ["final words"])
         self.assertEqual(finished, [True])
 
+    def test_capture_continues_while_previous_phrase_is_transcribed(self):
+        from agent.speech_input import VoiceInputController
+
+        second_capture_started = threading.Event()
+        release_recognition = threading.Event()
+        transcripts: list[str] = []
+        finished = threading.Event()
+        voice = VoiceInputController(
+            on_transcript=transcripts.append,
+            on_finished=finished.set,
+        )
+
+        class FakeMicrophone:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+        class FakeRecognizer:
+            created = 0
+
+            def __init__(self):
+                self.role = FakeRecognizer.created
+                FakeRecognizer.created += 1
+                self.listen_count = 0
+
+            def adjust_for_ambient_noise(self, *_args, **_kwargs):
+                return None
+
+            def listen(self, *_args, **_kwargs):
+                self.listen_count += 1
+                if self.listen_count == 1:
+                    return "first audio"
+                second_capture_started.set()
+                voice.stop(silent=True)
+                return "second audio"
+
+            def recognize_google(self, audio, **_kwargs):
+                if audio == "first audio":
+                    release_recognition.wait(2)
+                    return "first"
+                return "second"
+
+        class WaitTimeoutError(Exception):
+            pass
+
+        class UnknownValueError(Exception):
+            pass
+
+        class RequestError(Exception):
+            pass
+
+        fake_sr = types.SimpleNamespace(
+            Recognizer=FakeRecognizer,
+            Microphone=FakeMicrophone,
+            WaitTimeoutError=WaitTimeoutError,
+            UnknownValueError=UnknownValueError,
+            RequestError=RequestError,
+        )
+        stop_event = threading.Event()
+        worker = threading.Thread(
+            target=voice._listen_loop,
+            args=(1, stop_event),
+            daemon=True,
+        )
+        with voice._lock:
+            voice._generation = 1
+            voice._active = True
+            voice._stop = stop_event
+            voice._thread = worker
+        with patch.dict(sys.modules, {"speech_recognition": fake_sr}):
+            worker.start()
+            self.assertTrue(second_capture_started.wait(1))
+            # Recognition of phrase one is still blocked, yet phrase two was
+            # already captured by the independent microphone worker.
+            self.assertEqual(transcripts, [])
+            release_recognition.set()
+            worker.join(3)
+
+        self.assertFalse(worker.is_alive())
+        self.assertTrue(finished.is_set())
+        self.assertEqual(transcripts, ["first", "first second"])
+
+    def test_abort_releases_capture_without_waiting_for_obsolete_network_call(self):
+        from agent.speech_input import VoiceInputController
+
+        recognition_started = threading.Event()
+        release_recognition = threading.Event()
+        stop_event = threading.Event()
+        voice = VoiceInputController()
+
+        class FakeMicrophone:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+        class FakeRecognizer:
+            def __init__(self):
+                self.listen_count = 0
+
+            def adjust_for_ambient_noise(self, *_args, **_kwargs):
+                return None
+
+            def listen(self, *_args, **_kwargs):
+                self.listen_count += 1
+                if self.listen_count == 1:
+                    return "audio"
+                stop_event.wait(1)
+                return "discarded"
+
+            def recognize_google(self, *_args, **_kwargs):
+                recognition_started.set()
+                release_recognition.wait(2)
+                return "obsolete"
+
+        class WaitTimeoutError(Exception):
+            pass
+
+        class UnknownValueError(Exception):
+            pass
+
+        class RequestError(Exception):
+            pass
+
+        fake_sr = types.SimpleNamespace(
+            Recognizer=FakeRecognizer,
+            Microphone=FakeMicrophone,
+            WaitTimeoutError=WaitTimeoutError,
+            UnknownValueError=UnknownValueError,
+            RequestError=RequestError,
+        )
+        worker = threading.Thread(
+            target=voice._listen_loop,
+            args=(1, stop_event),
+            daemon=True,
+        )
+        with voice._lock:
+            voice._generation = 1
+            voice._active = True
+            voice._stop = stop_event
+            voice._thread = worker
+        with patch.dict(sys.modules, {"speech_recognition": fake_sr}):
+            worker.start()
+            self.assertTrue(recognition_started.wait(1))
+            voice.stop(abort=True, silent=True)
+            worker.join(1)
+            self.assertFalse(worker.is_alive())
+            release_recognition.set()
+
+        self.assertEqual(voice.get_base_text(), "")
+
+    def test_stalled_transcription_cannot_freeze_clean_stop(self):
+        from agent import speech_input
+        from agent.speech_input import VoiceInputController
+
+        recognition_started = threading.Event()
+        release_recognition = threading.Event()
+        finished = threading.Event()
+        stop_event = threading.Event()
+        voice = VoiceInputController(on_finished=finished.set)
+
+        class FakeMicrophone:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+        class FakeRecognizer:
+            def adjust_for_ambient_noise(self, *_args, **_kwargs):
+                return None
+
+            def listen(_recognizer, *_args, **_kwargs):
+                # Long-lived fd redirection can freeze Textual repainting.
+                self.assertEqual(speech_input._silence_depth, 0)
+                voice.stop(silent=True)
+                return "audio"
+
+            def recognize_google(self, *_args, **_kwargs):
+                recognition_started.set()
+                release_recognition.wait(2)
+                return "late"
+
+        class WaitTimeoutError(Exception):
+            pass
+
+        class UnknownValueError(Exception):
+            pass
+
+        class RequestError(Exception):
+            pass
+
+        fake_sr = types.SimpleNamespace(
+            Recognizer=FakeRecognizer,
+            Microphone=FakeMicrophone,
+            WaitTimeoutError=WaitTimeoutError,
+            UnknownValueError=UnknownValueError,
+            RequestError=RequestError,
+        )
+        worker = threading.Thread(
+            target=voice._listen_loop,
+            args=(1, stop_event),
+            daemon=True,
+        )
+        with voice._lock:
+            voice._generation = 1
+            voice._active = True
+            voice._stop = stop_event
+            voice._thread = worker
+        with patch.dict(sys.modules, {"speech_recognition": fake_sr}), patch.object(
+            speech_input, "_RECOGNITION_DRAIN_TIMEOUT", 0.05
+        ):
+            worker.start()
+            self.assertTrue(recognition_started.wait(1))
+            worker.join(0.5)
+            self.assertFalse(worker.is_alive())
+            self.assertTrue(finished.is_set())
+            self.assertEqual(speech_input._silence_depth, 0)
+            release_recognition.set()
+
+        self.assertEqual(voice.get_base_text(), "")
+
     def test_stop_is_non_blocking_and_invalidates_late_worker(self):
         from agent.speech_input import VoiceInputController
 
@@ -154,7 +379,9 @@ class SpeechCapabilityTests(unittest.TestCase):
         self.assertFalse(voice.active)
         self.assertEqual(voice._generation, 5)
         self.assertEqual(active_states, [False])
-        stream.close.assert_called_once_with()
+        # PortAudio teardown must stay on its owning worker; cross-thread close
+        # produces ALSA assertions and can destabilize the next recording.
+        stream.close.assert_not_called()
         thread.join.assert_not_called()
 
         # Completion from generation 4 must not clear a newer recording.

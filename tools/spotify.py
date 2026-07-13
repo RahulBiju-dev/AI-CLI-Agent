@@ -19,6 +19,22 @@ import urllib.parse
 from agent.platform_runtime import open_native_target, platform_family, spawn_detached
 
 
+_MPRIS_BUS_PREFIX = "org.mpris.MediaPlayer2."
+_MPRIS_OBJECT_PATH = "/org/mpris/MediaPlayer2"
+_MPRIS_PLAYER_INTERFACE = "org.mpris.MediaPlayer2.Player"
+_MPRIS_PROPERTIES_INTERFACE = "org.freedesktop.DBus.Properties"
+_KNOWN_SPOTIFY_MPRIS_NAMES = (
+    "org.mpris.MediaPlayer2.spotify",
+    "org.mpris.MediaPlayer2.spotify_player",
+    "org.mpris.MediaPlayer2.com.spotify.Client",
+)
+_SPOTIFY_MPRIS_PLAYER_NAMES = (
+    "spotify",
+    "spotify_player",
+    "com.spotify.client",
+)
+
+
 # ── Spotify launch helpers ────────────────────────────────────────────
 
 def _find_spotify_command() -> list[str]:
@@ -128,43 +144,106 @@ def _launch_spotify() -> bool:
 
 # ── D-Bus helpers ─────────────────────────────────────────────────────
 
-def _get_spotify_dbus():
-    """Get the Spotify D-Bus MPRIS2 player interface."""
+def _spotify_mpris_service_names(bus) -> tuple[str, ...]:
+    """Return active Spotify MPRIS names before compatibility fallbacks.
+
+    MPRIS permits instance-qualified names such as
+    ``org.mpris.MediaPlayer2.spotify.instance123``. Flatpak applications may
+    also use an application-ID-shaped player name. Enumerating the session bus
+    avoids assuming that every Spotify package owns one fixed name.
+    """
+    try:
+        active_names = {str(name) for name in bus.list_names()}
+    except Exception:
+        # Some constrained D-Bus proxies do not allow enumeration. The known
+        # names below remain useful and preserve the old behavior.
+        active_names = set()
+
+    discovered = []
+    for name in active_names:
+        if not name.startswith(_MPRIS_BUS_PREFIX):
+            continue
+        suffix = name[len(_MPRIS_BUS_PREFIX):].casefold()
+        if any(
+            suffix == player_name or suffix.startswith(f"{player_name}.")
+            for player_name in _SPOTIFY_MPRIS_PLAYER_NAMES
+        ):
+            discovered.append(name)
+
+    ordered = []
+    for name in (*_KNOWN_SPOTIFY_MPRIS_NAMES, *sorted(discovered)):
+        if name not in ordered:
+            ordered.append(name)
+    return tuple(ordered)
+
+
+def _get_spotify_interface(interface_name: str):
+    """Return one interface from any active Spotify MPRIS service."""
     import dbus
 
     bus = dbus.SessionBus()
-    try:
-        proxy = bus.get_object(
-            "org.mpris.MediaPlayer2.spotify",
-            "/org/mpris/MediaPlayer2",
-        )
-        player = dbus.Interface(proxy, "org.mpris.MediaPlayer2.Player")
-        return player
-    except dbus.exceptions.DBusException:
-        # Try with flatpak instance name
+    for service in _spotify_mpris_service_names(bus):
         try:
-            proxy = bus.get_object(
-                "org.mpris.MediaPlayer2.spotify_player",
-                "/org/mpris/MediaPlayer2",
-            )
-            player = dbus.Interface(proxy, "org.mpris.MediaPlayer2.Player")
-            return player
+            proxy = bus.get_object(service, _MPRIS_OBJECT_PATH)
+            return dbus.Interface(proxy, interface_name)
         except dbus.exceptions.DBusException:
-            return None
+            continue
+    return None
+
+
+def _get_spotify_dbus():
+    """Get the Spotify D-Bus MPRIS2 player interface."""
+    return _get_spotify_interface(_MPRIS_PLAYER_INTERFACE)
 
 
 def _get_spotify_properties():
     """Get the Spotify D-Bus properties interface."""
-    import dbus
+    return _get_spotify_interface(_MPRIS_PROPERTIES_INTERFACE)
 
-    bus = dbus.SessionBus()
-    for service in ("org.mpris.MediaPlayer2.spotify", "org.mpris.MediaPlayer2.spotify_player"):
-        try:
-            proxy = bus.get_object(service, "/org/mpris/MediaPlayer2")
-            return dbus.Interface(proxy, "org.freedesktop.DBus.Properties")
-        except dbus.exceptions.DBusException:
-            continue
-    return None
+
+def _wait_for_spotify_dbus(timeout_seconds: float = 6.0, poll_interval: float = 0.25):
+    """Wait briefly for Spotify to publish its MPRIS service after launch."""
+    deadline = time.monotonic() + max(0.0, timeout_seconds)
+    while True:
+        player = _get_spotify_dbus()
+        if player is not None:
+            return player
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        time.sleep(min(poll_interval, remaining))
+
+
+def _linux_uri_fallback_result(uri: str, primary_backend: str, reason: str) -> dict:
+    """Try Fedora's native URI handler without claiming playback succeeded."""
+    fallback = open_native_target(
+        uri,
+        platform_name="linux",
+        allowed_uri_schemes={"spotify"},
+    )
+    if fallback.ok:
+        return {
+            "success": True,
+            "backend": fallback.backend,
+            "primary_backend": primary_backend,
+            "supported": True,
+            "capability": "uri-launch-fallback",
+            "launch_requested": True,
+            "playback_confirmed": False,
+            "message": (
+                f"{reason} Linux accepted a native URI launch request for {uri}; "
+                "playback was not verified."
+            ),
+            "uri": uri,
+        }
+    return {
+        "error": (
+            f"{reason} The Fedora/Linux native URI fallback was not accepted."
+        ),
+        "backend": primary_backend,
+        "fallback_backend": fallback.backend,
+        "supported": False,
+    }
 
 
 # ── URI helpers ───────────────────────────────────────────────────────
@@ -307,7 +386,7 @@ def spotify_play(query: str) -> str:
                     "supported": False,
                 })
             try:
-                player = _get_spotify_dbus()
+                player = _wait_for_spotify_dbus()
             except (ImportError, ModuleNotFoundError):
                 return json.dumps({
                     "error": "Spotify playback control requires dbus-python on Linux.",
@@ -315,21 +394,21 @@ def spotify_play(query: str) -> str:
                     "supported": False,
                     "missing_dependency": "dbus-python",
                 })
-            except Exception as exc:
-                return json.dumps({
-                    "error": f"The Fedora/Linux MPRIS session bus is unavailable: {exc}",
-                    "backend": backend,
-                    "supported": False,
-                })
+            except Exception:
+                return json.dumps(_linux_uri_fallback_result(
+                    uri,
+                    backend,
+                    "The Fedora/Linux MPRIS session bus could not be reached.",
+                ))
             if player:
                 try:
                     player.OpenUri(uri)
-                except Exception as exc:
-                    return json.dumps({
-                        "error": f"Spotify rejected the MPRIS playback request: {exc}",
-                        "backend": backend,
-                        "supported": True,
-                    })
+                except Exception:
+                    return json.dumps(_linux_uri_fallback_result(
+                        uri,
+                        backend,
+                        "Spotify did not accept the MPRIS playback request.",
+                    ))
 
                 time.sleep(1)
                 # Metadata confirms playback when available, but its absence
@@ -369,11 +448,15 @@ def spotify_play(query: str) -> str:
                     "uri": uri,
                 })
 
-            return json.dumps({
-                "error": "Could not connect to Spotify via the Fedora/Linux MPRIS D-Bus backend.",
-                "backend": backend,
-                "supported": False,
-            })
+            # A Spotify package can have a working desktop URI handler while
+            # its MPRIS service is unavailable (or hidden by a package
+            # sandbox). Preserve Fedora's native desktop path as a truthful,
+            # unconfirmed fallback instead of reporting a total failure.
+            return json.dumps(_linux_uri_fallback_result(
+                uri,
+                backend,
+                "Spotify did not publish an MPRIS service.",
+            ))
 
         return json.dumps({
             "error": "Spotify control is not supported on this platform.",

@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 import json
+import math
 from collections import defaultdict, deque
 from typing import Any
 
 
 CAUSAL_RELATIONS = {"causes", "enables", "increases", "decreases", "prevents", "mitigates"}
 NEGATIVE_RELATIONS = {"decreases", "prevents", "mitigates", "contradicts", "inhibits"}
+MAX_INFERRED_PATHS = 250
+MAX_TRAVERSAL_STATES = 20_000
+MAX_IDENTIFIER_CHARS = 200
+MAX_LABEL_CHARS = 2_000
 
 
 def _json(value: Any) -> str:
@@ -28,6 +33,8 @@ def knowledge_graph_builder(
     """
     if not isinstance(concepts, list) or not isinstance(relationships, list):
         return _json({"error": "concepts and relationships must be arrays"})
+    if query is not None and not isinstance(query, dict):
+        return _json({"error": "query must be an object"})
     if len(concepts) > 500 or len(relationships) > 3000:
         return _json({"error": "Graph exceeds the 500-concept/3000-relationship safety limit"})
 
@@ -40,16 +47,19 @@ def knowledge_graph_builder(
         node_id = str(concept.get("id", "")).strip()
         if not node_id:
             errors.append(f"concepts[{index}] is missing id")
+        elif len(node_id) > MAX_IDENTIFIER_CHARS or any(ord(char) < 32 for char in node_id):
+            errors.append(f"concepts[{index}] id is invalid or exceeds {MAX_IDENTIFIER_CHARS} characters")
         elif node_id in nodes:
             errors.append(f"Duplicate concept id: {node_id}")
         else:
             nodes[node_id] = {
                 "id": node_id,
-                "label": str(concept.get("label") or node_id),
+                "label": str(concept.get("label") or node_id)[:MAX_LABEL_CHARS],
                 "attributes": concept.get("attributes", {}),
             }
 
     edges: list[dict] = []
+    edge_ids: set[str] = set()
     adjacency: dict[str, list[dict]] = defaultdict(list)
     reverse: dict[str, list[dict]] = defaultdict(list)
     signatures: dict[tuple[str, str], set[str]] = defaultdict(set)
@@ -60,15 +70,33 @@ def knowledge_graph_builder(
         source = str(relation.get("source", "")).strip()
         target = str(relation.get("target", "")).strip()
         relation_type = str(relation.get("type", "related_to")).strip().lower()
+        edge_id = str(relation.get("id") or f"r{index + 1}").strip()
         if source not in nodes or target not in nodes:
             errors.append(f"relationships[{index}] references an unknown concept")
             continue
+        if not relation_type:
+            errors.append(f"relationships[{index}] type cannot be empty")
+            continue
+        if not edge_id:
+            errors.append(f"relationships[{index}] id cannot be empty")
+            continue
+        if len(edge_id) > MAX_IDENTIFIER_CHARS or any(ord(char) < 32 for char in edge_id):
+            errors.append(f"relationships[{index}] id is invalid or exceeds {MAX_IDENTIFIER_CHARS} characters")
+            continue
+        if edge_id in edge_ids:
+            errors.append(f"Duplicate relationship id: {edge_id}")
+            continue
         try:
-            weight = max(0.0, min(1.0, float(relation.get("weight", 1.0))))
-        except (TypeError, ValueError):
-            weight = 1.0
+            weight = float(relation.get("weight", 1.0))
+        except (TypeError, ValueError, OverflowError):
+            errors.append(f"relationships[{index}] weight must be numeric")
+            continue
+        if not math.isfinite(weight) or not 0.0 <= weight <= 1.0:
+            errors.append(f"relationships[{index}] weight must be finite and between 0 and 1")
+            continue
+        edge_ids.add(edge_id)
         edge = {
-            "id": str(relation.get("id") or f"r{index + 1}"),
+            "id": edge_id,
             "source": source,
             "target": target,
             "type": relation_type,
@@ -83,21 +111,38 @@ def knowledge_graph_builder(
     if errors:
         return _json({"error": "Invalid graph", "details": errors})
 
-    depth_limit = max(1, min(int(max_depth), 8))
+    try:
+        depth_limit = max(1, min(int(max_depth), 8))
+    except (TypeError, ValueError, OverflowError):
+        return _json({"error": "max_depth must be an integer"})
     start = str((query or {}).get("source", "")).strip() or None
     goal = str((query or {}).get("target", "")).strip() or None
-    allowed_types = set((query or {}).get("relation_types") or CAUSAL_RELATIONS)
+    raw_types = (query or {}).get("relation_types")
+    if raw_types is not None and not isinstance(raw_types, list):
+        return _json({"error": "query.relation_types must be an array"})
+    if raw_types is not None and len(raw_types) > 100:
+        return _json({"error": "query.relation_types exceeds the 100-item limit"})
+    allowed_types = {
+        str(value).strip().lower()
+        for value in (raw_types or CAUSAL_RELATIONS)
+        if str(value).strip()
+    }
+    if not allowed_types:
+        return _json({"error": "query.relation_types cannot be empty"})
     if start and start not in nodes:
         return _json({"error": f"Unknown query source: {start}"})
     if goal and goal not in nodes:
         return _json({"error": f"Unknown query target: {goal}"})
 
     paths: list[dict] = []
+    traversal_states = 0
+    traversal_truncated = False
     origins = [start] if start else list(nodes)
     for origin in origins:
         queue = deque([(origin, [], {origin})])
-        while queue and len(paths) < 250:
+        while queue and len(paths) < MAX_INFERRED_PATHS and traversal_states < MAX_TRAVERSAL_STATES:
             current, path, visited = queue.popleft()
+            traversal_states += 1
             if len(path) >= depth_limit:
                 continue
             for edge in adjacency[current]:
@@ -115,6 +160,13 @@ def knowledge_graph_builder(
                         "path": [{"edge": e["id"], "from": e["source"], "type": e["type"], "to": e["target"]} for e in new_path],
                     })
                 queue.append((destination, new_path, visited | {destination}))
+        if queue and (
+            traversal_states >= MAX_TRAVERSAL_STATES
+            or len(paths) >= MAX_INFERRED_PATHS
+        ):
+            traversal_truncated = True
+        if len(paths) >= MAX_INFERRED_PATHS or traversal_states >= MAX_TRAVERSAL_STATES:
+            break
 
     contradictions = []
     for (source, target), types in signatures.items():
@@ -153,9 +205,15 @@ def knowledge_graph_builder(
         "graph": {"concepts": list(nodes.values()), "relationships": edges},
         "analysis": {
             "inferred_paths": paths,
+            "traversal_truncated": traversal_truncated,
             "contradictions": contradictions,
             "potential_feedback_cycles": cycles,
             "central_concepts": centrality[:10],
         },
-        "limits": {"max_depth": depth_limit, "path_limit": 250},
+        "limits": {
+            "max_depth": depth_limit,
+            "path_limit": MAX_INFERRED_PATHS,
+            "traversal_state_limit": MAX_TRAVERSAL_STATES,
+            "traversal_states": traversal_states,
+        },
     })

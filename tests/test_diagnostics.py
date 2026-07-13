@@ -37,6 +37,21 @@ class DiagnosticsTests(unittest.TestCase):
         self.assertTrue(payload["ok"])
         self.assertFalse(payload["dependencies"]["dbus-python"])
 
+    def test_optional_dependencies_reports_complete_google_oauth_stack(self):
+        payload = diagnostics._check_optional_dependencies()
+
+        self.assertIn("cryptography", payload["dependencies"])
+        self.assertIn("google-api-python-client", payload["dependencies"])
+        self.assertIn("google-auth-oauthlib", payload["dependencies"])
+        self.assertIn("keyring", payload["dependencies"])
+
+    def test_optional_dependencies_reports_all_spreadsheet_backends(self):
+        payload = diagnostics._check_optional_dependencies()
+
+        self.assertIn("openpyxl", payload["dependencies"])
+        self.assertIn("xlrd", payload["dependencies"])
+        self.assertIn("xlwt", payload["dependencies"])
+
     def test_main_doctor_exit_codes(self):
         with patch.object(diagnostics, "run_diagnostics", return_value={"ok": True, "checks": {}, "failed_checks": [], "elapsed_seconds": 0}):
             self.assertEqual(diagnostics.main_doctor(as_json=True), 0)

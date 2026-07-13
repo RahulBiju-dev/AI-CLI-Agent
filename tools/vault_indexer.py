@@ -11,8 +11,6 @@ import threading
 from pathlib import Path
 from typing import Optional
 
-import chromadb
-
 from agent.cancellation import CancellationToken, OperationCancelled
 from agent.persistence import PersistenceError, atomic_write_json, read_json_preserved
 from agent.platform_runtime import get_runtime_paths
@@ -78,6 +76,14 @@ def sanitize_collection_name(name: str) -> str:
 
 def get_chroma_client(path: str | None = None):
     """Return a persistent Chroma client shared by index and search tools."""
+    try:
+        import chromadb
+    except ImportError as exc:
+        raise RuntimeError(
+            "ChromaDB is unavailable. Install the optional 'chromadb' package "
+            "to use vault and codebase indexing tools."
+        ) from exc
+
     persist_directory = path or CHROMA_DIR
     if hasattr(chromadb, "PersistentClient"):
         return chromadb.PersistentClient(path=persist_directory)

@@ -71,6 +71,8 @@ def _validate_public_http_url(url: str) -> str:
     url = str(url or "").strip()
     if not url:
         raise ValueError("url is required")
+    if len(url) > 4096 or any(ord(char) < 32 for char in url):
+        raise ValueError("URL is too long or contains control characters")
 
     parsed = urlparse(url)
     if not parsed.scheme:
@@ -83,6 +85,12 @@ def _validate_public_http_url(url: str) -> str:
         raise ValueError("URL must include a host")
     if parsed.username or parsed.password:
         raise ValueError("URLs with embedded credentials are not allowed")
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError(f"URL port is invalid: {exc}") from exc
+    if port is not None and not 1 <= port <= 65535:
+        raise ValueError("URL port is outside the valid range")
 
     host = parsed.hostname.strip("[]").lower()
     if host in {"localhost", "localhost.localdomain"} or host.endswith(".localhost"):
@@ -98,7 +106,7 @@ def _validate_public_http_url(url: str) -> str:
         addresses.add(literal_ip)
     else:
         try:
-            infos = socket.getaddrinfo(host, parsed.port or (443 if parsed.scheme == "https" else 80), type=socket.SOCK_STREAM)
+            infos = socket.getaddrinfo(host, port or (443 if parsed.scheme.lower() == "https" else 80), type=socket.SOCK_STREAM)
         except socket.gaierror as exc:
             raise ValueError(f"could not resolve host: {exc}") from exc
         for info in infos:
@@ -254,6 +262,7 @@ def _fetch(url: str) -> dict:
                     return {"error": "redirect response did not include a Location header", "url": safe_url}
                 current_url = urljoin(safe_url, location)
                 redirects.append(current_url)
+                response.close()
                 continue
             break
         else:

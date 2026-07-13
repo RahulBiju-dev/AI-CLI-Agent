@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import threading
@@ -25,6 +26,7 @@ DEFAULT_BATCH_SIZE = 16
 MAX_FILES = 5000
 MAX_FILE_BYTES = 2 * 1024 * 1024
 MAX_TOTAL_BYTES = 50 * 1024 * 1024
+MAX_SKIPPED_FILES = 1_000
 STATE_FILE = os.path.join(DATA_DIR, "codebase_indexes.json")
 _STATE_LOCK = threading.RLock()
 _INDEX_LOCK = threading.RLock()
@@ -110,16 +112,26 @@ def _discover_files(
             try:
                 size = path.stat().st_size
             except OSError as exc:
-                skipped.append({"file": str(path), "reason": str(exc)})
+                if len(skipped) < MAX_SKIPPED_FILES:
+                    skipped.append({"file": str(path), "reason": str(exc)})
                 continue
             if size > MAX_FILE_BYTES:
-                skipped.append({"file": str(path), "reason": "file exceeds 2 MiB"})
+                if len(skipped) < MAX_SKIPPED_FILES:
+                    skipped.append({"file": str(path), "reason": "file exceeds 2 MiB"})
                 continue
-            if len(files) >= MAX_FILES or total_bytes + size > MAX_TOTAL_BYTES:
-                skipped.append({"file": str(path), "reason": "repository indexing limit reached"})
+            if len(files) >= MAX_FILES:
+                if len(skipped) < MAX_SKIPPED_FILES:
+                    skipped.append({"file": str(path), "reason": "repository file limit reached"})
+                dirs[:] = []
+                break
+            if total_bytes + size > MAX_TOTAL_BYTES:
+                if len(skipped) < MAX_SKIPPED_FILES:
+                    skipped.append({"file": str(path), "reason": "repository byte limit reached"})
                 continue
             files.append(path)
             total_bytes += size
+        if len(files) >= MAX_FILES:
+            return files, skipped
     return files, skipped
 
 
@@ -310,7 +322,15 @@ def _index_repository(
         "indexed_files": len(records),
         "indexed_chunks": indexed_chunks,
     }
-    _save_state(state)
+    try:
+        _save_state(state)
+    except (OSError, PersistenceError) as exc:
+        return {
+            "error": f"The code index was updated, but refresh state could not be saved: {exc}",
+            "state_file": STATE_FILE,
+            "preserved": True,
+            "collection": collection_name,
+        }
     return {
         "refreshed": True,
         "refresh_reason": "forced or index older than 24 hours",
@@ -388,7 +408,15 @@ def _search(
     used = 0
     for rank, document in enumerate(documents, start=1):
         metadata = metadatas[rank - 1] if rank <= len(metadatas) else {}
+        metadata = metadata if isinstance(metadata, dict) else {}
         distance = distances[rank - 1] if rank <= len(distances) else None
+        try:
+            distance = float(distance) if distance is not None else None
+        except (TypeError, ValueError, OverflowError):
+            distance = None
+        if isinstance(distance, float) and not math.isfinite(distance):
+            distance = None
+        document = str(document or "")
         header = f"Source: {metadata.get('source', 'unknown')} | lines {metadata.get('line_start', '?')}-{metadata.get('line_end', '?')}"
         entry = f"{header}\n{document}\n---"
         remaining = max_chars - used
@@ -445,6 +473,9 @@ def codebase_indexer(
         return _json({"error": "action must be query, index, or status"})
     if query is not None and len(str(query)) > 4000:
         return _json({"error": "query exceeds the 4000-character limit"})
+    if not isinstance(model, str) or not model.strip() or len(model) > 200:
+        return _json({"error": "model must be a non-empty name of at most 200 characters"})
+    model = model.strip()
     if cancellation_token:
         cancellation_token.raise_if_cancelled()
 

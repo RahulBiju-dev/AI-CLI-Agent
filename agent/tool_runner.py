@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from enum import Enum
 import inspect
 import json
+import math
 import threading
 import time
 from typing import Callable, ContextManager, Iterable
@@ -182,6 +183,11 @@ def _validate_schema_value(value: object, schema: dict, path: str, errors: list[
         if isinstance(maximum, int) and len(value) > maximum:
             errors.append(f"{path} must be at most {maximum} character(s)")
     elif isinstance(value, (int, float)) and not isinstance(value, bool):
+        if isinstance(value, float) and not math.isfinite(value):
+            error = f"{path} must be finite"
+            if error not in errors:
+                errors.append(error)
+            return
         minimum = schema.get("minimum")
         maximum = schema.get("maximum")
         if isinstance(minimum, (int, float)) and value < minimum:
@@ -190,12 +196,44 @@ def _validate_schema_value(value: object, schema: dict, path: str, errors: list[
             errors.append(f"{path} must be at most {maximum}")
 
 
+def _validate_finite_numbers(
+    value: object,
+    path: str,
+    errors: list[str],
+    seen: set[int],
+    depth: int = 0,
+) -> None:
+    if isinstance(value, float) and not math.isfinite(value):
+        errors.append(f"{path} must be finite")
+        return
+    if not isinstance(value, (dict, list)):
+        return
+    if depth >= 100:
+        errors.append(f"{path} exceeds the maximum nesting depth")
+        return
+    identity = id(value)
+    if identity in seen:
+        errors.append(f"{path} contains a recursive value")
+        return
+    seen.add(identity)
+    try:
+        if isinstance(value, dict):
+            for key, child in value.items():
+                _validate_finite_numbers(child, f"{path}.{key}", errors, seen, depth + 1)
+        else:
+            for index, child in enumerate(value):
+                _validate_finite_numbers(child, f"{path}[{index}]", errors, seen, depth + 1)
+    finally:
+        seen.remove(identity)
+
+
 def validate_tool_arguments(name: str, arguments: dict) -> list[str]:
     """Validate model-provided arguments against the registry's JSON schema subset."""
     schema = TOOL_SCHEMA_BY_NAME.get(name)
     if not isinstance(schema, dict):
         return []
     errors: list[str] = []
+    _validate_finite_numbers(arguments, "arguments", errors, set())
     _validate_schema_value(arguments, schema, "arguments", errors)
     return errors
 
@@ -247,6 +285,12 @@ def _handler_result_status(content: str) -> ToolResultStatus:
     try:
         payload = json.loads(content)
     except (TypeError, json.JSONDecodeError):
+        # A few older tools still return human-readable errors rather than
+        # JSON. Do not report those as successful executions or allow a later
+        # side effect to proceed as though the call succeeded.
+        normalized = content.lstrip().casefold() if isinstance(content, str) else ""
+        if normalized.startswith(("error:", "error ")):
+            return ToolResultStatus.ERROR
         return ToolResultStatus.SUCCESS
     if isinstance(payload, dict) and (
         payload.get("ok") is False or bool(payload.get("error"))

@@ -10,6 +10,7 @@ passed directly to the LLM so it knows what tools are available and how to call 
 from __future__ import annotations
 
 import importlib
+import inspect
 import sys
 from dataclasses import dataclass, replace
 from typing import Callable
@@ -59,6 +60,7 @@ TOOL_SCHEMAS: list[dict] = [
                 "properties": {
                     "timezone": {
                         "type": "string",
+                        "maxLength": 255,
                         "description": "Optional IANA timezone such as Asia/Kolkata, Europe/London, or America/New_York. Omit for the computer's local timezone."
                     }
                 }
@@ -120,6 +122,8 @@ TOOL_SCHEMAS: list[dict] = [
                 "properties": {
                     "query": {
                         "type": "string",
+                        "minLength": 1,
+                        "maxLength": 1000,
                         "description": "The search query.",
                     },
                     "difficulty": {
@@ -141,10 +145,14 @@ TOOL_SCHEMAS: list[dict] = [
                     },
                     "max_pages": {
                         "type": "integer",
+                        "minimum": 1,
+                        "maximum": 5,
                         "description": "Optional number of top results to scrape when include_content=true (1-5). Defaults by difficulty.",
                     },
                     "max_chars_per_page": {
                         "type": "integer",
+                        "minimum": 1000,
+                        "maximum": 20000,
                         "description": "Maximum extracted text characters per scraped page when include_content=true (1000-20000, default 6000).",
                     },
                 },
@@ -165,10 +173,14 @@ TOOL_SCHEMAS: list[dict] = [
                 "properties": {
                     "url": {
                         "type": "string",
+                        "minLength": 1,
+                        "maxLength": 4096,
                         "description": "Public http/https URL to read. Bare domains are treated as https:// domains.",
                     },
                     "max_chars": {
                         "type": "integer",
+                        "minimum": 1000,
+                        "maximum": 50000,
                         "description": "Maximum extracted text characters to return (1000-50000, default 20000).",
                     },
                     "include_links": {
@@ -684,10 +696,19 @@ TOOL_SCHEMAS.extend([
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "concepts": {"type": "array", "items": {"type": "object"}, "description": "Concept objects with id, optional label, and optional attributes."},
-                    "relationships": {"type": "array", "items": {"type": "object"}, "description": "Edges with source, target, type, optional weight (0-1), and evidence."},
-                    "query": {"type": "object", "description": "Optional source, target, and relation_types filter."},
-                    "max_depth": {"type": "integer", "description": "Maximum inference path length (1-8, default 4)."}
+                    "concepts": {"type": "array", "maxItems": 500, "items": {"type": "object"}, "description": "Concept objects with id, optional label, and optional attributes."},
+                    "relationships": {"type": "array", "maxItems": 3000, "items": {"type": "object"}, "description": "Edges with source, target, type, optional weight (0-1), and evidence."},
+                    "query": {
+                        "type": "object",
+                        "properties": {
+                            "source": {"type": "string"},
+                            "target": {"type": "string"},
+                            "relation_types": {"type": "array", "maxItems": 100, "items": {"type": "string"}}
+                        },
+                        "additionalProperties": False,
+                        "description": "Optional source, target, and relation_types filter."
+                    },
+                    "max_depth": {"type": "integer", "minimum": 1, "maximum": 8, "description": "Maximum inference path length (1-8, default 4)."}
                 },
                 "required": ["concepts", "relationships"]
             }
@@ -703,10 +724,11 @@ TOOL_SCHEMAS.extend([
                 "properties": {
                     "variables": {"type": "object", "description": "Initial numeric state keyed by variable name."},
                     "equations": {"type": "object", "description": "Safe arithmetic expression for each updated variable; may use step, time, dt, normal(), and uniform()."},
-                    "steps": {"type": "integer"}, "dt": {"type": "number"},
+                    "steps": {"type": "integer", "minimum": 1, "maximum": 10000},
+                    "dt": {"type": "number", "minimum": 0.000000001, "maximum": 1000000},
                     "mode": {"type": "string", "enum": ["recurrence", "euler"]},
-                    "scenarios": {"type": "array", "items": {"type": "object"}, "description": "Named scenarios containing variable overrides."},
-                    "trials": {"type": "integer", "description": "Monte Carlo trials (1-1000)."},
+                    "scenarios": {"type": "array", "maxItems": 20, "items": {"type": "object"}, "description": "Named scenarios containing variable overrides."},
+                    "trials": {"type": "integer", "minimum": 1, "maximum": 1000, "description": "Monte Carlo trials (1-1000)."},
                     "seed": {"type": "integer", "description": "Optional reproducibility seed."}
                 },
                 "required": ["variables", "equations"]
@@ -721,10 +743,44 @@ TOOL_SCHEMAS.extend([
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "request": {"type": "object", "description": "HTTP method, url, headers, params, json/data body, timeout, and response limit."},
-                    "auth": {"type": "object", "description": "Auth config. Use environment-variable names, never literal secrets. Types: none, bearer, api_key, basic, oauth2_client_credentials."},
-                    "retry": {"type": "object", "description": "max_attempts (up to 6) and base_delay."},
-                    "alternative_endpoints": {"type": "array", "items": {"type": "string"}},
+                    "request": {
+                        "type": "object",
+                        "properties": {
+                            "method": {"type": "string", "enum": ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"]},
+                            "url": {"type": "string", "minLength": 1, "maxLength": 4096},
+                            "headers": {"type": "object"},
+                            "params": {}, "json": {}, "data": {},
+                            "timeout": {"type": "number", "minimum": 0.5, "maximum": 120},
+                            "max_response_chars": {"type": "integer", "minimum": 1000, "maximum": 100000},
+                            "allow_redirects": {"type": "boolean"}
+                        },
+                        "required": ["url"],
+                        "additionalProperties": False,
+                        "description": "HTTP method, url, headers, params, json/data body, timeout, and response limit."
+                    },
+                    "auth": {
+                        "type": "object",
+                        "properties": {
+                            "type": {"type": "string", "enum": ["none", "bearer", "api_key", "basic", "oauth2_client_credentials"]},
+                            "token_env": {"type": "string"}, "value_env": {"type": "string"},
+                            "header": {"type": "string"}, "username_env": {"type": "string"},
+                            "password_env": {"type": "string"}, "token_url": {"type": "string", "maxLength": 4096},
+                            "client_id_env": {"type": "string"}, "client_secret_env": {"type": "string"},
+                            "scope": {"type": "string"}
+                        },
+                        "additionalProperties": False,
+                        "description": "Auth config. Use environment-variable names, never literal secrets. Types: none, bearer, api_key, basic, oauth2_client_credentials."
+                    },
+                    "retry": {
+                        "type": "object",
+                        "properties": {
+                            "max_attempts": {"type": "integer", "minimum": 1, "maximum": 6},
+                            "base_delay": {"type": "number", "minimum": 0, "maximum": 10}
+                        },
+                        "additionalProperties": False,
+                        "description": "max_attempts (up to 6) and base_delay."
+                    },
+                    "alternative_endpoints": {"type": "array", "maxItems": 9, "items": {"type": "string", "maxLength": 4096}},
                     "documentation": {"type": "object", "description": "Optional OpenAPI-like base_url and paths map used to find non-deprecated alternatives."}
                 },
                 "required": ["request"]
@@ -739,10 +795,10 @@ TOOL_SCHEMAS.extend([
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "messages": {"type": "array", "items": {"type": "object"}},
-                    "target_tokens": {"type": "integer"},
-                    "preserve_recent": {"type": "integer"},
-                    "critical_terms": {"type": "array", "items": {"type": "string"}}
+                    "messages": {"type": "array", "maxItems": 10000, "items": {"type": "object"}},
+                    "target_tokens": {"type": "integer", "minimum": 256, "maximum": 100000},
+                    "preserve_recent": {"type": "integer", "minimum": 0, "maximum": 50},
+                    "critical_terms": {"type": "array", "maxItems": 100, "items": {"type": "string", "maxLength": 200}}
                 },
                 "required": ["messages"]
             }
@@ -757,8 +813,8 @@ TOOL_SCHEMAS.extend([
                 "type": "object",
                 "properties": {
                     "conclusion": {"type": "string"},
-                    "steps": {"type": "array", "items": {"type": "object"}, "description": "Steps with id, claim, depends_on, evidence_ids, assumption, and confidence."},
-                    "evidence": {"type": "array", "items": {"type": "object"}, "description": "Evidence records with stable id and source."}
+                    "steps": {"type": "array", "maxItems": 500, "items": {"type": "object"}, "description": "Steps with id, claim, depends_on, evidence_ids, assumption, and confidence."},
+                    "evidence": {"type": "array", "maxItems": 1000, "items": {"type": "object"}, "description": "Evidence records with stable id and source."}
                 },
                 "required": ["conclusion", "steps"]
             }
@@ -921,7 +977,7 @@ TOOL_METADATA: dict[str, ToolMetadata] = {
     ),
     "spreadsheet": _metadata(
         "spreadsheet", read_only=False, default_timeout_seconds=120, max_output_chars=30_000,
-        optional_dependencies=("openpyxl",),
+        optional_dependencies=("openpyxl", "xlrd", "xlwt"),
     ),
     "web_search": _metadata(
         "web_search", parallel_safe=True, network_bound=True,
@@ -931,7 +987,7 @@ TOOL_METADATA: dict[str, ToolMetadata] = {
     "web_scrape": _metadata(
         "web_scrape", parallel_safe=True, network_bound=True,
         requires_temporal_preflight=True, default_timeout_seconds=90, max_output_chars=50_000,
-        optional_dependencies=("requests", "beautifulsoup4"),
+        optional_dependencies=("requests",),
     ),
     "read_document": _metadata(
         "read_document", cpu_heavy=True, default_timeout_seconds=120, max_output_chars=20_000,
@@ -985,7 +1041,9 @@ TOOL_METADATA: dict[str, ToolMetadata] = {
     "google_workspace": _metadata(
         "google_workspace", read_only=False, network_bound=True,
         requires_temporal_preflight=True, default_timeout_seconds=120, max_output_chars=25_000,
-        optional_dependencies=("google-api-python-client", "cryptography"),
+        optional_dependencies=(
+            "google-api-python-client", "google-auth-oauthlib", "cryptography", "keyring",
+        ),
     ),
     "codebase_indexer": _metadata(
         "codebase_indexer", read_only=False, cpu_heavy=True, gpu_heavy=True,
@@ -1054,6 +1112,17 @@ TOOL_METADATA: dict[str, ToolMetadata] = {
 }
 
 
+# Tool handlers are keyword-bound callables. Closing each model-visible root
+# schema ensures invented parameter names are rejected before they reach a
+# handler as an opaque Python ``TypeError``. Nested free-form objects retain
+# their explicitly declared JSON-schema behavior.
+for _entry in TOOL_SCHEMAS:
+    _function = _entry.get("function") if isinstance(_entry, dict) else None
+    _parameters = _function.get("parameters") if isinstance(_function, dict) else None
+    if isinstance(_parameters, dict) and _parameters.get("type") == "object":
+        _parameters.setdefault("additionalProperties", False)
+
+
 TOOL_SCHEMA_BY_NAME: dict[str, dict] = {
     str(entry.get("function", {}).get("name")): entry.get("function", {}).get("parameters", {})
     for entry in TOOL_SCHEMAS
@@ -1075,8 +1144,14 @@ def get_tool_metadata(name: str, arguments: dict | None = None) -> ToolMetadata 
             parallel_safe=True,
             idempotent=True,
         )
+    if name == "google_workspace" and action == "authorize":
+        # The local OAuth listener stops itself after 240 seconds. Leave time
+        # for the token exchange and atomic encrypted save before the runner's
+        # non-cooperative timeout is reached.
+        return replace(metadata, default_timeout_seconds=300)
     if name == "google_workspace" and action in {
-        "status", "list_calendars", "list_events", "list_tasks", "list_task_lists"
+        "status", "list_calendars", "list_events", "list_birthdays",
+        "list_tasks", "list_task_lists",
     }:
         return replace(
             metadata,
@@ -1092,6 +1167,18 @@ def get_tool_metadata(name: str, arguments: dict | None = None) -> ToolMetadata 
             side_effecting=False,
             parallel_safe=False,
             idempotent=True,
+        )
+    if action == "status" and name in {
+        "build_vault_notes_pdf", "codebase_indexer", "index_vault"
+    }:
+        return replace(
+            metadata,
+            read_only=True,
+            side_effecting=False,
+            parallel_safe=True,
+            idempotent=True,
+            cpu_heavy=False,
+            gpu_heavy=False,
         )
     return metadata
 
@@ -1115,6 +1202,61 @@ def validate_tool_registry() -> list[str]:
             f"Model schema/metadata mismatch: schemas_only={sorted(schema_names - exposed_metadata)}, "
             f"metadata_only={sorted(exposed_metadata - schema_names)}"
         )
+    schema_name_list = [
+        str(entry.get("function", {}).get("name"))
+        for entry in TOOL_SCHEMAS
+        if entry.get("type") == "function" and entry.get("function", {}).get("name")
+    ]
+    duplicate_schema_names = sorted({
+        name for name in schema_name_list if schema_name_list.count(name) > 1
+    })
+    if duplicate_schema_names:
+        errors.append(f"Duplicate model tool schemas: {duplicate_schema_names}")
+    for name, schema in TOOL_SCHEMA_BY_NAME.items():
+        properties = schema.get("properties")
+        if schema.get("type") != "object" or not isinstance(properties, dict):
+            errors.append(f"{name}: parameters must be an object schema with properties")
+            continue
+        if schema.get("additionalProperties") is not False:
+            errors.append(f"{name}: root parameters must reject additional properties")
+        required = schema.get("required", [])
+        if not isinstance(required, list) or any(item not in properties for item in required):
+            errors.append(f"{name}: required parameters must be a subset of properties")
+        handler = TOOL_DISPATCH.get(name)
+        if callable(handler):
+            try:
+                signature = inspect.signature(handler)
+            except (TypeError, ValueError):
+                signature = None
+            if signature is not None:
+                keyword_parameters = {
+                    parameter_name: parameter
+                    for parameter_name, parameter in signature.parameters.items()
+                    if parameter_name != "cancellation_token"
+                    and parameter.kind in {
+                        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                        inspect.Parameter.KEYWORD_ONLY,
+                    }
+                }
+                accepts_extras = any(
+                    parameter.kind is inspect.Parameter.VAR_KEYWORD
+                    for parameter in signature.parameters.values()
+                )
+                unknown_schema_parameters = sorted(set(properties) - set(keyword_parameters))
+                if unknown_schema_parameters and not accepts_extras:
+                    errors.append(
+                        f"{name}: schema parameters are not accepted by the handler: {unknown_schema_parameters}"
+                    )
+                required_handler_parameters = {
+                    parameter_name
+                    for parameter_name, parameter in keyword_parameters.items()
+                    if parameter.default is inspect.Parameter.empty
+                }
+                missing_required_schema = sorted(required_handler_parameters - set(required))
+                if missing_required_schema:
+                    errors.append(
+                        f"{name}: required handler parameters are not required by the schema: {missing_required_schema}"
+                    )
     for name, handler in TOOL_DISPATCH.items():
         if not callable(handler):
             errors.append(f"Dispatch handler for '{name}' is not callable")

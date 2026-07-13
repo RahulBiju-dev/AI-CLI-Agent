@@ -203,6 +203,36 @@ class TestContextBudget(unittest.TestCase):
         self.assertEqual(tool_result["content"], "result " * 4_000)
         self.assertGreaterEqual(options["num_predict"], 96)
 
+    def test_tool_continuation_selection_uses_original_request_not_boilerplate(self):
+        messages = [
+            {"role": "user", "content": "Summarize the latest AI news"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "function": {"name": "web_search", "arguments": {"query": "AI news"}}
+                }],
+            },
+            {
+                "role": "user",
+                "content": TOOL_CONTINUATION_PROMPT.format(
+                    user_input="Summarize the latest AI news"
+                ),
+            },
+        ]
+
+        selected = tool_schemas_for_model(
+            messages,
+            {"runtime_profile": "low-vram", "options": {}},
+            TOOL_SCHEMAS,
+        )
+        names = {item["function"]["name"] for item in selected}
+
+        self.assertIn("web_search", names)
+        self.assertIn("web_scrape", names)
+        self.assertNotIn("api_orchestrator", names)
+        self.assertNotIn("context_memory_optimizer", names)
+
     def test_num_predict_is_capped_to_remaining_context(self):
         messages = [{"role": "user", "content": "x" * 5000}]
 

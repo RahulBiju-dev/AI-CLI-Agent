@@ -375,6 +375,43 @@ _TOOL_KEYWORD_HINTS = {
     "reasoning_chain_debugger": "audit claim evidence reasoning confidence graph",
     "automated_routine_executor": "routine workflow recurring trigger automation",
 }
+_TOOL_COMPANIONS = {
+    "web_search": ("web_scrape",),
+    "index_vault": ("vault_search", "vault_read"),
+    "vault_search": ("vault_read",),
+}
+
+
+def _tool_selection_text(messages: list[dict]) -> str:
+    """Use the original request, not generic continuation boilerplate."""
+    latest_user_text = next(
+        (
+            str(message.get("content", ""))
+            for message in reversed(messages)
+            if isinstance(message, dict) and message.get("role") == "user"
+        ),
+        "",
+    )
+    marker = "\n\nOriginal user request:\n"
+    if latest_user_text.startswith((
+        "Continue the current user request using the tool result messages",
+        "The previous response reached the model's per-call output limit",
+    )) and marker in latest_user_text:
+        return latest_user_text.split(marker, 1)[1]
+    return latest_user_text
+
+
+def _recent_called_tool_names(messages: list[dict]) -> list[str]:
+    names: list[str] = []
+    for message in messages:
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        for call in message.get("tool_calls") or []:
+            function = call.get("function") if isinstance(call, dict) else None
+            name = str((function or {}).get("name") or "").strip()
+            if name and name not in names:
+                names.append(name)
+    return names[-4:]
 
 
 def select_tool_schemas(
@@ -395,14 +432,7 @@ def select_tool_schemas(
     if len(tools) <= maximum:
         return list(tools)
 
-    recent_user_text = next(
-        (
-            str(message.get("content", ""))
-            for message in reversed(messages)
-            if isinstance(message, dict) and message.get("role") == "user"
-        ),
-        "",
-    ).casefold()
+    recent_user_text = _tool_selection_text(messages).casefold()
     normalized_text = re.sub(r"[^\w]+", " ", recent_user_text, flags=re.UNICODE)
     request_tokens = {
         token for token in normalized_text.split()
@@ -441,6 +471,12 @@ def select_tool_schemas(
     if not chosen:
         chosen.extend(_DEFAULT_TOOL_NAMES)
     else:
+        for called_name in _recent_called_tool_names(messages):
+            if called_name in by_name and called_name not in chosen:
+                chosen.append(called_name)
+            for companion in _TOOL_COMPANIONS.get(called_name, ()):
+                if companion in by_name and companion not in chosen:
+                    chosen.append(companion)
         for name in _DEFAULT_TOOL_NAMES:
             if name not in chosen:
                 chosen.append(name)

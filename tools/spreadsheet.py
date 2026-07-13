@@ -8,6 +8,7 @@ import math
 import os
 import re
 import tempfile
+import zipfile
 from dataclasses import dataclass
 from datetime import date, datetime, time
 from pathlib import Path
@@ -25,6 +26,8 @@ MAX_READ_COLUMNS = 100
 MAX_SCAN_CELLS = 200_000
 MAX_QUERY_MATCHES = 50
 MAX_CSV_CELLS = 200_000
+MAX_XLSX_EXPANDED_BYTES = 250 * 1024 * 1024
+MAX_XLSX_ARCHIVE_ENTRIES = 20_000
 CSV_DELIMITERS = {",", ";", "\t", "|"}
 _CELL_RANGE_RE = re.compile(r"^([A-Za-z]+)([1-9]\d*)(?::([A-Za-z]+)([1-9]\d*))?$")
 _INVALID_SHEET_CHARS = re.compile(r"[\\/*?:\[\]]")
@@ -81,7 +84,10 @@ def _column_letters(number: int) -> str:
 def _parse_range(cell_range: str | None, sheet: _Sheet) -> tuple[int, int, int, int]:
     if not cell_range:
         return 1, 1, sheet.row_count, sheet.column_count
-    match = _CELL_RANGE_RE.fullmatch(str(cell_range).strip())
+    raw_range = str(cell_range).strip()
+    if len(raw_range) > 64:
+        raise ValueError("cell_range exceeds the 64-character limit")
+    match = _CELL_RANGE_RE.fullmatch(raw_range)
     if not match:
         raise ValueError("cell_range must use A1 or A1:D20 notation")
     start_column = _column_number(match.group(1))
@@ -133,6 +139,15 @@ def _matrix(
 
 
 def _open_xlsx(file_path: Path, data_only: bool) -> tuple[list[_Sheet], Callable[[], None]]:
+    try:
+        with zipfile.ZipFile(file_path) as archive:
+            entries = archive.infolist()
+            if len(entries) > MAX_XLSX_ARCHIVE_ENTRIES:
+                raise ValueError("XLSX archive contains too many entries")
+            if sum(item.file_size for item in entries) > MAX_XLSX_EXPANDED_BYTES:
+                raise ValueError("XLSX expanded content exceeds the 250 MiB safety limit")
+    except zipfile.BadZipFile as exc:
+        raise ValueError("XLSX file is not a valid Office archive") from exc
     try:
         import openpyxl
     except ImportError as exc:

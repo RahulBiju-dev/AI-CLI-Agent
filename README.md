@@ -272,7 +272,9 @@ The `google_workspace` tool exposes Google Calendar and Google Tasks as two user
 
 Event times accept RFC 3339 date-times or `YYYY-MM-DD` for all-day events. Task due dates accept either form; Google Tasks retains the date portion. Calendar IDs default to `primary`, while task-list IDs default to `@default`. Selene sends attendee updates when an event with guests is created, changed, or deleted.
 
-On first use, Selene opens Google's Desktop OAuth flow in the browser. The OAuth client configuration, access token, and refresh token are stored as AES-GCM ciphertext in `~/.selene-agent/google_oauth.enc` (or `$SELENE_DATA_DIR/google_oauth.enc`). The encryption key is kept in the OS keyring where available, with a mode-`0600` local fallback for headless systems. Refreshed tokens are immediately re-encrypted; credential values are redacted from tool errors.
+On first use, Selene opens Google's Desktop OAuth flow in the browser. The OAuth client configuration, access token, and refresh token are stored as AES-GCM ciphertext in `~/.selene-agent/google_oauth.enc` (or `$SELENE_DATA_DIR/google_oauth.enc`). Its encryption key has an owner-only mode-`0600` recovery copy beside the ciphertext and is mirrored to the OS keyring when that backend is available, so a locked or unavailable Linux keyring cannot strand future tokens. Refreshed tokens are immediately re-encrypted; credential values are redacted from tool errors.
+
+The `status` action checks local decryptability without contacting Google or refreshing a token. If an older keyring-only credential cannot be unlocked, Selene preserves the encrypted file and asks for one explicit `authorize` flow before replacing it.
 
 Setup:
 
@@ -299,7 +301,7 @@ The advanced tools are deliberately bounded:
 - Memory optimisation is extractive and reports before/after token estimates. Automatic background compaction uses the same optimizer after generating its factual summary.
 - The reasoning debugger audits supplied claims, dependencies, assumptions, and evidence IDs. It does not expose private model chain-of-thought; it produces an accountable evidence graph and Mermaid diagram.
 - Routines live in `~/.selene-agent/routines.json` (or `$SELENE_DATA_DIR/routines.json`) so they persist across conversations, application restarts, and upgrades. Existing routines from `.selene/routines.json` are imported automatically. Routine actions can invoke registered agent tools; app actions are dispatched through `app_launcher.py`, including batched `launch_apps` calls. Use `action=show` (or `dry_run=true`) for the required preview of command, URL, and general tool runs, then use `action=run` with `confirmed=true` after user approval. App/delay-only routines can receive persistent approval when defined, allowing an exact saved trigger to run them later without another prompt. Commands use argument arrays with `shell=False` and remain in the project workspace.
-- Google Calendar and Tasks use a first-run Desktop OAuth browser flow. The downloaded client configuration and refresh token are then stored together as AES-GCM ciphertext at `~/.selene-agent/google_oauth.enc` (or under `$SELENE_DATA_DIR`). Selene keeps the encryption key in the OS keyring where available; headless systems fall back to a mode-`0600` key beside the ciphertext. The downloaded source JSON is never copied into the repository and can be deleted after authorization.
+- Google Calendar and Tasks use a bounded Desktop OAuth loopback flow. The downloaded client configuration and refresh token are stored together as AES-GCM ciphertext at `~/.selene-agent/google_oauth.enc` (or under `$SELENE_DATA_DIR`). A mode-`0600` local recovery key is mirrored to the OS keyring when available; unreadable legacy ciphertext is preserved until a successful explicit reauthorization. The downloaded source JSON is never copied into the repository and can be deleted after authorization.
 - App actions accept only installed application display names. Shells, terminals, paths, URLs, command flags, uninstallers, and arbitrary PATH binaries are rejected; all launches are detached and shell-free. On Windows, discovery uses bounded Start Menu `.lnk` resolution with target validation.
 
 Example simulation model:
@@ -432,7 +434,7 @@ Critical JSON (sessions, aliases, routines metadata, and similar) is written wit
 
 ### Spotify / PDF notes
 
-- **Fedora:** Spotify uses MPRIS over DBus (`dbus-python` is Linux-only in `requirements.txt`).
+- **Fedora:** Spotify discovers active and instance-qualified MPRIS players over DBus (`dbus-python` is Linux-only in `requirements.txt`) and briefly waits for startup registration. If MPRIS remains unavailable, Selene uses the native `gio` Spotify URI handler and reports playback as unverified.
 - **Windows:** Spotify uses a URI launch backend and never claims confirmed playback.
 - **PDF text** works with `pypdf` alone. **PDF-to-image** needs Poppler (`poppler-utils` on Fedora; set `POPPLER_PATH` / `SELENE_POPPLER_PATH` on Windows if needed). **PDF creation** uses `reportlab` from `requirements.txt`.
 - Optional packages (Google APIs, Chroma, vision/PDF image tooling, PDF writing, `dbus-python`) fail with capability errors for those features only — they must not block core import or startup.

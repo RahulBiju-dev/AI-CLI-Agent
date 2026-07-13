@@ -16,6 +16,7 @@ from agent.platform_runtime import get_runtime_paths
 from agent.persistence import atomic_write_json, atomic_write_text, read_json_preserved
 
 MAX_PDF_CONTENT_CHARS = 10_000_000
+MAX_PDF_TITLE_CHARS = 1_000
 EXPORTS_DIR = get_runtime_paths().data_dir / "vaults" / "exports"
 PDF_JOBS_DIR = get_runtime_paths().data_dir / "vaults" / ".pdf_jobs"
 NOTES_SOURCE_CHARS = 6000
@@ -37,6 +38,8 @@ def _resolve_output_path(file_path: str) -> Path:
     raw = str(file_path or "").strip()
     if not raw:
         raise ValueError("file_path is required")
+    if len(raw) > 4096 or "\0" in raw:
+        raise ValueError("file_path is invalid")
     requested = Path(raw).expanduser()
     if requested.suffix.lower() != ".pdf":
         requested = requested.with_suffix(".pdf")
@@ -222,6 +225,9 @@ def create_pdf(
     """Create a styled PDF atomically from Markdown-like text or a text file."""
     try:
         output = _resolve_output_path(file_path)
+        resolved_title = str(title or output.stem).strip()
+        if len(resolved_title) > MAX_PDF_TITLE_CHARS:
+            return _json({"error": f"PDF title exceeds the {MAX_PDF_TITLE_CHARS}-character limit"})
         if output.exists() and not overwrite:
             return _json({"error": f"PDF already exists: {output}", "overwrite_required": True})
         if output.exists() and overwrite and not confirmed:
@@ -241,11 +247,11 @@ def create_pdf(
         if len(value) > MAX_PDF_CONTENT_CHARS:
             return _json({"error": "PDF content exceeds the 10,000,000-character limit"})
 
-        _render_pdf(output, str(title or output.stem).strip(), value)
+        _render_pdf(output, resolved_title, value)
         return _json({
             "created": True,
             "file_path": str(output),
-            "title": str(title or output.stem).strip(),
+            "title": resolved_title,
             "input_characters": len(value),
             "bytes": output.stat().st_size,
         })
@@ -352,6 +358,8 @@ def _notes_job_paths(collection: str, source: str | None, output: Path) -> tuple
 
 def _parse_notes_cursor(value: str | int | None) -> tuple[int, int]:
     raw = str(value if value is not None else "0:0").strip()
+    if len(raw) > 100:
+        raise ValueError("cursor exceeds the 100-character limit")
     try:
         if ":" in raw:
             record, char = raw.split(":", 1)
@@ -492,6 +500,8 @@ def build_vault_notes_pdf(
         action = str(action or "build").strip().lower()
         if action not in {"build", "status"}:
             return _json({"error": "action must be build or status"})
+        if len(str(title or "")) > MAX_PDF_TITLE_CHARS:
+            return _json({"error": f"PDF title exceeds the {MAX_PDF_TITLE_CHARS}-character limit"})
         collection_name = resolve_vault_alias(collection)
         output = _resolve_output_path(file_path)
         job_dir, state_path = _notes_job_paths(collection_name, source, output)
@@ -564,10 +574,19 @@ def build_vault_notes_pdf(
             }
             atomic_write_json(state_path, state)
 
-        missing_sections = [
-            name for name in state.get("section_files", [])
-            if not (job_dir / str(name)).is_file()
-        ]
+        section_names = state.get("section_files", [])
+        if not isinstance(section_names, list) or any(
+            not isinstance(name, str)
+            or Path(name).name != name
+            or not name.endswith(".md")
+            for name in section_names
+        ):
+            return _json({
+                "error": "The durable notes checkpoint contains invalid section records and was preserved",
+                "job_directory": str(job_dir),
+                "preserved": True,
+            })
+        missing_sections = [name for name in section_names if not (job_dir / name).is_file()]
         if missing_sections:
             return _json({
                 "error": "A committed notes section is missing; refusing to create an incomplete PDF",
@@ -581,7 +600,10 @@ def build_vault_notes_pdf(
                 "error": "cursor does not match the durable job checkpoint",
                 "next_cursor": _cursor_text(current_cursor),
             })
-        sections_per_run = max(1, min(int(sections_per_run), 12))
+        try:
+            sections_per_run = max(1, min(int(sections_per_run), 12))
+        except (TypeError, ValueError, OverflowError):
+            return _json({"error": "sections_per_run must be an integer between 1 and 12"})
         collection_obj = get_chroma_client().get_collection(name=collection_name)
 
         created_this_run = 0

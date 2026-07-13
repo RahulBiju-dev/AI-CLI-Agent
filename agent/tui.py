@@ -948,7 +948,6 @@ def build_app_class():
                 ("⇥", "complete"),
                 ("^C", "stop"),
                 ("^C^C", "quit"),
-                ("F1", "help"),
             )
             line = Text()
             for index, (key, action) in enumerate(items):
@@ -1031,7 +1030,6 @@ def build_app_class():
             Binding("ctrl+slash", "open_commands", "Commands", show=True),
             Binding("ctrl+o", "open_sessions", "Conversations", show=True, priority=True),
             Binding("ctrl+s", "toggle_speech", "Speech", show=True, priority=True),
-            Binding("f1", "show_help", "Help", show=True),
             Binding("ctrl+j", "submit_input", "Send", show=False, priority=True),
             Binding("escape", "blur_or_clear", "Esc", show=False, priority=True),
         ]
@@ -1318,9 +1316,7 @@ def build_app_class():
             brand.append("/", style=f"bold {pal['text_soft']}")
             brand.append(" commands  ·  ", style=pal["muted"])
             brand.append("/theme", style=f"bold {pal['text_soft']}")
-            brand.append(" colors  ·  ", style=pal["muted"])
-            brand.append("F1", style=f"bold {pal['text_soft']}")
-            brand.append(" help", style=pal["muted"])
+            brand.append(" colors", style=pal["muted"])
             from agent.tui_themes import DEFAULT_THEME, theme_label
 
             theme_name = DEFAULT_THEME
@@ -2433,7 +2429,7 @@ def build_app_class():
             self._open_sessions_menu(reset_selection=True)
 
         def action_show_help(self) -> None:
-            """F1 — show command help in the transcript."""
+            """Show command help in the transcript."""
             if self._busy:
                 return
             self._dismiss_sessions_menu()
@@ -2472,7 +2468,6 @@ def build_app_class():
                 ("Esc", "Dismiss menu / speech / clear input"),
                 ("Ctrl+K", "Clear input + dismiss menus"),
                 ("Ctrl+L", "Clear conversation"),
-                ("F1", "Show this help"),
             ):
                 shortcuts.append(f"  {key:<16}", style="#7a7a7a")
                 shortcuts.append(f"  {desc}\n", style="#555555")

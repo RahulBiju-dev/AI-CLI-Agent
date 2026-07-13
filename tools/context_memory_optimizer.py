@@ -7,6 +7,11 @@ import re
 from typing import Any
 
 
+MAX_MESSAGES = 10_000
+MAX_CRITICAL_TERMS = 100
+MAX_TERM_CHARS = 200
+
+
 def _tokens(value: Any) -> int:
     return len(json.dumps(value, ensure_ascii=False, default=str)) // 4 + 1
 
@@ -24,9 +29,26 @@ def context_memory_optimizer(
     """Compress messages while retaining recent turns, decisions, facts, and links."""
     if not isinstance(messages, list):
         return json.dumps({"error": "messages must be an array"})
-    target = max(256, min(int(target_tokens), 100000))
-    preserve_count = max(0, min(int(preserve_recent), 50))
-    terms = [term.casefold() for term in (critical_terms or []) if str(term).strip()]
+    if len(messages) > MAX_MESSAGES:
+        return json.dumps({"error": f"messages exceeds the {MAX_MESSAGES}-item limit"})
+    invalid_message = next((index for index, value in enumerate(messages) if not isinstance(value, dict)), None)
+    if invalid_message is not None:
+        return json.dumps({"error": f"messages[{invalid_message}] must be an object"})
+    try:
+        target = max(256, min(int(target_tokens), 100000))
+        preserve_count = max(0, min(int(preserve_recent), 50))
+    except (TypeError, ValueError, OverflowError):
+        return json.dumps({"error": "target_tokens and preserve_recent must be integers"})
+    if critical_terms is not None and not isinstance(critical_terms, list):
+        return json.dumps({"error": "critical_terms must be an array"})
+    if len(critical_terms or []) > MAX_CRITICAL_TERMS:
+        return json.dumps({"error": f"critical_terms exceeds the {MAX_CRITICAL_TERMS}-item limit"})
+    invalid_term = next((index for index, value in enumerate(critical_terms or []) if not isinstance(value, str)), None)
+    if invalid_term is not None:
+        return json.dumps({"error": f"critical_terms[{invalid_term}] must be a string"})
+    terms = [term.strip().casefold() for term in (critical_terms or []) if term.strip()]
+    if any(len(term) > MAX_TERM_CHARS for term in terms):
+        return json.dumps({"error": f"critical terms may contain at most {MAX_TERM_CHARS} characters"})
 
     systems = [message for message in messages if message.get("role") == "system"]
     conversation = [message for message in messages if message.get("role") != "system"]

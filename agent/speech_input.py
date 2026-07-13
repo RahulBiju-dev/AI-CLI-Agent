@@ -7,14 +7,17 @@ Mirrors the Web UI voice flow in ``agent/static/app.js``:
 * continuous capture with progressive results
 * cooperative stop (abort vs clean stop)
 
-ALSA / Pulse / JACK drivers often spam stderr when opening devices. That noise
-destroys full-screen TUI painting, so native device open/close calls use a
-short stderr guard. Missing optional packages never block Selene startup.
+ALSA / Pulse / JACK drivers can spam stderr while opening or closing a device.
+Those short native operations use a scoped guard; capture and transcription do
+not redirect the TUI's process-wide stderr. Missing optional packages never
+block Selene startup.
 """
 from __future__ import annotations
 
 import os
+import queue
 import threading
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Callable, Iterator, Literal
@@ -59,6 +62,7 @@ _silence_lock = threading.RLock()
 _silence_depth = 0
 _silence_saved_fd: int | None = None
 _silence_devnull_fd: int | None = None
+_RECOGNITION_DRAIN_TIMEOUT = 3.0
 
 
 @contextmanager
@@ -199,6 +203,8 @@ class VoiceInputController:
         self._generation = 0
         self._recognizer = None
         self._microphone = None
+        self._restart_requested = False
+        self._restart_base = ""
 
     @property
     def active(self) -> bool:
@@ -232,6 +238,14 @@ class VoiceInputController:
             if self._active:
                 self._emit_error("busy", ERROR_MESSAGES["busy"])
                 return False
+            existing = self._thread
+            if existing is not None and existing.is_alive():
+                # An aborted PortAudio read is winding down on its owning
+                # worker. Queue one restart instead of racing a second stream
+                # against the same default device.
+                self._restart_requested = True
+                self._restart_base = str(base_text or "")
+                return True
             if base_text is not None:
                 self._base_text = str(base_text)
             self._generation += 1
@@ -255,24 +269,23 @@ class VoiceInputController:
     def stop(self, *, abort: bool = False, silent: bool = False) -> None:
         """Stop listening (mirrors ``stopVoiceInput`` in app.js)."""
         with self._lock:
-            if not self._active and self._thread is None:
+            if not self._active and self._thread is None and not self._restart_requested:
                 return
+            was_active = self._active
+            self._restart_requested = False
+            self._restart_base = ""
             self._suppress_error = bool(silent)
             self._stop.set()
             self._active = False
             if abort:
                 self._generation += 1  # invalidate late results from this worker
-            microphone = self._microphone
         # Mark inactive immediately for UI (onend equivalent).
-        self._set_active(False)
-        # Closing the active PortAudio stream wakes recognizer.listen promptly.
-        # Never join here: stop() is called by the Textual event thread.
-        stream = getattr(microphone, "stream", None)
-        if abort and stream is not None:
-            try:
-                stream.close()
-            except Exception:
-                pass
+        if was_active:
+            self._set_active(False)
+        # Never close or join the PortAudio stream here. This method runs on the
+        # Textual thread; cross-thread close races ALSA and emits native
+        # assertions (or can crash). The short capture chunks observe _stop and
+        # the worker performs teardown itself.
 
     def _set_active(self, active: bool) -> None:
         callback = self._on_active
@@ -328,6 +341,11 @@ class VoiceInputController:
 
     def _listen_loop(self, generation: int, stop_event: threading.Event) -> None:
         """Background capture loop — continuous phrase recognition."""
+        self._listen_loop_silenced(generation, stop_event)
+
+    def _listen_loop_silenced(
+        self, generation: int, stop_event: threading.Event
+    ) -> None:
         try:
             import speech_recognition as sr
         except Exception as exc:
@@ -335,12 +353,26 @@ class VoiceInputController:
             self._finish_loop(generation)
             return
 
-        recognizer = sr.Recognizer()
-        # Slightly more patient defaults for conversational dictation.
-        recognizer.dynamic_energy_threshold = True
-        recognizer.pause_threshold = 0.55
-        recognizer.non_speaking_duration = 0.3
-        recognizer.operation_timeout = 4.0
+        capture_recognizer = sr.Recognizer()
+        capture_recognizer.dynamic_energy_threshold = True
+        capture_recognizer.pause_threshold = 0.48
+        capture_recognizer.non_speaking_duration = 0.25
+
+        recognition_queue: queue.Queue[object] = queue.Queue(maxsize=3)
+        recognition_done = object()
+        recognition_failed = threading.Event()
+        recognition_thread = threading.Thread(
+            target=self._recognize_loop,
+            args=(
+                generation,
+                recognition_queue,
+                recognition_done,
+                recognition_failed,
+                sr,
+            ),
+            name="selene-speech-recognition",
+            daemon=True,
+        )
 
         microphone = None
         # A just-closed PortAudio stream may need a moment to release the
@@ -364,25 +396,28 @@ class VoiceInputController:
                 stop_event.wait(0.08)
 
         try:
-            # Silence only native open/close operations. Redirecting fd 2 for
-            # the full recording would hide unrelated diagnostics process-wide.
             with audio_stderr_silence():
                 source = microphone.__enter__()
             with self._lock:
                 if generation == self._generation:
                     self._microphone = microphone
+            recognition_thread.start()
             try:
                 try:
-                    recognizer.adjust_for_ambient_noise(source, duration=0.18)
+                    capture_recognizer.adjust_for_ambient_noise(source, duration=0.12)
                 except Exception:
                     pass
 
-                while not stop_event.is_set() and self._is_current(generation):
+                while (
+                    not stop_event.is_set()
+                    and not recognition_failed.is_set()
+                    and self._is_current(generation)
+                ):
                     try:
-                        audio = recognizer.listen(
+                        audio = capture_recognizer.listen(
                             source,
-                            timeout=0.65,
-                            phrase_time_limit=8,
+                            timeout=0.5,
+                            phrase_time_limit=2.5,
                         )
                     except sr.WaitTimeoutError:
                         continue
@@ -390,7 +425,7 @@ class VoiceInputController:
                         if stop_event.is_set() or not self._is_current(generation):
                             break
                         code = _map_exception(exc)
-                        self._emit_error(code)
+                        self._emit_error(code, generation=generation)
                         if code in {"not-allowed", "audio-capture", "service-not-allowed"}:
                             break
                         continue
@@ -399,33 +434,46 @@ class VoiceInputController:
                         break
 
                     try:
-                        # Same service family as browser Web Speech (Google).
-                        text = recognizer.recognize_google(audio, language=self._language)
-                    except sr.UnknownValueError:
-                        # Equivalent to browser "no-speech" for a single phrase —
-                        # stay listening (continuous) instead of hard-stopping.
-                        continue
-                    except sr.RequestError as exc:
-                        self._emit_error(
-                            "network",
-                            ERROR_MESSAGES["network"] + f" ({exc})",
-                            generation=generation,
-                        )
+                        recognition_queue.put(audio, timeout=0.15)
+                    except queue.Full:
+                        self._emit_error("busy", generation=generation)
                         break
-                    except Exception as exc:
-                        code = _map_exception(exc)
-                        self._emit_error(code, generation=generation)
-                        if code in {"network", "not-allowed", "service-not-allowed"}:
-                            break
-                        continue
-
-                    # Progressive "final" chunks: fold into base so the next phrase
-                    # appends (mirrors continuous results joining in app.js).
-                    if self._is_current(generation):
-                        self._emit_transcript(text)
             finally:
-                with audio_stderr_silence():
-                    microphone.__exit__(None, None, None)
+                try:
+                    with audio_stderr_silence():
+                        microphone.__exit__(None, None, None)
+                finally:
+                    # The recognition worker drains already captured phrases on
+                    # a clean stop. Abort discards queued work and never delays
+                    # the next microphone open.
+                    if recognition_thread.is_alive():
+                        if not self._is_current(generation):
+                            try:
+                                while True:
+                                    recognition_queue.get_nowait()
+                            except queue.Empty:
+                                pass
+                            recognition_queue.put_nowait(recognition_done)
+                        else:
+                            deadline = time.monotonic() + _RECOGNITION_DRAIN_TIMEOUT
+                            while (
+                                recognition_thread.is_alive()
+                                and time.monotonic() < deadline
+                            ):
+                                try:
+                                    recognition_queue.put(
+                                        recognition_done, timeout=0.1
+                                    )
+                                    break
+                                except queue.Full:
+                                    if recognition_failed.is_set():
+                                        break
+                            remaining = max(0.0, deadline - time.monotonic())
+                            recognition_thread.join(timeout=remaining)
+                            if recognition_thread.is_alive():
+                                # Never let DNS/socket behavior freeze the TUI's
+                                # finishing state. Late daemon results are ignored.
+                                recognition_failed.set()
         except Exception as exc:
             if not stop_event.is_set() and self._is_current(generation):
                 code = _map_exception(exc)
@@ -433,18 +481,74 @@ class VoiceInputController:
         finally:
             self._finish_loop(generation)
 
+    def _recognize_loop(
+        self,
+        generation: int,
+        audio_queue: queue.Queue[object],
+        done_marker: object,
+        failed: threading.Event,
+        sr,
+    ) -> None:
+        """Transcribe queued phrases without pausing microphone capture."""
+        recognizer = sr.Recognizer()
+        recognizer.operation_timeout = 2.5
+        while True:
+            audio = audio_queue.get()
+            if audio is done_marker:
+                return
+            if failed.is_set() or not self._is_current(generation):
+                return
+            try:
+                text = recognizer.recognize_google(audio, language=self._language)
+            except sr.UnknownValueError:
+                if failed.is_set():
+                    return
+                continue
+            except sr.RequestError as exc:
+                if failed.is_set():
+                    return
+                self._emit_error(
+                    "network",
+                    ERROR_MESSAGES["network"] + f" ({exc})",
+                    generation=generation,
+                )
+                failed.set()
+                return
+            except Exception as exc:
+                if failed.is_set():
+                    return
+                code = _map_exception(exc)
+                self._emit_error(code, generation=generation)
+                if code in {"network", "not-allowed", "service-not-allowed"}:
+                    failed.set()
+                    return
+                continue
+            if not failed.is_set() and self._is_current(generation):
+                self._emit_transcript(text)
+
     def _finish_loop(self, generation: int) -> None:
         finished_callback = None
+        restart_base = None
         current_thread = threading.current_thread()
         with self._lock:
             if self._thread is current_thread:
                 self._thread = None
                 self._microphone = None
+                if self._restart_requested:
+                    restart_base = self._restart_base
+                    self._restart_requested = False
+                    self._restart_base = ""
             if generation != self._generation:
-                return
-            self._active = False
-            self._suppress_error = False
-            finished_callback = self._on_finished
+                finished_callback = None
+            else:
+                self._active = False
+                self._suppress_error = False
+                finished_callback = self._on_finished
+        if restart_base is not None:
+            self.start(base_text=restart_base)
+            return
+        if generation != self._generation:
+            return
         # onend always clears active in the web UI.
         self._set_active(False)
         if finished_callback is not None:

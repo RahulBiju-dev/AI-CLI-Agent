@@ -139,13 +139,19 @@ def read_file(
     Returns:
         str: A JSON-encoded string with file contents or search matches, or an error.
     """
+    if not isinstance(file_path, str) or not file_path.strip() or len(file_path) > 4096 or "\0" in file_path:
+        return _json({"error": "file_path must be a valid path"})
+    file_path = file_path.strip()
     if not os.path.exists(file_path):
         return _json({"error": f"File not found: {file_path}"})
     if not os.path.isfile(file_path):
         return _json({"error": f"Not a file: {file_path}"})
 
     ext = os.path.splitext(file_path)[1].lower()
-    file_size_bytes = os.path.getsize(file_path)
+    try:
+        file_size_bytes = os.path.getsize(file_path)
+    except OSError as exc:
+        return _json({"error": f"Could not inspect file: {exc}", "file": file_path})
     max_chars_int = _positive_int(max_chars, DEFAULT_MAX_CHARS, minimum=1000, maximum=MAX_CHARS_CAP)
     chunk_size_int = _positive_int(chunk_size, DEFAULT_CHUNK_SIZE, minimum=1000, maximum=MAX_CHARS_CAP)
     if query is not None:
@@ -166,6 +172,13 @@ def read_file(
             })
         from tools.spreadsheet import spreadsheet
         return spreadsheet(action="read", file_path=file_path, query=query)
+
+    if file_size_bytes > MAX_DIRECT_FILE_BYTES:
+        return _json({
+            "error": f"File is too large for direct reading ({file_size_bytes} bytes)",
+            "max_direct_bytes": MAX_DIRECT_FILE_BYTES,
+            "guidance": "Use index_vault/codebase_indexer for bounded retrieval of very large files.",
+        })
 
     if lines:
         try:
@@ -192,12 +205,6 @@ def read_file(
         except (OSError, UnicodeDecodeError, ValueError) as exc:
             return _json({"error": str(exc), "file": file_path, "size_bytes": file_size_bytes})
 
-    if file_size_bytes > MAX_DIRECT_FILE_BYTES:
-        return _json({
-            "error": f"File is too large for direct full/query reading ({file_size_bytes} bytes)",
-            "max_direct_bytes": MAX_DIRECT_FILE_BYTES,
-            "guidance": "Use index_vault and vault_search, or request a specific line range.",
-        })
     try:
         with open(file_path, "r", encoding="utf-8") as f:
             text = f.read()

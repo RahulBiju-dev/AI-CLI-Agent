@@ -1,9 +1,11 @@
 import json
+import subprocess
 import sys
 import threading
 import time
 import unittest
 from contextlib import contextmanager
+from pathlib import Path
 from unittest.mock import patch
 
 agent_module = sys.modules.get("agent")
@@ -105,6 +107,25 @@ class TestToolRunner(unittest.TestCase):
         self.assertEqual(payload["error_code"], "unknown_tool")
         self.assertIn("does_not_exist", payload["error"])
 
+    def test_unknown_argument_is_rejected_before_handler_invocation(self):
+        result = execute_tool_call(_spec("get_current_datetime", {"made_up": True}))
+        payload = json.loads(result.content)
+
+        self.assertEqual(result.status, ToolResultStatus.ERROR)
+        self.assertEqual(payload["error_code"], "invalid_arguments")
+        self.assertIn(
+            "arguments.made_up is not allowed",
+            payload["details"]["validation_errors"],
+        )
+
+    def test_plain_text_error_result_is_not_reported_as_success(self):
+        metadata = _metadata("legacy_error", side_effecting=True)
+        with _registered_tool("legacy_error", lambda: "Error: backend unavailable", metadata):
+            result = execute_tool_call(_spec("legacy_error"))
+
+        self.assertEqual(result.status, ToolResultStatus.ERROR)
+        self.assertEqual(result.content, "Error: backend unavailable")
+
     def test_schema_validation_rejects_missing_and_wrong_typed_arguments(self):
         invoked = threading.Event()
 
@@ -134,6 +155,20 @@ class TestToolRunner(unittest.TestCase):
         self.assertTrue(any("count must be integer" in error for error in errors))
         self.assertTrue(any("unexpected is not allowed" in error for error in errors))
         self.assertFalse(invoked.is_set())
+
+    def test_schema_validation_rejects_non_finite_numbers(self):
+        schema = {
+            "type": "object",
+            "properties": {"payload": {}},
+            "required": ["payload"],
+            "additionalProperties": False,
+        }
+        with _registered_tool("finite_probe", lambda **_arguments: "unexpected", schema=schema):
+            result = execute_tool_call(_spec("finite_probe", {"payload": {"value": float("nan")}}))
+
+        payload = json.loads(result.content)
+        self.assertEqual(result.status, ToolResultStatus.ERROR)
+        self.assertIn("arguments.payload.value must be finite", payload["details"]["validation_errors"])
 
     def test_tool_output_is_bounded_and_marked_as_truncated(self):
         metadata = _metadata("large_output", output_limit=256)
@@ -359,6 +394,60 @@ class TestToolRunner(unittest.TestCase):
 class TestToolRegistryContract(unittest.TestCase):
     def test_dispatch_schema_and_metadata_registry_are_in_sync(self):
         self.assertEqual(validate_tool_registry(), [])
+
+    def test_model_tool_root_schemas_reject_unknown_parameters(self):
+        for name, schema in TOOL_SCHEMA_BY_NAME.items():
+            with self.subTest(tool=name):
+                self.assertIs(schema.get("additionalProperties"), False)
+
+    def test_registry_detects_schema_handler_signature_drift(self):
+        broken_schema = {
+            "type": "object",
+            "properties": {"invented": {"type": "string"}},
+            "additionalProperties": False,
+        }
+        with patch.dict(TOOL_SCHEMA_BY_NAME, {"get_current_datetime": broken_schema}):
+            errors = validate_tool_registry()
+
+        self.assertTrue(any("not accepted by the handler" in error for error in errors))
+
+    def test_status_actions_do_not_acquire_heavy_resource_slots(self):
+        for name in ("build_vault_notes_pdf", "codebase_indexer", "index_vault"):
+            with self.subTest(tool=name):
+                metadata = tool_runner.get_tool_metadata(name, {"action": "status"})
+                self.assertIsNotNone(metadata)
+                self.assertTrue(metadata.read_only)
+                self.assertTrue(metadata.parallel_safe)
+                self.assertFalse(metadata.side_effecting)
+                self.assertFalse(metadata.cpu_heavy)
+                self.assertFalse(metadata.gpu_heavy)
+
+    def test_registry_import_survives_missing_optional_chromadb(self):
+        probe = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import sys\n"
+                    "sys.modules['chromadb'] = None\n"
+                    "import tools.registry\n"
+                    "from tools.vault_indexer import get_chroma_client\n"
+                    "assert tools.registry.validate_tool_registry() == []\n"
+                    "try:\n"
+                    "    get_chroma_client()\n"
+                    "except RuntimeError as exc:\n"
+                    "    assert 'ChromaDB is unavailable' in str(exc)\n"
+                    "else:\n"
+                    "    raise AssertionError('missing ChromaDB was not isolated')\n"
+                ),
+            ],
+            cwd=str(Path(__file__).resolve().parents[1]),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        self.assertEqual(probe.returncode, 0, probe.stderr)
 
     def test_resource_heavy_tools_are_never_marked_parallel_safe(self):
         heavy = {

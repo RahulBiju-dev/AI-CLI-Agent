@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import json
 import os
 import re
@@ -25,6 +26,12 @@ KEY_PATH = DATA_DIR / ".credential-key"
 KEYRING_SERVICE = "selene-agent"
 KEYRING_USER = "google-oauth-encryption"
 MAX_RESULTS = 100
+OAUTH_WAIT_TIMEOUT_SECONDS = 240
+_CREDENTIAL_AAD = b"selene-google-v1"
+
+
+class CredentialStoreError(RuntimeError):
+    """A safe, actionable encrypted-credential storage failure."""
 
 
 def _result(**values: Any) -> str:
@@ -33,7 +40,8 @@ def _result(**values: Any) -> str:
 
 def _safe_error(exc: Exception) -> str:
     """Return a useful error without echoing common credential fields."""
-    message = str(exc).splitlines()[0][:500]
+    raw_message = str(exc).strip()
+    message = (raw_message.splitlines()[0] if raw_message else type(exc).__name__)[:500]
     message = re.sub(
         r"(?i)(access_token|refresh_token|client_secret|authorization|api[_-]?key)([=:'\" ]+)[^, }&]+",
         r"\1\2[redacted]",
@@ -46,39 +54,112 @@ def _atomic_private_write(path: Path, data: bytes) -> None:
     atomic_write_bytes(path, data, private=True)
 
 
-def _encryption_key(create: bool) -> bytes:
-    """Load the key from the OS keyring, falling back to a mode-0600 local key."""
-    encoded = None
+def _encode_key(key: bytes) -> str:
+    if len(key) != 32:
+        raise CredentialStoreError("The Google credential encryption key is invalid")
+    return base64.urlsafe_b64encode(key).decode("ascii")
+
+
+def _decode_key(encoded: str, source: str) -> bytes:
+    try:
+        key = base64.b64decode(encoded.encode("ascii"), altchars=b"-_", validate=True)
+    except (AttributeError, UnicodeEncodeError, binascii.Error, ValueError) as exc:
+        raise CredentialStoreError(
+            f"The Google credential encryption key in {source} is invalid"
+        ) from exc
+    if len(key) != 32:
+        raise CredentialStoreError(
+            f"The Google credential encryption key in {source} is invalid"
+        )
+    return key
+
+
+def _key_candidates() -> list[bytes]:
+    """Return distinct usable local/keyring keys without modifying either store."""
+    candidates: list[bytes] = []
+
+    if KEY_PATH.is_file():
+        try:
+            encoded = KEY_PATH.read_text(encoding="ascii").strip()
+            candidates.append(_decode_key(encoded, "the local fallback file"))
+        except (OSError, UnicodeError, CredentialStoreError):
+            # A keyring copy may still unlock the credentials. Do not replace
+            # the malformed fallback until a candidate authenticates them.
+            pass
+
     try:
         import keyring
 
         encoded = keyring.get_password(KEYRING_SERVICE, KEYRING_USER)
-        if not encoded and create:
-            encoded = base64.urlsafe_b64encode(os.urandom(32)).decode("ascii")
+        if encoded:
+            key = _decode_key(encoded, "the OS keyring")
+            if key not in candidates:
+                candidates.append(key)
+    except Exception:
+        # keyring can be installed while its SecretService/desktop backend is
+        # unavailable. The private file is the deterministic fallback.
+        pass
+    return candidates
+
+
+def _persist_key(key: bytes) -> None:
+    """Persist the local fallback first, then mirror it to keyring best-effort."""
+    encoded = _encode_key(key)
+    local_is_current = False
+    try:
+        local_is_current = _decode_key(
+            KEY_PATH.read_text(encoding="ascii").strip(), "the local fallback file"
+        ) == key
+        if os.name != "nt" and KEY_PATH.stat().st_mode & 0o077:
+            local_is_current = False
+    except (OSError, UnicodeError, CredentialStoreError):
+        pass
+    if not local_is_current:
+        _atomic_private_write(KEY_PATH, encoded.encode("ascii"))
+    try:
+        import keyring
+
+        if keyring.get_password(KEYRING_SERVICE, KEYRING_USER) != encoded:
             keyring.set_password(KEYRING_SERVICE, KEYRING_USER, encoded)
     except Exception:
-        # Headless Linux installations often have no keyring backend. The
-        # fallback still prevents credentials appearing as plaintext and is
-        # restricted to the current OS user.
-        if KEY_PATH.is_file():
-            encoded = KEY_PATH.read_text(encoding="ascii").strip()
-        elif create:
-            encoded = base64.urlsafe_b64encode(os.urandom(32)).decode("ascii")
-            _atomic_private_write(KEY_PATH, encoded.encode("ascii"))
-    if not encoded:
-        raise RuntimeError("The Google credential encryption key is unavailable")
-    key = base64.urlsafe_b64decode(encoded.encode("ascii"))
-    if len(key) != 32:
-        raise RuntimeError("The Google credential encryption key is invalid")
+        # Fedora headless sessions and packaged apps may not have an unlocked
+        # SecretService. The owner-only local copy remains authoritative.
+        pass
+
+
+def _encryption_key(create: bool) -> bytes:
+    """Load a durable key, creating one only for an explicit credential save."""
+    candidates = _key_candidates()
+    if candidates:
+        key = candidates[0]
+        if create:
+            _persist_key(key)
+        return key
+    if not create:
+        raise CredentialStoreError(
+            "The Google credential encryption key is unavailable. Run authorize again "
+            "with a Google Desktop OAuth client JSON file; the existing encrypted "
+            "credential file was preserved."
+        )
+    key = os.urandom(32)
+    _persist_key(key)
     return key
 
 
-def _save_credentials(payload: dict[str, Any]) -> None:
+def _save_credentials(payload: dict[str, Any], *, encryption_key: bytes | None = None) -> None:
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
+    if encryption_key is None:
+        key = _encryption_key(create=True)
+    else:
+        key = encryption_key
+        # Always establish the private fallback before replacing the
+        # ciphertext. A later keyring outage can therefore never strand a
+        # refreshed token.
+        _persist_key(key)
     nonce = os.urandom(12)
     plaintext = json.dumps(payload, separators=(",", ":")).encode("utf-8")
-    ciphertext = AESGCM(_encryption_key(create=True)).encrypt(nonce, plaintext, b"selene-google-v1")
+    ciphertext = AESGCM(key).encrypt(nonce, plaintext, _CREDENTIAL_AAD)
     envelope = {
         "version": 1,
         "nonce": base64.urlsafe_b64encode(nonce).decode("ascii"),
@@ -87,22 +168,86 @@ def _save_credentials(payload: dict[str, Any]) -> None:
     _atomic_private_write(CREDENTIAL_PATH, json.dumps(envelope).encode("utf-8"))
 
 
-def _load_credentials() -> dict[str, Any]:
+def _decode_envelope_value(envelope: dict[str, Any], field: str) -> bytes:
+    encoded = envelope.get(field)
+    if not isinstance(encoded, str):
+        raise CredentialStoreError(
+            "The encrypted Google credential file is malformed and was preserved"
+        )
+    try:
+        return base64.b64decode(encoded.encode("ascii"), altchars=b"-_", validate=True)
+    except (UnicodeEncodeError, binascii.Error, ValueError) as exc:
+        raise CredentialStoreError(
+            "The encrypted Google credential file is malformed and was preserved"
+        ) from exc
+
+
+def _load_credentials_with_key(*, repair_key: bool) -> tuple[dict[str, Any], bytes]:
+    if not CREDENTIAL_PATH.is_file():
+        raise CredentialStoreError("Google is not connected. Run the authorize action first.")
+    try:
+        envelope = json.loads(CREDENTIAL_PATH.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise CredentialStoreError(
+            "The encrypted Google credential file is malformed and was preserved"
+        ) from exc
+    if not isinstance(envelope, dict):
+        raise CredentialStoreError(
+            "The encrypted Google credential file is malformed and was preserved"
+        )
+    if envelope.get("version") != 1:
+        raise CredentialStoreError(
+            "Unsupported encrypted Google credential format; the file was preserved"
+        )
+    nonce = _decode_envelope_value(envelope, "nonce")
+    ciphertext = _decode_envelope_value(envelope, "ciphertext")
+    if len(nonce) != 12 or len(ciphertext) < 16:
+        raise CredentialStoreError(
+            "The encrypted Google credential file is malformed and was preserved"
+        )
+
+    from cryptography.exceptions import InvalidTag
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-    if not CREDENTIAL_PATH.is_file():
-        raise RuntimeError("Google is not connected. Run the authorize action first.")
-    envelope = json.loads(CREDENTIAL_PATH.read_text(encoding="utf-8"))
-    if envelope.get("version") != 1:
-        raise RuntimeError("Unsupported encrypted Google credential format")
-    nonce = base64.urlsafe_b64decode(envelope["nonce"])
-    ciphertext = base64.urlsafe_b64decode(envelope["ciphertext"])
-    plaintext = AESGCM(_encryption_key(create=False)).decrypt(
-        nonce, ciphertext, b"selene-google-v1"
-    )
-    payload = json.loads(plaintext)
-    if not isinstance(payload, dict):
-        raise RuntimeError("Invalid encrypted Google credentials")
+    candidates = _key_candidates()
+    if not candidates:
+        # Keep one consistent, actionable message for the common Fedora case
+        # where keyring exists but has no usable SecretService backend.
+        _encryption_key(create=False)
+    plaintext = None
+    selected_key = None
+    for candidate in candidates:
+        try:
+            plaintext = AESGCM(candidate).decrypt(nonce, ciphertext, _CREDENTIAL_AAD)
+            selected_key = candidate
+            break
+        except InvalidTag:
+            continue
+    if plaintext is None or selected_key is None:
+        raise CredentialStoreError(
+            "The encrypted Google credentials cannot be unlocked with the available key. "
+            "Run authorize again with a Google Desktop OAuth client JSON file; the existing "
+            "credential file was preserved."
+        )
+    try:
+        payload = json.loads(plaintext)
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise CredentialStoreError(
+            "The decrypted Google credential payload is malformed; the file was preserved"
+        ) from exc
+    if not isinstance(payload, dict) or not isinstance(payload.get("token"), dict):
+        raise CredentialStoreError(
+            "The decrypted Google credential payload is invalid; the file was preserved"
+        )
+    if repair_key:
+        # Repair only after AES-GCM authenticated the candidate. This safely
+        # handles old keyring-only files and stale/mismatched key copies.
+        _persist_key(selected_key)
+    return payload, selected_key
+
+
+def _load_credentials(*, repair_key: bool = False) -> dict[str, Any]:
+    payload, _ = _load_credentials_with_key(repair_key=repair_key)
     return payload
 
 
@@ -138,7 +283,10 @@ def _authorize(client_secrets_file: str | None) -> str:
         _, _, InstalledAppFlow, _ = _google_imports()
         flow = InstalledAppFlow.from_client_config(client_config, SCOPES)
         credentials = flow.run_local_server(
+            host="127.0.0.1",
+            bind_addr="127.0.0.1",
             port=0,
+            timeout_seconds=OAUTH_WAIT_TIMEOUT_SECONDS,
             access_type="offline",
             prompt="consent",
             open_browser=True,
@@ -163,13 +311,13 @@ def _authorize(client_secrets_file: str | None) -> str:
 
 def _services() -> tuple[Any, Any]:
     Request, Credentials, _, build = _google_imports()
-    stored = _load_credentials()
+    stored, encryption_key = _load_credentials_with_key(repair_key=True)
     credentials = Credentials.from_authorized_user_info(stored["token"], SCOPES)
     if credentials.expired and credentials.refresh_token:
         credentials.refresh(Request())
         stored["token"] = json.loads(credentials.to_json())
         stored["saved_at"] = datetime.now(timezone.utc).isoformat()
-        _save_credentials(stored)
+        _save_credentials(stored, encryption_key=encryption_key)
     if not credentials.valid:
         raise RuntimeError("Google authorization is invalid or expired; authorize again")
     return (
@@ -503,11 +651,44 @@ def google_workspace(
     """Authorize and manage the user's Google Calendar events and Tasks."""
     action = str(action or "").strip().lower()
     if action == "status":
-        return _result(
-            connected=CREDENTIAL_PATH.is_file(),
-            encrypted=True,
-            credential_file=str(CREDENTIAL_PATH),
-        )
+        credential_file_present = CREDENTIAL_PATH.is_file()
+        status_result: dict[str, Any] = {
+            "connected": False,
+            "encrypted": True,
+            "credential_file": str(CREDENTIAL_PATH),
+            "credential_file_present": credential_file_present,
+        }
+        if not credential_file_present:
+            status_result.update({
+                "credential_store_status": "missing",
+                "authorization_required": True,
+            })
+            return _result(**status_result)
+        try:
+            # This is a local decryptability check only: no Google imports,
+            # network requests, token refreshes, or key-store repairs.
+            _load_credentials(repair_key=False)
+        except ImportError:
+            status_result.update({
+                "credential_store_status": "dependency_unavailable",
+                "error": (
+                    "Google credential encryption support is unavailable. "
+                    "Install cryptography and restart Selene."
+                ),
+            })
+        except Exception as exc:
+            status_result.update({
+                "credential_store_status": "unreadable",
+                "reauthorization_required": True,
+                "error": _safe_error(exc),
+            })
+        else:
+            status_result.update({
+                "connected": True,
+                "credential_store_status": "ready",
+                "authorization_required": False,
+            })
+        return _result(**status_result)
     if action == "authorize":
         return _authorize(client_secrets_file)
     if action == "disconnect":

@@ -8,6 +8,7 @@ import json
 import math
 import os
 import re
+import zipfile
 from dataclasses import dataclass
 from typing import Iterable
 
@@ -15,6 +16,10 @@ DEFAULT_MAX_CHARS = 14000
 DEFAULT_CHUNK_SIZE = 12000
 MAX_CHUNK_SIZE = 50000
 MAX_QUERY_MATCHES = 8
+MAX_DOCUMENT_BYTES = 100 * 1024 * 1024
+MAX_PAGE_SELECTION = 2_000
+MAX_OFFICE_ARCHIVE_BYTES = 200 * 1024 * 1024
+MAX_OFFICE_ARCHIVE_ENTRIES = 10_000
 
 SUPPORTED_DOCUMENT_EXTENSIONS = {".pdf", ".docx"}
 
@@ -71,7 +76,12 @@ def _parse_page_spec(pages: str | None, page_count: int) -> list[int]:
             bounded_start = max(1, start)
             bounded_end = min(page_count, end)
             if bounded_start <= bounded_end:
-                selected.update(range(bounded_start - 1, bounded_end))
+                for page_index in range(bounded_start - 1, bounded_end):
+                    selected.add(page_index)
+                    if len(selected) > MAX_PAGE_SELECTION:
+                        raise ValueError(
+                            f"A single read may select at most {MAX_PAGE_SELECTION} PDF pages; request a smaller range"
+                        )
         else:
             try:
                 page = int(part)
@@ -79,6 +89,10 @@ def _parse_page_spec(pages: str | None, page_count: int) -> list[int]:
                 raise ValueError(f"Invalid page number: {part}") from exc
             if 1 <= page <= page_count:
                 selected.add(page - 1)
+                if len(selected) > MAX_PAGE_SELECTION:
+                    raise ValueError(
+                        f"A single read may select at most {MAX_PAGE_SELECTION} PDF pages; request a smaller range"
+                    )
 
     if not selected:
         raise ValueError(f"No pages from '{pages}' are inside this document's 1-{page_count} page range")
@@ -233,6 +247,15 @@ def _iter_docx_blocks(doc) -> Iterable[str]:
 
 def _extract_docx_segments(file_path: str, preview_chars: int | None = None) -> tuple[list[TextSegment], dict]:
     try:
+        with zipfile.ZipFile(file_path) as archive:
+            entries = archive.infolist()
+            if len(entries) > MAX_OFFICE_ARCHIVE_ENTRIES:
+                raise ValueError("DOCX archive contains too many entries")
+            if sum(item.file_size for item in entries) > MAX_OFFICE_ARCHIVE_BYTES:
+                raise ValueError("DOCX expanded content exceeds the 200 MiB safety limit")
+    except zipfile.BadZipFile as exc:
+        raise ValueError("DOCX file is not a valid Office archive") from exc
+    try:
         import docx
     except ImportError as exc:
         raise RuntimeError("Missing required dependency. Please run: pip install python-docx") from exc
@@ -326,10 +349,23 @@ def read_document(
         str: A JSON-encoded string containing the extracted text, search matches,
              or metadata about the document. Contains an 'error' key if reading fails.
     """
+    if not isinstance(file_path, str) or not file_path.strip() or len(file_path) > 4096 or "\0" in file_path:
+        return _json({"error": "file_path must be a valid path"})
+    file_path = file_path.strip()
     if not os.path.exists(file_path):
         return _json({"error": f"File not found: {file_path}"})
     if not os.path.isfile(file_path):
         return _json({"error": f"Not a file: {file_path}"})
+
+    try:
+        file_size = os.path.getsize(file_path)
+    except OSError as exc:
+        return _json({"error": f"Could not inspect document: {exc}"})
+    if file_size > MAX_DOCUMENT_BYTES:
+        return _json({
+            "error": f"Document exceeds the {MAX_DOCUMENT_BYTES}-byte direct-read limit",
+            "guidance": "Use index_vault for bounded, resumable retrieval of very large documents.",
+        })
 
     ext = os.path.splitext(file_path)[1].lower()
     if ext not in SUPPORTED_DOCUMENT_EXTENSIONS:
@@ -360,7 +396,7 @@ def read_document(
 
         base = {
             "file": file_path,
-            "size_bytes": os.path.getsize(file_path),
+            "size_bytes": file_size,
             **info,
         }
 

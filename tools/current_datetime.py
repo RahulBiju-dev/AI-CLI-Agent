@@ -10,6 +10,8 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 def get_current_datetime(timezone: str | None = None) -> str:
     """Return a stable, machine-readable snapshot of the current date and time."""
     requested_timezone = str(timezone or "").strip()
+    if len(requested_timezone) > 255 or any(ord(char) < 32 for char in requested_timezone):
+        return json.dumps({"error": "timezone must be a valid IANA timezone name"})
     try:
         if requested_timezone:
             zone = ZoneInfo(requested_timezone)
@@ -18,7 +20,7 @@ def get_current_datetime(timezone: str | None = None) -> str:
         else:
             now = datetime.now().astimezone()
             timezone_name = getattr(now.tzinfo, "key", None) or now.tzname() or "local"
-    except (ZoneInfoNotFoundError, ValueError):
+    except (ZoneInfoNotFoundError, ValueError, OSError):
         return json.dumps({
             "error": f"Unknown IANA timezone: {requested_timezone}",
             "example": "Asia/Kolkata",

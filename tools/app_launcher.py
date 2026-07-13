@@ -28,6 +28,7 @@ _APP_CACHE: tuple[float, list[dict]] = (0.0, [])
 _APP_CACHE_LOCK = threading.Lock()
 _APP_CACHE_SECONDS = 30.0
 MAX_APPS_PER_REQUEST = 10
+MAX_DESKTOP_FILE_BYTES = 1 * 1024 * 1024
 
 # App launching is intentionally not a general process-execution primitive. These
 # programs can turn an innocent-looking app request into arbitrary command access.
@@ -75,6 +76,8 @@ def _parse_desktop_file(file_path: str) -> dict | None:
             or the file is invalid.
     """
     try:
+        if os.path.getsize(file_path) > MAX_DESKTOP_FILE_BYTES:
+            return None
         with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
             lines = f.readlines()
     except Exception:
@@ -127,7 +130,7 @@ def _get_installed_apps() -> list[dict]:
     global _APP_CACHE
     with _APP_CACHE_LOCK:
         cached_at, cached_apps = _APP_CACHE
-        if cached_apps and time.monotonic() - cached_at < _APP_CACHE_SECONDS:
+        if cached_at > 0 and time.monotonic() - cached_at < _APP_CACHE_SECONDS:
             return [dict(app) for app in cached_apps]
 
     # User entries precede system entries because desktop files with the same
@@ -246,7 +249,17 @@ def _is_safe_desktop_entry(app: dict) -> bool:
         executable_index += 1
         while executable_index < len(command):
             token = command[executable_index]
-            if token.startswith("-") or ("=" in token and not token.startswith(("/", "\\"))):
+            if token == "--":
+                executable_index += 1
+                break
+            if token.startswith("-"):
+                # Options such as ``env -S`` can conceal a shell command in a
+                # single argument. Refuse complex wrappers instead of guessing.
+                return False
+            if "=" in token and not token.startswith(("/", "\\")):
+                name, _value = token.split("=", 1)
+                if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+                    return False
                 executable_index += 1
                 continue
             break

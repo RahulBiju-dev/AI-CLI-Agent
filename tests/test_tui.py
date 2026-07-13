@@ -512,6 +512,23 @@ class SlashFilterTests(unittest.TestCase):
 
 
 class CommandPaletteEscapeTests(unittest.TestCase):
+    def test_app_uses_no_function_key_shortcuts(self):
+        try:
+            import textual  # noqa: F401
+        except ImportError:
+            self.skipTest("textual not installed")
+
+        from agent.tui import build_app_class
+
+        AppCls = build_app_class()
+        keys = []
+        for binding in AppCls.BINDINGS:
+            key = getattr(binding, "key", None) or getattr(binding, "keys", None)
+            keys.extend(str(key).casefold().split(","))
+        self.assertFalse(
+            any(key.strip().startswith("f") and key.strip()[1:].isdigit() for key in keys)
+        )
+
     def test_escape_closes_palette_opened_via_shortcut(self):
         try:
             import textual  # noqa: F401

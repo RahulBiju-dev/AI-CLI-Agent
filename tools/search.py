@@ -13,6 +13,7 @@ to scrape the top public results in the same response.
 """
 
 import json
+from urllib.parse import urlsplit
 
 from tools.web_scraper import web_scrape
 
@@ -83,7 +84,14 @@ def web_search(
 
     try:
         from ddgs import DDGS
+    except ImportError:
+        return json.dumps({
+            "error": "Web search is unavailable because the optional 'ddgs' package is not installed",
+            "error_code": "missing_dependency",
+            "dependency": "ddgs",
+        }, separators=(",", ":"))
 
+    try:
         # Initialize DuckDuckGo Search client
         with DDGS() as ddgs:
             # Perform text search and limit results
@@ -92,13 +100,39 @@ def web_search(
         # Extract only the title and body snippet from each result to save space.
         condensed = []
         seen_urls = set()
-        for result in raw_results:
+        skipped_results = 0
+        for result in raw_results[:max_results]:
+            if not isinstance(result, dict):
+                skipped_results += 1
+                continue
             url = str(result.get("href") or result.get("url") or "").strip()
+            if len(url) > 4096 or any(ord(char) < 32 for char in url):
+                skipped_results += 1
+                continue
+            try:
+                parsed_url = urlsplit(url)
+                port = parsed_url.port
+            except ValueError:
+                skipped_results += 1
+                continue
+            if (
+                parsed_url.scheme.lower() not in {"http", "https"}
+                or not parsed_url.hostname
+                or parsed_url.username is not None
+                or parsed_url.password is not None
+                or (port is not None and not 1 <= port <= 65535)
+            ):
+                skipped_results += 1
+                continue
             if url and url in seen_urls:
                 continue
             if url:
                 seen_urls.add(url)
-            condensed.append({"title": str(result.get("title") or ""), "url": url, "snippet": str(result.get("body") or "")})
+            condensed.append({
+                "title": str(result.get("title") or "")[:500],
+                "url": url,
+                "snippet": str(result.get("body") or "")[:4_000],
+            })
 
         if include_content:
             try:
@@ -113,12 +147,14 @@ def web_search(
             chars_limit = max(1000, min(20000, chars_limit))
 
             scraped_count = 0
+            scrape_attempts = 0
             for item in condensed:
-                if scraped_count >= page_limit:
+                if scrape_attempts >= page_limit:
                     break
                 url = item.get("url", "")
                 if not url:
                     continue
+                scrape_attempts += 1
                 scraped = _safe_json_loads(web_scrape(url=url, max_chars=chars_limit, include_links=False))
                 if isinstance(scraped, dict) and scraped.get("error"):
                     item["scrape_error"] = scraped["error"]
@@ -137,6 +173,11 @@ def web_search(
                     item["scrape_error"] = "unexpected scrape result"
 
         # Return results as a compact JSON string
+        if skipped_results:
+            return json.dumps({
+                "results": condensed,
+                "skipped_invalid_results": skipped_results,
+            }, ensure_ascii=False, separators=(",", ":"))
         return json.dumps(condensed, ensure_ascii=False, separators=(",", ":"))
 
     except Exception as exc:

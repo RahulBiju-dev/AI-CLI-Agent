@@ -45,6 +45,12 @@ def normalize_embeddings(response: Any) -> List[List[float]]:
 
 
 def _clean_inputs(texts: Sequence[str]) -> list[str]:
+    if isinstance(texts, (str, bytes, bytearray)):
+        raise TypeError("texts must be a sequence of strings, not a single string")
+    if not isinstance(texts, Sequence):
+        raise TypeError("texts must be a sequence")
+    if len(texts) > 1_000:
+        raise ValueError("At most 1,000 texts may be embedded in one call")
     cleaned = []
     for text in texts:
         value = str(text or "").strip()
@@ -100,7 +106,10 @@ def embed_texts(
     if not inputs:
         return []
 
-    timeout = max(1, min(int(timeout), 300))
+    try:
+        timeout = max(1, min(int(timeout), 300))
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("timeout must be an integer number of seconds") from exc
     thread_id = threading.get_ident()
     coordinator = _EMBED_SERVICE.coordinator
     owner = (

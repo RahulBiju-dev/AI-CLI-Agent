@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import tempfile
 import threading
@@ -17,6 +18,7 @@ from agent.platform_runtime import (
     path_is_within,
     spawn_detached,
     terminate_process_tree,
+    validate_http_url,
 )
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -25,6 +27,9 @@ STORE_PATH = DATA_DIR / "routines.json"
 LEGACY_STORE_PATH = PROJECT_ROOT / ".selene" / "routines.json"
 MAX_ACTIONS = 50
 MAX_TRIGGERS = 25
+MAX_ROUTINE_NAME_CHARS = 200
+MAX_COMMAND_ARGUMENTS = 100
+MAX_ARGUMENT_CHARS = 4096
 AUTOMATIC_ACTION_TYPES = {"open_app", "delay", "tool"}
 AUTOMATIC_TOOL_NAMES = {"open_app", "launch_apps"}
 CONFIRMATION_TOOL_NAMES = {*AUTOMATIC_TOOL_NAMES, "open_terminal_at_path"}
@@ -42,13 +47,27 @@ def _active_store_path() -> Path:
 def _load() -> dict[str, dict]:
     store = _active_store_path()
     try:
-        return read_json_preserved(store, expected_type=dict)
+        routines = read_json_preserved(store, expected_type=dict)
     except FileNotFoundError:
         return {}
     except OSError as exc:
         raise PersistenceError(
             f"Routine state at '{store}' could not be read and was preserved: {exc}"
         ) from exc
+    invalid = [
+        name
+        for name, value in routines.items()
+        if not isinstance(name, str)
+        or not isinstance(value, dict)
+        or not isinstance(value.get("triggers", []), list)
+        or not isinstance(value.get("actions", []), list)
+        or any(not isinstance(item, dict) for item in value.get("actions", []))
+    ]
+    if invalid:
+        raise PersistenceError(
+            f"Routine state at '{store}' contains invalid records and was preserved without modification"
+        )
+    return routines
 
 
 def _save(routines: dict[str, dict]) -> None:
@@ -123,11 +142,38 @@ def _validate(routine: dict) -> list[str]:
             if not isinstance(item.get("argv"), list) or not item.get("argv"):
                 errors.append(f"actions[{index}].argv must be a non-empty argument array; shell strings are not accepted")
             else:
-                executable = str(item["argv"][0])
+                argv = item["argv"]
+                if len(argv) > MAX_COMMAND_ARGUMENTS:
+                    errors.append(f"actions[{index}].argv may contain at most {MAX_COMMAND_ARGUMENTS} arguments")
+                invalid_arg = any(
+                    not isinstance(value, str) or not value or len(value) > MAX_ARGUMENT_CHARS or "\0" in value
+                    for value in argv
+                )
+                if invalid_arg:
+                    errors.append(f"actions[{index}].argv entries must be non-empty strings of at most {MAX_ARGUMENT_CHARS} characters")
+                executable = str(argv[0])
                 if executable not in ALLOWED_ROUTINE_COMMANDS:
                     errors.append(f"actions[{index}].argv[0] must be an allowed command ({', '.join(sorted(ALLOWED_ROUTINE_COMMANDS))}); found '{executable}'")
-        elif item.get("type") == "open_app" and not isinstance(item.get("app_name"), str):
-            errors.append(f"actions[{index}].app_name must be an installed application display name")
+                try:
+                    timeout = float(item.get("timeout", 60))
+                    if not math.isfinite(timeout) or not 1 <= timeout <= 600:
+                        raise ValueError
+                except (TypeError, ValueError, OverflowError):
+                    errors.append(f"actions[{index}].timeout must be between 1 and 600 seconds")
+                cwd = item.get("cwd", ".")
+                if not isinstance(cwd, str) or not cwd.strip() or len(cwd) > MAX_ARGUMENT_CHARS or "\0" in cwd:
+                    errors.append(f"actions[{index}].cwd must be a valid project-relative path")
+                else:
+                    try:
+                        requested_cwd = (PROJECT_ROOT / cwd).resolve()
+                    except (OSError, RuntimeError):
+                        requested_cwd = None
+                    if requested_cwd is None or not path_is_within(requested_cwd, PROJECT_ROOT):
+                        errors.append(f"actions[{index}].cwd must stay inside the project workspace")
+        elif item.get("type") == "open_app":
+            app_name = item.get("app_name")
+            if not isinstance(app_name, str) or not app_name.strip() or len(app_name) > 128:
+                errors.append(f"actions[{index}].app_name must be an installed application display name")
         elif item.get("type") == "tool":
             if not isinstance(item.get("tool_name"), str) or not item["tool_name"].strip():
                 errors.append(f"actions[{index}].tool_name must be a registered tool name")
@@ -135,8 +181,20 @@ def _validate(routine: dict) -> list[str]:
                 errors.append(f"actions[{index}] cannot recursively call automated_routine_executor")
             if not isinstance(item.get("arguments", {}), dict):
                 errors.append(f"actions[{index}].arguments must be an object")
-        elif item.get("type") == "open_url" and not str(item.get("url", "")).startswith(("http://", "https://")):
-            errors.append(f"actions[{index}].url must use http or https")
+        elif item.get("type") == "open_url":
+            try:
+                validate_http_url(item.get("url"))
+            except ValueError as exc:
+                errors.append(f"actions[{index}].url is invalid: {exc}")
+        elif item.get("type") == "delay":
+            try:
+                seconds = float(item.get("seconds", 1))
+                if not math.isfinite(seconds) or not 0 <= seconds <= 30:
+                    raise ValueError
+            except (TypeError, ValueError, OverflowError):
+                errors.append(f"actions[{index}].seconds must be between 0 and 30")
+        if isinstance(item, dict) and "continue_on_error" in item and not isinstance(item["continue_on_error"], bool):
+            errors.append(f"actions[{index}].continue_on_error must be boolean")
     if routine.get("allow_automatic") is True:
         unsafe = sorted({
             str(item.get("type"))
@@ -358,6 +416,9 @@ def automated_routine_executor(
     if action == "define":
         if not name or not routine:
             return json.dumps({"error": "name and routine are required for define"})
+        if not isinstance(name, str) or not name.strip() or len(name.strip()) > MAX_ROUTINE_NAME_CHARS or any(ord(char) < 32 for char in name):
+            return json.dumps({"error": f"name must contain 1-{MAX_ROUTINE_NAME_CHARS} printable characters"})
+        name = name.strip()
         candidate = dict(routine)
         candidate["description"] = str(candidate.get("description", "")).strip()
         candidate["triggers"] = _normalized_triggers(candidate, trigger)
@@ -370,15 +431,18 @@ def automated_routine_executor(
                 "error": "Persistent automatic execution requires confirmed=true after the user approves the preview.",
                 "routine": candidate,
             }, ensure_ascii=False)
-        with _STORE_LOCK:
-            routines = _load()
-            routines[name] = {
-                "description": candidate["description"],
-                "triggers": candidate["triggers"],
-                "actions": candidate["actions"],
-                "automatic_approved": wants_automatic and confirmed is True,
-            }
-            _save(routines)
+        try:
+            with _STORE_LOCK:
+                routines = _load()
+                routines[name] = {
+                    "description": candidate["description"],
+                    "triggers": candidate["triggers"],
+                    "actions": candidate["actions"],
+                    "automatic_approved": wants_automatic and confirmed is True,
+                }
+                _save(routines)
+        except (PersistenceError, OSError, TypeError, ValueError) as exc:
+            return json.dumps({"error": str(exc), "store": str(_active_store_path()), "preserved": True})
         return json.dumps({
             "ok": True,
             "defined": name,
@@ -391,12 +455,15 @@ def automated_routine_executor(
     if action == "delete":
         if not confirmed:
             return json.dumps({"error": "Deleting a routine requires confirmed=true"})
-        with _STORE_LOCK:
-            routines = _load()
-            if not name or name not in routines:
-                return json.dumps({"error": "Routine not found"})
-            del routines[name]
-            _save(routines)
+        try:
+            with _STORE_LOCK:
+                routines = _load()
+                if not name or name not in routines:
+                    return json.dumps({"error": "Routine not found"})
+                del routines[name]
+                _save(routines)
+        except (PersistenceError, OSError, TypeError, ValueError) as exc:
+            return json.dumps({"error": str(exc), "store": str(_active_store_path()), "preserved": True})
         return json.dumps({"ok": True, "deleted": name})
     if action not in {"show", "run"}:
         return json.dumps({"error": "action must be list, define, show, run, or delete"})

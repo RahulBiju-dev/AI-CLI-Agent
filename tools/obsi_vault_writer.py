@@ -9,6 +9,13 @@ from agent.platform_runtime import get_runtime_paths
 
 DATA_DIR = str(get_runtime_paths().data_dir)
 VAULTS_DIR = os.path.join(DATA_DIR, "vaults")
+MAX_NOTE_CHARS = 5_000_000
+MAX_TITLE_CHARS = 500
+MAX_LINKS = 200
+MAX_TAGS = 200
+MAX_LINK_CHARS = 500
+MAX_TAG_CHARS = 100
+MAX_VERSION_ATTEMPTS = 10_000
 
 def _json(data: dict) -> str:
     return json.dumps(data, ensure_ascii=False)
@@ -53,14 +60,30 @@ def create_structured_note(
         title = "Untitled Note"
     else:
         title = str(title)
+    if len(title) > MAX_TITLE_CHARS:
+        return _json({"error": f"title exceeds the {MAX_TITLE_CHARS}-character limit"})
     display_title = re.sub(r"[\r\n\x00-\x1f]+", " ", title).strip() or "Untitled Note"
         
     if not content:
         content = ""
     else:
         content = str(content)
-        
-    os.makedirs(VAULTS_DIR, exist_ok=True)
+    if len(content) > MAX_NOTE_CHARS:
+        return _json({"error": f"Note content exceeds the {MAX_NOTE_CHARS}-character limit"})
+    for field_name, value, limit in (
+        ("incoming_links", incoming_links, MAX_LINKS),
+        ("outgoing_links", outgoing_links, MAX_LINKS),
+        ("tags", tags, MAX_TAGS),
+    ):
+        if value is not None and not isinstance(value, list):
+            return _json({"error": f"{field_name} must be an array"})
+        if isinstance(value, list) and len(value) > limit:
+            return _json({"error": f"{field_name} exceeds the {limit}-item limit"})
+
+    try:
+        os.makedirs(VAULTS_DIR, exist_ok=True)
+    except OSError as exc:
+        return _json({"error": f"Failed to prepare the vault directory: {exc}"})
     
     # 2. Graph View Optimization: Sanitize file names (replace invalid characters with dashes)
     safe_title = unicodedata.normalize("NFKC", display_title)
@@ -80,6 +103,10 @@ def create_structured_note(
     tags = _as_list(tags)
     incoming_links = _as_list(incoming_links)
     outgoing_links = _as_list(outgoing_links)
+    if any(len(str(value)) > MAX_LINK_CHARS for value in [*incoming_links, *outgoing_links]):
+        return _json({"error": f"Wiki links may contain at most {MAX_LINK_CHARS} characters"})
+    if any(len(str(value)) > MAX_TAG_CHARS for value in tags):
+        return _json({"error": f"Tags may contain at most {MAX_TAG_CHARS} characters"})
 
     if tags:
         note_lines.append("---")
@@ -121,6 +148,8 @@ def create_structured_note(
                     f.write(final_content)
                 break
             except FileExistsError:
+                if counter > MAX_VERSION_ATTEMPTS:
+                    return _json({"error": "Could not allocate a unique note filename within the version limit"})
                 filepath = os.path.join(VAULTS_DIR, f"{safe_title} v{counter}.md")
                 counter += 1
     except Exception as e:
