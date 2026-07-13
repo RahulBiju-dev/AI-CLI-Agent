@@ -794,5 +794,89 @@ class SessionsMenuTests(unittest.TestCase):
             asyncio.run(_run())
 
 
+class PromptQueueTests(unittest.TestCase):
+    def test_composer_stays_open_and_queues_while_busy(self):
+        try:
+            import textual  # noqa: F401
+        except ImportError:
+            self.skipTest("textual not installed")
+
+        import asyncio
+        import threading
+
+        from agent.tui import build_app_class
+
+        AppCls = build_app_class()
+        started = threading.Event()
+        release = threading.Event()
+        turns: list[str] = []
+        block_first = {"yes": True}
+
+        def process_turn(user_input, session, history, default_system_prompt):
+            turns.append(user_input)
+            if block_first["yes"]:
+                block_first["yes"] = False
+                started.set()
+                release.wait(timeout=5.0)
+
+        app = AppCls(
+            session={
+                "history": True,
+                "system": "",
+                "options": {},
+                "verbose": False,
+                "wordwrap": True,
+                "format": "",
+                "think": True,
+                "runtime_profile": "manual",
+            },
+            history=[],
+            default_system_prompt="sys",
+            process_turn=process_turn,
+            handle_command=lambda *a, **k: True,
+            slash_completions=("/help",),
+            slash_descriptions={"/help": "Help"},
+            status_meta={"profile": "manual"},
+        )
+
+        async def _run():
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                inp = app.query_one("#prompt-input")
+                self.assertFalse(inp.disabled)
+
+                # Start a blocking turn.
+                app._submit("first")
+                self.assertTrue(started.wait(timeout=2.0))
+                self.assertTrue(app._busy)
+                # Composer must remain usable while generating.
+                self.assertFalse(inp.disabled)
+
+                # Queue up to 3 follow-ups.
+                app._submit("q1")
+                app._submit("q2")
+                app._submit("q3")
+                self.assertEqual(app._prompt_queue, ["q1", "q2", "q3"])
+
+                # Fourth is rejected (queue full).
+                before = list(app._prompt_queue)
+                app._submit("q4")
+                self.assertEqual(app._prompt_queue, before)
+
+                # Finish current turn — remaining queue drains FIFO automatically.
+                release.set()
+                for _ in range(40):
+                    if len(turns) >= 4 and not app._busy and not app._prompt_queue:
+                        break
+                    await pilot.pause(0.05)
+                self.assertEqual(turns, ["first", "q1", "q2", "q3"])
+                self.assertEqual(app._prompt_queue, [])
+                self.assertFalse(app._busy)
+                self.assertFalse(inp.disabled)
+
+        asyncio.run(_run())
+        release.set()
+
+
 if __name__ == "__main__":
     unittest.main()

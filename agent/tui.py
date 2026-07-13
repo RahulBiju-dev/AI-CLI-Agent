@@ -1060,6 +1060,9 @@ def build_app_class():
             self.status_meta = dict(status_meta or {})
             self._busy = False
             self._busy_lock = threading.Lock()
+            # Prompts typed while a turn is running (FIFO, capped).
+            self._prompt_queue: list[str] = []
+            self._PROMPT_QUEUE_MAX = 3
             self._quit_armed_until = 0.0
             self._selene_palette = None  # filled on mount via ui_apply_theme
             self._stream_widget: MessageBlock | None = None
@@ -2205,8 +2208,45 @@ def build_app_class():
 
         # ── Turn execution ────────────────────────────────────────────
 
+        def _queue_depth(self) -> int:
+            with self._busy_lock:
+                return len(self._prompt_queue)
+
+        def _refresh_queue_ui(self) -> None:
+            """Show queue depth in the composer shortcut strip while pending."""
+            try:
+                hint = self.query_one("#composer-hint", Static)
+                composer = self.query_one(Composer)
+            except Exception:
+                return
+            n = self._queue_depth()
+            if n <= 0:
+                try:
+                    hint.update(composer._shortcut_strip())
+                except Exception:
+                    pass
+                return
+            from agent.tui_themes import DEFAULT_THEME, rich_palette
+
+            pal = getattr(self, "_selene_palette", None) or rich_palette(DEFAULT_THEME)
+            soft = pal["text_soft"]
+            faint = pal["faint"]
+            line = Text()
+            line.append(f"queued {n}/{self._PROMPT_QUEUE_MAX}", style=f"bold {soft}")
+            line.append("  ·  ", style=faint)
+            line.append("enter queues next", style=faint)
+            if n >= self._PROMPT_QUEUE_MAX:
+                line.append("  ·  ", style=faint)
+                line.append("full", style=faint)
+            try:
+                hint.update(line)
+            except Exception:
+                pass
+
         def _submit(self, user_input: str) -> None:
             stripped = str(user_input or "").strip()
+            if not stripped:
+                return
             base = stripped.split(None, 1)[0].lower() if stripped else ""
             # Voice toggle must stay on the UI thread (no generation lock).
             if base == "/speech":
@@ -2217,9 +2257,27 @@ def build_app_class():
 
             with self._busy_lock:
                 if self._busy:
-                    self.ui_status("Still generating — wait for the current turn", kind="warn")
-                    return
-                self._busy = True
+                    # Keep the composer open: queue for after the current turn.
+                    if len(self._prompt_queue) >= self._PROMPT_QUEUE_MAX:
+                        full = True
+                    else:
+                        self._prompt_queue.append(stripped)
+                        full = False
+                    depth = len(self._prompt_queue)
+                else:
+                    self._busy = True
+                    full = False
+                    depth = -1
+
+            if depth >= 0:
+                # Was busy — queued or rejected.
+                self._refresh_queue_ui()
+                if full:
+                    self.ui_status(
+                        f"Prompt queue full ({self._PROMPT_QUEUE_MAX})",
+                        kind="warn",
+                    )
+                return
 
             # Match web: stop mic when a turn starts.
             self._stop_voice(silent=True, abort=True)
@@ -2233,7 +2291,12 @@ def build_app_class():
             self._stop_activity_timer()
             self._remove_activity_widget()
             self._activity_phase = "idle"
-            self.query_one("#prompt-input", Input).disabled = True
+            # Composer stays enabled so the user can type / queue the next prompt.
+            try:
+                inp = self.query_one("#prompt-input", Input)
+                inp.disabled = False
+            except Exception:
+                pass
 
             def work() -> None:
                 try:
@@ -2244,11 +2307,11 @@ def build_app_class():
                         if result is None:
                             self.call_from_thread(self.exit)
                             return
-                        base = user_input.strip().split(None, 1)[0].lower()
-                        if base == "/clear":
+                        cmd_base = user_input.strip().split(None, 1)[0].lower()
+                        if cmd_base == "/clear":
                             # Reset UI after core clears history; show one confirmation.
                             self.call_from_thread(self._clear_conversation_ui)
-                        elif base == "/load" and len(user_input.strip().split(None, 1)) > 1:
+                        elif cmd_base == "/load" and len(user_input.strip().split(None, 1)) > 1:
                             # Rebuild transcript after a successful /load <target>.
                             self.call_from_thread(self._rebuild_transcript_from_history)
                     else:
@@ -2273,15 +2336,26 @@ def build_app_class():
             if self._thinking_widget is not None:
                 self.ui_thinking_end()
             self._clear_waiting_activity()
+            next_prompt: str | None = None
             with self._busy_lock:
                 self._busy = False
-            inp = self.query_one("#prompt-input", Input)
-            inp.disabled = False
-            inp.focus()
+                if self._prompt_queue:
+                    next_prompt = self._prompt_queue.pop(0)
+            try:
+                inp = self.query_one("#prompt-input", Input)
+                inp.disabled = False
+                if next_prompt is None:
+                    inp.focus()
+            except Exception:
+                pass
             # Flush any remaining capture buffer.
             if self._capture_file is not None:
                 self._capture_file.flush()
             self.refresh_context_usage()
+            self._refresh_queue_ui()
+            # Serve the next queued prompt immediately (FIFO).
+            if next_prompt is not None:
+                self._submit(next_prompt)
 
         def _reset_transcript(self) -> None:
             """Clear the chat view after /clear (history already wiped by handler).
@@ -2456,7 +2530,7 @@ def build_app_class():
             shortcuts.append(f"{GLYPH_SECTION} ", style="#6b6b6b")
             shortcuts.append("shortcuts\n", style="bold #7a7a7a")
             for key, desc in (
-                ("Enter / Ctrl+J", "Send message"),
+                ("Enter / Ctrl+J", "Send message (queues up to 3 while generating)"),
                 ("Ctrl+C", "Stop generation"),
                 ("Ctrl+C twice", "Quit application"),
                 ("Ctrl+/", "Open command palette"),
@@ -2474,9 +2548,7 @@ def build_app_class():
             self._mount_block(shortcuts, "system")
 
         def action_submit_input(self) -> None:
-            """Ctrl+J — send the current composer text (or open selected chat)."""
-            if self._busy:
-                return
+            """Ctrl+J — send the current composer text (or queue while generating)."""
             self._submit_from_input()
 
         # ── Voice input (centered speech popup) ───────────────────────
