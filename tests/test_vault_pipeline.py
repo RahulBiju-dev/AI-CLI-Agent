@@ -99,6 +99,198 @@ class VaultReadTests(unittest.TestCase):
 
 
 class IncrementalPdfIndexTests(unittest.TestCase):
+    def test_chroma_directory_preserves_legacy_store_without_migration(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            vaults = root / "vaults"
+            managed = vaults / ".chroma"
+            legacy = root / ".chroma"
+
+            self.assertEqual(
+                vault_indexer._select_chroma_directory(str(root), str(vaults)),
+                str(managed),
+            )
+            legacy.mkdir()
+            self.assertEqual(
+                vault_indexer._select_chroma_directory(str(root), str(vaults)),
+                str(legacy),
+            )
+
+    def test_single_file_ignores_stale_vault_path_and_creates_managed_directory(self):
+        collection = FakeCollection({})
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source_directory = root / "external source"
+            source_directory.mkdir()
+            source_file = source_directory / "notes.txt"
+            source_file.write_text("searchable notes", encoding="utf-8")
+            vaults_directory = root / "runtime" / "vaults"
+            stale_chroma_path = root / "missing legacy" / ".chroma"
+            with (
+                patch.object(vault_indexer, "VAULTS_DIR", str(vaults_directory)),
+                patch.object(vault_indexer, "CHROMA_DIR", str(vaults_directory / ".chroma")),
+                patch.object(vault_indexer, "get_chroma_client", return_value=FakeClient(collection)),
+                patch.object(
+                    vault_indexer,
+                    "embed_texts",
+                    side_effect=lambda docs, **kwargs: [[1.0] for _ in docs],
+                ),
+                patch.object(vault_indexer, "register_vault_alias"),
+            ):
+                payload = json.loads(vault_indexer.index_vault(
+                    collection="lecture",
+                    file_path=str(source_file),
+                    vault_path=str(stale_chroma_path),
+                ))
+
+            self.assertTrue(payload["complete"])
+            self.assertNotIn("error", payload)
+            self.assertEqual(payload["source_root"], str(source_directory))
+            self.assertNotIn("vault_directory", payload)
+            self.assertNotIn("persist_directory", payload)
+            self.assertTrue((vaults_directory / "lecture").is_dir())
+            metadata = next(iter(collection.documents.values()))[1]
+            self.assertEqual(metadata["source"], "notes.txt")
+
+    def test_empty_source_folder_is_not_reported_as_completed_indexing(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source_directory = root / "empty source"
+            source_directory.mkdir()
+            vaults_directory = root / "runtime" / "vaults"
+            with (
+                patch.object(vault_indexer, "VAULTS_DIR", str(vaults_directory)),
+                patch.object(vault_indexer, "CHROMA_DIR", str(vaults_directory / ".chroma")),
+                patch.object(vault_indexer, "get_chroma_client") as get_client,
+            ):
+                payload = json.loads(vault_indexer.index_vault(
+                    collection="empty",
+                    vault_path=str(source_directory),
+                ))
+
+            self.assertFalse(payload["complete"])
+            self.assertIn("no supported files", payload["error"])
+            self.assertTrue((vaults_directory / "empty").is_dir())
+            get_client.assert_not_called()
+
+    def test_status_uses_checkpoint_when_source_and_stale_vault_path_are_missing(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            missing_source = root / "unmounted" / "notes.pdf"
+            vaults_directory = root / "runtime" / "vaults"
+            state = {
+                "collection": "lecture",
+                "fingerprint": "fingerprint",
+                "source": "notes.pdf",
+                "source_path": str(missing_source),
+                "next_page": 21,
+                "page_count": 100,
+                "indexed_pages": 20,
+                "indexed_chunks": 20,
+                "complete": False,
+                "config": {
+                    "chunk_size": 500,
+                    "chunk_overlap": 0,
+                    "embedding_model": "embed",
+                    "vision_mode": "all",
+                },
+            }
+            with patch.object(vault_indexer, "VAULTS_DIR", str(vaults_directory)):
+                vault_indexer._save_index_job("lecture", str(missing_source), state)
+                status = json.loads(vault_indexer.index_vault(
+                    action="status",
+                    collection="lecture",
+                    file_path=str(missing_source),
+                    vault_path=str(root / "missing legacy" / ".chroma"),
+                ))
+                collection_status = json.loads(vault_indexer.index_vault(
+                    action="status",
+                    collection="lecture",
+                ))
+                failed_index = json.loads(vault_indexer.index_vault(
+                    action="index",
+                    collection="lecture",
+                    file_path=str(missing_source),
+                    vault_path=str(root / "missing legacy" / ".chroma"),
+                ))
+
+        self.assertEqual(status["job_count"], 1)
+        self.assertEqual(status["jobs"][0]["next_page"], 21)
+        self.assertTrue(status["jobs"][0]["checkpoint_exists"])
+        self.assertEqual(collection_status["job_count"], 1)
+        self.assertEqual(collection_status["jobs"][0]["source_path"], str(missing_source))
+        self.assertIsNone(collection_status["source_root"])
+        self.assertIn("source file not found", failed_index["error"])
+        self.assertNotIn("vault path", failed_index["error"])
+
+    def test_collection_status_on_fresh_runtime_is_empty_not_path_error(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            vaults_directory = Path(temporary) / "not-created" / "vaults"
+            with patch.object(vault_indexer, "VAULTS_DIR", str(vaults_directory)):
+                status = json.loads(vault_indexer.index_vault(
+                    action="status",
+                    collection="lecture",
+                ))
+
+        self.assertFalse(status["complete"])
+        self.assertEqual(status["jobs"], [])
+        self.assertEqual(status["job_count"], 0)
+        self.assertNotIn("error", status)
+
+    def test_resume_keeps_checkpoint_source_label_when_caller_root_changes(self):
+        class FakePage:
+            def __init__(self, number):
+                self.number = number
+
+            def extract_text(self):
+                return f"page {self.number} text"
+
+            def get(self, key):
+                return {}
+
+        class FakeReader:
+            is_encrypted = False
+
+            def __init__(self, stream):
+                self.pages = [FakePage(1), FakePage(2)]
+
+        collection = FakeCollection({})
+        with tempfile.TemporaryDirectory() as temporary:
+            pdf_path = Path(temporary) / "slides.pdf"
+            pdf_path.write_bytes(b"fake pdf")
+            with (
+                patch.dict(sys.modules, {"pypdf": SimpleNamespace(PdfReader=FakeReader)}),
+                patch.object(vault_indexer, "VAULTS_DIR", temporary),
+                patch.object(vault_indexer, "_pdf_fingerprint", return_value="fingerprint"),
+                patch.object(
+                    vault_indexer,
+                    "embed_texts",
+                    side_effect=lambda docs, **kwargs: [[1.0] for _ in docs],
+                ),
+            ):
+                first = vault_indexer._index_pdf_incremental(
+                    path=str(pdf_path), rel="legacy/root/slides.pdf",
+                    collection_name="lecture", collection_obj=collection,
+                    chunk_size=500, chunk_overlap=0, model="embed",
+                    vision_mode="off", max_pages=1, resume_page=None,
+                    cancellation_token=None,
+                )
+                second = vault_indexer._index_pdf_incremental(
+                    path=str(pdf_path), rel="slides.pdf",
+                    collection_name="lecture", collection_obj=collection,
+                    chunk_size=500, chunk_overlap=0, model="embed",
+                    vision_mode="off", max_pages=1, resume_page=2,
+                    cancellation_token=None,
+                )
+
+        self.assertFalse(first["complete"])
+        self.assertTrue(second["complete"])
+        self.assertEqual(second["source"], "legacy/root/slides.pdf")
+        self.assertTrue(all(
+            item_id.startswith("legacy/root/slides.pdf::pdf::fingerprint::")
+            for item_id in collection.documents
+        ))
+
     def test_pdf_index_resumes_from_atomic_page_checkpoint(self):
         class FakePage:
             def __init__(self, number):
@@ -507,6 +699,7 @@ class IncrementalPdfIndexTests(unittest.TestCase):
             ):
                 first = json.loads(vault_indexer.index_vault(
                     file_path=str(pdf_path), collection="lecture",
+                    vault_path=str(Path(temporary) / "missing" / ".chroma"),
                     vision_mode="off", max_pages=1,
                     chunk_size=700, chunk_overlap=0, model="embed",
                 ))
@@ -515,6 +708,9 @@ class IncrementalPdfIndexTests(unittest.TestCase):
 
         self.assertEqual(continuation["chunk_size"], 700)
         self.assertEqual(continuation["chunk_overlap"], 0)
+        self.assertNotIn("vault_path", continuation)
+        self.assertNotIn("persist_directory", first)
+        self.assertNotIn("vault_directory", first)
         self.assertTrue(second["complete"])
         self.assertEqual(second["chunk_size"], 700)
         self.assertEqual(second["chunk_overlap"], 0)

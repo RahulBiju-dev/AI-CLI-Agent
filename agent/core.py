@@ -2951,7 +2951,6 @@ def _handle_vault(args: str) -> None:
             }
         else:
             index_args = {
-                "vault_path": os.path.dirname(target) or ".",
                 "file_path": target,
                 "vision_mode": vision_mode,
                 "max_pages": max_pages,
@@ -2994,7 +2993,6 @@ def _handle_vault(args: str) -> None:
             _console.print("[red]Usage: /vault status <pdf-path> [--collection name][/]\n")
             return
         status_args = {
-            "vault_path": os.path.dirname(target) or ".",
             "file_path": target,
             "action": "status",
         }
@@ -3278,7 +3276,6 @@ def process_user_turn(
                             "function": {
                                 "name": "index_vault",
                                 "arguments": {
-                                    "vault_path": os.path.dirname(user_input) or ".",
                                     "file_path": user_input,
                                 },
                             }

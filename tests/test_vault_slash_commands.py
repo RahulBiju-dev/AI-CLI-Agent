@@ -131,6 +131,7 @@ class VaultSlashCommandTests(unittest.TestCase):
         spec = mock_execute.call_args[0][0]
         self.assertEqual(spec.name, "index_vault")
         self.assertEqual(spec.arguments["action"], "status")
+        self.assertNotIn("vault_path", spec.arguments)
 
     def test_vault_add_forwards_visual_batch_options_without_forcing_generic_collection(self):
         with (
@@ -155,6 +156,7 @@ class VaultSlashCommandTests(unittest.TestCase):
         self.assertEqual(spec.arguments["vision_mode"], "all")
         self.assertEqual(spec.arguments["max_pages"], 5)
         self.assertNotIn("collection", spec.arguments)
+        self.assertNotIn("vault_path", spec.arguments)
 
 
 if __name__ == "__main__":

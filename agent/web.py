@@ -945,18 +945,19 @@ def execute_command_web(
                 return f"Path does not exist: `{path}`"
                 
             if os.path.isfile(abs_path):
-                vault_path = os.path.dirname(abs_path) or "."
+                vault_path = None
                 file_path = abs_path
             else:
                 vault_path = abs_path
                 file_path = None
                 
             index_args = {
-                "vault_path": vault_path,
                 "file_path": file_path,
                 "vision_mode": vision_mode,
                 "max_pages": max_pages,
             }
+            if vault_path is not None:
+                index_args["vault_path"] = vault_path
             if collection_option:
                 index_args["collection"] = collection
             data = call_tool("index_vault", **index_args)
@@ -985,7 +986,6 @@ def execute_command_web(
                 return "Usage: `/vault status <pdf-path> [--collection name]`"
             path = " ".join(tokens)
             status_args = {
-                "vault_path": os.path.dirname(path) or ".",
                 "file_path": path,
                 "action": "status",
             }
@@ -1280,7 +1280,6 @@ def _generate_chat_events_impl(
                         "function": {
                             "name": "index_vault",
                             "arguments": {
-                                "vault_path": os.path.dirname(user_input) or ".",
                                 "file_path": user_input,
                             },
                         }

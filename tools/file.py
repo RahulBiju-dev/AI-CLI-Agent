@@ -330,7 +330,6 @@ def create_file(file_path: str, content: str) -> str:
         # Index the file into its own vault collection
         try:
             index_result = index_vault(
-                vault_path=VAULTS_DIR,
                 file_path=vault_file_path,
                 collection=collection_name,
             )

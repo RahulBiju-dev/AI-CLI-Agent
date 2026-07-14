@@ -52,6 +52,7 @@ class TestCreateFile(unittest.TestCase):
                         self.assertEqual(result.get("alias"), "test")
 
                         mock_index.assert_called_once()
+                        self.assertNotIn("vault_path", mock_index.call_args.kwargs)
                         mock_alias.assert_called_once()
 
     def test_create_file_invalid_basename(self):

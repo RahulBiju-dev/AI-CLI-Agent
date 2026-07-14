@@ -496,8 +496,8 @@ TOOL_SCHEMAS.extend([
                 "type": "object",
                 "properties": {
                     "collection": {"type": "string", "description": "ChromaDB collection name."},
-                    "vault_path": {"type": "string", "description": "Folder to index recursively."},
-                    "file_path": {"type": "string", "description": "File to index."},
+                    "vault_path": {"type": "string", "description": "Source folder to index recursively. Omit when file_path is supplied."},
+                    "file_path": {"type": "string", "description": "Source file to index; managed vault storage is created automatically."},
                     "chunk_size": {"type": "integer", "description": "Chunk size (default 1800)."},
                     "chunk_overlap": {"type": "integer", "description": "Overlap between chunks (default 250)."},
                     "include_vision": {"type": "boolean", "description": "Enable automatic Moondream page selection (default true; false is text-only)."},

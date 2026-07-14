@@ -34,8 +34,20 @@ PDF_VISION_TEXT_THRESHOLD = 500
 MAX_RETURNED_WARNING_SAMPLES = 3
 MAX_RETURNED_FAILED_PAGES = 25
 DATA_DIR = str(get_runtime_paths().data_dir)
-CHROMA_DIR = os.path.join(DATA_DIR, ".chroma")
 VAULTS_DIR = os.path.join(DATA_DIR, "vaults")
+
+
+def _select_chroma_directory(data_dir: str, vaults_dir: str) -> str:
+    """Keep an existing legacy store; use the managed layout only when fresh."""
+    legacy_directory = os.path.join(data_dir, ".chroma")
+    managed_directory = os.path.join(vaults_dir, ".chroma")
+    return legacy_directory if os.path.exists(legacy_directory) else managed_directory
+
+
+# Preserve an existing pre-vault-folder store in place. New installations keep
+# the Chroma database with the rest of the managed vault state; no user data is
+# silently migrated, copied, merged, or deleted.
+CHROMA_DIR = _select_chroma_directory(DATA_DIR, VAULTS_DIR)
 _ALIAS_LOCK = threading.RLock()
 _INDEX_JOB_LOCK = threading.RLock()
 
@@ -74,6 +86,21 @@ def sanitize_collection_name(name: str) -> str:
         name = name.ljust(3, '0')
         
     return name[:63]
+
+
+def _path_is_within(path: str, root: str) -> bool:
+    """Return whether path is contained by root on the active platform."""
+    try:
+        normalized_path = os.path.normcase(os.path.abspath(path))
+        normalized_root = os.path.normcase(os.path.abspath(root))
+        return os.path.commonpath((normalized_root, normalized_path)) == normalized_root
+    except (OSError, ValueError):
+        return False
+
+
+def _managed_collection_directory(collection_name: str) -> str:
+    """Return the durable user-visible folder for a vault collection."""
+    return os.path.join(VAULTS_DIR, sanitize_collection_name(collection_name))
 
 
 def get_chroma_client(path: str | None = None):
@@ -271,6 +298,29 @@ def _load_index_job(collection_name: str, path: str) -> dict:
         return read_json_preserved(job_path, expected_type=dict)
     except FileNotFoundError:
         return {}
+
+
+def _collection_index_job_summaries(collection_name: str) -> list[dict]:
+    """List durable PDF jobs for a collection without requiring source mounts."""
+    checkpoint_directory = Path(VAULTS_DIR) / ".index_jobs"
+    if not checkpoint_directory.is_dir():
+        return []
+    jobs: list[dict] = []
+    for checkpoint_path in sorted(checkpoint_directory.glob("*.json")):
+        try:
+            state = read_json_preserved(checkpoint_path, expected_type=dict)
+        except (FileNotFoundError, PersistenceError):
+            continue
+        stored_collection = str(state.get("collection") or "").strip()
+        if not stored_collection or sanitize_collection_name(stored_collection) != collection_name:
+            continue
+        source_path = str(state.get("source_path") or "").strip()
+        if not source_path:
+            continue
+        job = _index_job_summary(collection_name, source_path, state)
+        job["checkpoint_exists"] = True
+        jobs.append(job)
+    return jobs
 
 
 def _save_index_job(collection_name: str, path: str, state: dict) -> None:
@@ -472,6 +522,13 @@ def _index_pdf_incremental(
             },
         }
     else:
+        # The checkpoint owns the source label for this generation. Callers in
+        # older releases sometimes supplied the Chroma directory as vault_path,
+        # which changed the relative label between resume calls. Retaining the
+        # durable label prevents duplicate IDs and split source names.
+        stored_source = str(state.get("source") or "").strip()
+        if stored_source:
+            rel = stored_source
         stored_config = state.get("config") if isinstance(state.get("config"), dict) else {}
         if stored_config:
             stored_mode = str(stored_config.get("vision_mode") or vision_mode)
@@ -739,8 +796,9 @@ def index_vault(
     ChromaDB for later similarity search retrieval.
 
     Args:
-        vault_path (str | None): Directory containing multiple files to index.
-            If None and file_path is provided, defaults to the file's directory.
+        vault_path (str | None): Source directory to index recursively. Omit it
+            when file_path is supplied; Selene creates managed vault storage
+            separately under VAULTS_DIR.
         collection_name (str): The name of the ChromaDB collection to use.
         chunk_size (int | None): The approximate character limit for each text
             chunk. Omitted resumes inherit the durable job setting.
@@ -795,29 +853,87 @@ def index_vault(
     if resume_page is not None:
         resume_page = _positive_int(resume_page, 1, minimum=1, maximum=1_000_000)
 
-    if not vault_path:
-        vault_path = os.path.dirname(file_path) if file_path else VAULTS_DIR
-    vault_path = os.path.abspath(vault_path)
-    if not os.path.exists(vault_path):
-        return _json({"error": f"vault path not found: {vault_path}"})
+    requested_vault_path = os.path.abspath(vault_path) if vault_path else None
+    managed_vault_directory = _managed_collection_directory(collection_name)
+
+    if action == "status" and not file_path and requested_vault_path is None:
+        jobs = _collection_index_job_summaries(collection_name)
+        return _json({
+            "complete": all(job.get("complete", False) for job in jobs) if jobs else False,
+            "collection": collection_name,
+            "action": "status",
+            "jobs": jobs,
+            "job_count": len(jobs),
+            "source_root": None,
+        })
 
     if file_path:
         file_path = os.path.abspath(file_path)
-        try:
-            inside_vault = os.path.commonpath((vault_path, file_path)) == vault_path
-        except ValueError:
-            inside_vault = False
-        if not inside_vault:
+        if action == "index" and not os.path.exists(file_path):
             return _json({
-                "error": "vault_path must contain file_path; omit vault_path to use the file's directory",
-                "vault_path": vault_path,
+                "error": f"source file not found: {file_path}",
                 "file_path": file_path,
             })
+        if action == "index" and not os.path.isfile(file_path):
+            return _json({
+                "error": f"source file is not a regular file: {file_path}",
+                "file_path": file_path,
+            })
+        # A single explicit file is the complete source scope. vault_path is not
+        # a destination and must never prevent a valid file from being indexed.
+        source_root = os.path.dirname(file_path) or os.curdir
         candidates = [file_path]
     else:
-        if not os.path.isdir(vault_path):
-            return _json({"error": f"vault_path must be a folder when file_path is not provided: {vault_path}"})
-        candidates = list(_iter_indexable_files(vault_path))
+        source_root = requested_vault_path or os.path.abspath(VAULTS_DIR)
+        if not os.path.exists(source_root):
+            can_create_managed_source = (
+                action == "index" and _path_is_within(source_root, VAULTS_DIR)
+            )
+            if can_create_managed_source:
+                try:
+                    os.makedirs(source_root, exist_ok=True)
+                except OSError as exc:
+                    return _json({
+                        "error": f"Could not create managed vault folder: {exc}",
+                        "vault_directory": source_root,
+                    })
+            else:
+                return _json({"error": f"source folder not found: {source_root}"})
+        if not os.path.isdir(source_root):
+            return _json({
+                "error": (
+                    "vault_path must be a source folder when file_path is omitted: "
+                    f"{source_root}"
+                )
+            })
+        candidates = list(_iter_indexable_files(source_root))
+
+    if action == "index":
+        try:
+            os.makedirs(managed_vault_directory, exist_ok=True)
+        except OSError as exc:
+            return _json({
+                "error": f"Could not create managed vault folder: {exc}",
+                "vault_directory": managed_vault_directory,
+            })
+
+    if action == "index" and not candidates:
+        return _json({
+            "complete": False,
+            "continuation_required": False,
+            "next_page": None,
+            "continuation": None,
+            "collection": collection_name,
+            "source_root": source_root,
+            "indexed_files": 0,
+            "indexed_chunks": 0,
+            "skipped_files": [],
+            "skipped_count": 0,
+            "pdf_jobs": [],
+            "incomplete_pdf_count": 0,
+            "failed_pdf_count": 0,
+            "error": f"no supported files found in source folder: {source_root}",
+        })
 
     if action == "status":
         jobs = []
@@ -838,6 +954,7 @@ def index_vault(
             "action": "status",
             "jobs": jobs,
             "job_count": len(jobs),
+            "source_root": source_root,
         })
 
     batch_size = _positive_int(batch_size, DEFAULT_BATCH_SIZE, minimum=1, maximum=128)
@@ -870,7 +987,11 @@ def index_vault(
             skipped_files.append({"file": path, "error": f"unsupported extension: {ext}"})
             continue
 
-        rel = os.path.relpath(path, vault_path) if os.path.isdir(vault_path) else os.path.basename(path)
+        rel = (
+            os.path.relpath(path, source_root)
+            if os.path.isdir(source_root)
+            else os.path.basename(path)
+        )
         if ext == ".pdf":
             try:
                 job = _index_pdf_incremental(
@@ -1060,7 +1181,7 @@ def index_vault(
         "next_page": continuation["arguments"]["resume_page"] if continuation else None,
         "continuation": continuation,
         "collection": collection_name,
-        "persist_directory": CHROMA_DIR,
+        "source_root": source_root,
         "indexed_files": indexed_files,
         "indexed_chunks": indexed_chunks,
         "skipped_files": skipped_files[:20],
@@ -1182,7 +1303,6 @@ def list_vaults() -> str:
 
     vaults.sort(key=lambda item: item["collection"].lower())
     return _json({
-        "persist_directory": CHROMA_DIR,
         "vault_count": len(vaults),
         "vaults": vaults,
     })
