@@ -27,11 +27,15 @@ from agent.core import (
     CONTEXT_TOOL_LOOP_RESERVE,
     ContextWindowError,
     MODEL_NAME,
-    MAX_TOOL_CALL_ROUNDS,
     MAX_OUTPUT_CONTINUATION_ROUNDS,
     OUTPUT_CONTINUATION_PROMPT,
-    TOOL_CONTINUATION_PROMPT,
     _check_and_compact_history,
+    _automatic_vault_index_tool_call,
+    _new_vault_index_loop_state,
+    _should_reexecute_turn_duplicate,
+    _tool_loop_stop_message,
+    _update_vault_index_loop_state,
+    build_tool_continuation_prompt,
     effective_session_model_options,
     guarded_options_for_call,
     load_default_system_prompt,
@@ -960,8 +964,13 @@ def execute_command_web(
                 return f"Vault indexing failed: {data['error']}"
                 
             incomplete = data.get("incomplete_pdf_count", 0)
+            state_label = (
+                "indexing complete" if data.get("complete")
+                else "checkpoint saved" if incomplete
+                else "indexing incomplete"
+            )
             out = [
-                f"✓ Vault {'checkpoint saved' if incomplete else 'indexing complete'} "
+                f"✓ Vault {state_label} "
                 f"(collection: `{data.get('collection', collection)}`, chunks: {data.get('indexed_chunks', 0)})"
             ]
             for job in data.get("pdf_jobs", []):
@@ -1296,7 +1305,11 @@ def _generate_chat_events_impl(
                         index_payload = json.loads(tool_content)
                     except (TypeError, json.JSONDecodeError):
                         index_payload = {}
-                    if index_payload.get("incomplete_pdf_count"):
+                    if (
+                        index_result.ok
+                        and not index_payload.get("error")
+                        and index_payload.get("continuation_required")
+                    ):
                         job = (index_payload.get("pdf_jobs") or [{}])[0]
                         yield {
                             "type": "status",
@@ -1306,7 +1319,7 @@ def _generate_chat_events_impl(
                             ),
                             "color": "yellow",
                         }
-                    elif index_result.ok:
+                    elif index_result.ok and index_payload.get("complete"):
                         yield {"type": "status", "message": "Indexing complete.", "color": "green"}
                     else:
                         yield {"type": "status", "message": "Indexing did not complete.", "color": "yellow"}
@@ -1337,6 +1350,7 @@ def _generate_chat_events_impl(
         
     # 4. Stream response loop (supports tool execution and model chain-calling)
     executed_tool_calls: dict[str, dict] = {}
+    vault_index_loop_state = _new_vault_index_loop_state()
     tool_rounds = 0
     output_continuation_rounds = 0
     output_continuation_base: list[dict] | None = None
@@ -1345,6 +1359,9 @@ def _generate_chat_events_impl(
     continuing_output = False
     while True:
         cancellation_token.raise_if_cancelled()
+        suppress_vault_completion_claim = bool(
+            vault_index_loop_state.get("expected_arguments")
+        )
         runtime_tools = None if continuing_output else tool_schemas_for_model(
             messages_to_send, session_data, TOOL_SCHEMAS
         )
@@ -1460,7 +1477,8 @@ def _generate_chat_events_impl(
                         in_thinking = False
                         yield {"type": "thinking_end"}
                     content_buf += content_chunk
-                    yield {"type": "content_chunk", "text": content_chunk}
+                    if not suppress_vault_completion_claim:
+                        yield {"type": "content_chunk", "text": content_chunk}
         finally:
             if hasattr(stream, "close"):
                 try:
@@ -1537,6 +1555,57 @@ def _generate_chat_events_impl(
             
         if session_data.get("history", True):
             history_data.append(assistant_msg)
+
+        # The checkpoint is authoritative. If the model emits a final answer
+        # while a verified continuation remains, execute that exact continuation
+        # instead of accepting a premature completion claim.
+        if not tool_calls and vault_index_loop_state.get("expected_arguments"):
+            automatic_call = _automatic_vault_index_tool_call(vault_index_loop_state)
+            if automatic_call is not None:
+                if (
+                    session_data.get("history", True)
+                    and history_data
+                    and history_data[-1] is assistant_msg
+                ):
+                    history_data.pop()
+                tool_calls = [automatic_call]
+                assistant_msg = {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": tool_calls,
+                }
+                content_buf = ""
+                thinking_buf = ""
+                if session_data.get("history", True):
+                    history_data.append(assistant_msg)
+
+        if not tool_calls and vault_index_loop_state.get("blocked_reason"):
+            cancellation_token.raise_if_cancelled()
+            message = str(vault_index_loop_state["blocked_reason"])
+            if (
+                session_data.get("history", True)
+                and history_data
+                and history_data[-1] is assistant_msg
+            ):
+                history_data.pop()
+                history_data.append({"role": "assistant", "content": message})
+            yield {"type": "status", "message": message, "color": "yellow"}
+            yield {"type": "content_chunk", "text": message}
+            save_session_snapshot(
+                origin_name,
+                session_data,
+                history_data,
+                generation_start_session=generation_start_session,
+            )
+            yield {
+                "type": "done",
+                "state": "failed",
+                "error": message,
+                "history": history_data,
+                "active_session_name": origin_name,
+                "saved_sessions": list_saved_sessions(),
+            }
+            break
             
         # If there are no tool calls, this turn is completed
         if not tool_calls:
@@ -1573,11 +1642,12 @@ def _generate_chat_events_impl(
             }
             break
 
-        if tool_rounds >= MAX_TOOL_CALL_ROUNDS:
-            message = (
-                f"Stopped after {MAX_TOOL_CALL_ROUNDS} tool-call rounds to avoid an unreliable loop. "
-                "Please narrow the request or ask me to continue from the latest result."
-            )
+        message = _tool_loop_stop_message(
+            tool_rounds,
+            tool_calls,
+            vault_index_loop_state,
+        )
+        if message:
             yield {"type": "status", "message": message, "color": "yellow"}
             yield {"type": "content_chunk", "text": message}
             if session_data.get("history", True):
@@ -1621,14 +1691,15 @@ def _generate_chat_events_impl(
             turn_key = _tool_call_turn_key(call)
             if turn_key and turn_key in executed_tool_calls:
                 cached = dict(executed_tool_calls[turn_key])
-                tool_results_by_index[index] = cached
-                yield {
-                    "type": "tool_end",
-                    "id": index,
-                    "name": cached.get("tool_name") or cached.get("name") or "tool",
-                    "result": cached.get("content", ""),
-                }
-                continue
+                if not _should_reexecute_turn_duplicate(call, cached):
+                    tool_results_by_index[index] = cached
+                    yield {
+                        "type": "tool_end",
+                        "id": index,
+                        "name": cached.get("tool_name") or cached.get("name") or "tool",
+                        "result": cached.get("content", ""),
+                    }
+                    continue
             if turn_key and turn_key in pending_index_by_key:
                 duplicate_source_by_index[index] = pending_index_by_key[turn_key]
                 continue
@@ -1684,12 +1755,47 @@ def _generate_chat_events_impl(
             }
 
         tool_results = [tool_results_by_index[index] for index in sorted(tool_results_by_index)]
+        _update_vault_index_loop_state(
+            vault_index_loop_state,
+            tool_calls,
+            tool_results,
+        )
             
         if session_data.get("history", True):
             history_data.extend(tool_results)
+        else:
+            messages_to_send.append(assistant_msg)
+            messages_to_send.extend(tool_results)
+
+        if vault_index_loop_state.get("blocked_reason"):
+            message = str(vault_index_loop_state["blocked_reason"])
+            if session_data.get("history", True):
+                history_data.append({"role": "assistant", "content": message})
+            yield {"type": "status", "message": message, "color": "yellow"}
+            yield {"type": "content_chunk", "text": message}
+            save_session_snapshot(
+                origin_name,
+                session_data,
+                history_data,
+                generation_start_session=generation_start_session,
+            )
+            yield {
+                "type": "done",
+                "state": "failed",
+                "error": message,
+                "history": history_data,
+                "active_session_name": origin_name,
+                "saved_sessions": list_saved_sessions(),
+            }
+            break
+
+        if session_data.get("history", True):
             reminder = {
                 "role": "user",
-                "content": TOOL_CONTINUATION_PROMPT.format(user_input=user_input),
+                "content": build_tool_continuation_prompt(
+                    user_input,
+                    vault_index_loop_state,
+                ),
             }
             messages_to_send = prepare_messages_for_model(
                 [*history_data, reminder],
@@ -1698,11 +1804,12 @@ def _generate_chat_events_impl(
                 extra_reserved_tokens=CONTEXT_TOOL_LOOP_RESERVE,
             )
         else:
-            messages_to_send.append(assistant_msg)
-            messages_to_send.extend(tool_results)
             messages_to_send.append({
                 "role": "user",
-                "content": TOOL_CONTINUATION_PROMPT.format(user_input=user_input),
+                "content": build_tool_continuation_prompt(
+                    user_input,
+                    vault_index_loop_state,
+                ),
             })
             messages_to_send = prepare_messages_for_model(
                 messages_to_send,

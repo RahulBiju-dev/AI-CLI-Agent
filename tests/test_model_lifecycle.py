@@ -57,6 +57,15 @@ class ModelLifecycleTests(unittest.TestCase):
             self.assertIn(name, runtime_options)
             self.assertEqual(runtime_options[name], value)
 
+    def test_bundled_prompt_keeps_large_pdf_resume_contract(self):
+        parsed = parse_modelfile(Path(__file__).resolve().parents[1] / "Modelfile")
+
+        self.assertIn("index_vault", parsed.system_prompt)
+        self.assertIn("vision_mode=all", parsed.system_prompt)
+        self.assertIn("next_page", parsed.system_prompt)
+        self.assertIn("resume_page", parsed.system_prompt)
+        self.assertIn("complete=true", parsed.system_prompt)
+
     def _fixture(self, directory):
         root = Path(directory)
         modelfile = root / "Modelfile"

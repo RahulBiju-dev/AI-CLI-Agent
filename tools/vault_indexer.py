@@ -31,6 +31,8 @@ DEFAULT_CHUNK_OVERLAP = 250
 DEFAULT_BATCH_SIZE = 16
 DEFAULT_PDF_PAGES_PER_RUN = 20
 PDF_VISION_TEXT_THRESHOLD = 500
+MAX_RETURNED_WARNING_SAMPLES = 3
+MAX_RETURNED_FAILED_PAGES = 25
 DATA_DIR = str(get_runtime_paths().data_dir)
 CHROMA_DIR = os.path.join(DATA_DIR, ".chroma")
 VAULTS_DIR = os.path.join(DATA_DIR, "vaults")
@@ -272,9 +274,77 @@ def _load_index_job(collection_name: str, path: str) -> dict:
 
 
 def _save_index_job(collection_name: str, path: str, state: dict) -> None:
+    state["revision"] = max(0, int(state.get("revision", 0))) + 1
     job_path = _index_job_path(collection_name, path)
     job_path.parent.mkdir(parents=True, exist_ok=True)
     atomic_write_json(job_path, state)
+
+
+def _index_job_summary(
+    collection_name: str,
+    path: str,
+    state: dict,
+    *,
+    source: str | None = None,
+    error: str | None = None,
+) -> dict:
+    """Return the compact, model-facing control state for one PDF job."""
+    failed_pages = sorted({
+        int(value) for value in state.get("vision_failed_pages", [])
+        if str(value).lstrip("-").isdigit()
+    })
+    warnings = [str(value) for value in state.get("warnings", []) if str(value)]
+    config = state.get("config") if isinstance(state.get("config"), dict) else {}
+    complete = bool(state.get("complete"))
+    next_page = None if complete else state.get("next_page")
+    try:
+        next_page = None if next_page is None else int(next_page)
+    except (TypeError, ValueError):
+        next_page = None
+    vision_mode = str(config.get("vision_mode") or state.get("vision_mode") or "auto")
+
+    summary = {
+        # Put control fields first so even legacy prefix previews remain useful.
+        "complete": complete,
+        "next_page": next_page,
+        "revision": max(0, int(state.get("revision", 0))),
+        "source": source or state.get("source") or os.path.basename(path),
+        "source_path": os.path.abspath(path),
+        "page_count": max(0, int(state.get("page_count", 0))),
+        "indexed_pages": max(0, int(state.get("indexed_pages", 0))),
+        "indexed_chunks": max(0, int(state.get("indexed_chunks", 0))),
+        "chunk_size": _positive_int(
+            config.get("chunk_size"), DEFAULT_CHUNK_SIZE, minimum=500, maximum=20000
+        ),
+        "chunk_overlap": _positive_int(
+            config.get("chunk_overlap"),
+            DEFAULT_CHUNK_OVERLAP,
+            minimum=0,
+            maximum=max(
+                0,
+                _positive_int(
+                    config.get("chunk_size"),
+                    DEFAULT_CHUNK_SIZE,
+                    minimum=500,
+                    maximum=20000,
+                ) // 2,
+            ),
+        ),
+        "vision_mode": vision_mode,
+        "vision_pages": max(0, int(state.get("vision_pages", 0))),
+        "vision_failed_count": len(failed_pages),
+        "vision_failed_pages": failed_pages[:MAX_RETURNED_FAILED_PAGES],
+        "vision_failed_pages_truncated": len(failed_pages) > MAX_RETURNED_FAILED_PAGES,
+        "vision_complete": bool(complete and not failed_pages),
+        "warning_count": max(int(state.get("warning_count", 0)), len(warnings)),
+        "warnings": warnings[-MAX_RETURNED_WARNING_SAMPLES:],
+        "checkpoint": str(_index_job_path(collection_name, path)),
+        "fingerprint": state.get("fingerprint"),
+    }
+    if error:
+        summary["error"] = str(error)
+        summary["retryable"] = next_page is not None
+    return summary
 
 
 def _page_has_images(page) -> bool:
@@ -322,19 +392,31 @@ def _describe_pdf_page(
         conversion_options["poppler_path"] = poppler_path
     image_paths = convert_from_path(path, **conversion_options)
     if not image_paths:
-        return ""
-    description = describe_image(
-        str(image_paths[0]),
-        prompt=(
-            "Capture this lecture slide completely for a searchable knowledge vault. "
+        raise RuntimeError("PDF page rendering returned no image")
+    prompts = (
+        (
+            "Capture this document page completely for a searchable knowledge vault. "
             "Transcribe visible text, equations, labels, tables, chart values, diagram relationships, "
             "and any information conveyed visually. Be factual and dense; do not add outside knowledge."
         ),
-        cancellation_token=cancellation_token,
+        # Moondream can return a clean stop with empty content for long OCR-style
+        # prompts. Its short native description prompt recovers those pages.
+        "Describe this page in detail.",
     )
-    if description.startswith("Error"):
-        raise RuntimeError(description)
-    return description.strip()
+    last_error = "Vision model returned no page description"
+    for prompt in prompts:
+        description = describe_image(
+            str(image_paths[0]),
+            prompt=prompt,
+            cancellation_token=cancellation_token,
+        )
+        value = str(description or "").strip()
+        if value and not value.startswith("Error"):
+            return value
+        last_error = value or last_error
+        if value and "empty response" not in value.casefold():
+            break
+    raise RuntimeError(last_error)
 
 
 def _index_pdf_incremental(
@@ -350,6 +432,10 @@ def _index_pdf_incremental(
     max_pages: int,
     resume_page: int | None,
     cancellation_token: CancellationToken | None,
+    vision_mode_explicit: bool = True,
+    chunk_size_explicit: bool = True,
+    chunk_overlap_explicit: bool = True,
+    model_explicit: bool = True,
 ) -> dict:
     """Index a bounded PDF page range and checkpoint after every committed page."""
     try:
@@ -362,11 +448,12 @@ def _index_pdf_incremental(
         state = _load_index_job(collection_name, path)
     if state.get("fingerprint") != fingerprint:
         state = {
-            "version": 1,
+            "version": 2,
             "collection": collection_name,
             "source": rel,
             "source_path": os.path.abspath(path),
             "fingerprint": fingerprint,
+            "revision": 0,
             "next_page": 1,
             "indexed_pages": 0,
             "indexed_chunks": 0,
@@ -377,7 +464,47 @@ def _index_pdf_incremental(
             "warning_count": 0,
             "warnings": [],
             "complete": False,
+            "config": {
+                "chunk_size": chunk_size,
+                "chunk_overlap": chunk_overlap,
+                "embedding_model": model,
+                "vision_mode": vision_mode,
+            },
         }
+    else:
+        stored_config = state.get("config") if isinstance(state.get("config"), dict) else {}
+        if stored_config:
+            stored_mode = str(stored_config.get("vision_mode") or vision_mode)
+            if vision_mode_explicit and stored_mode != vision_mode:
+                raise ValueError(
+                    f"vision_mode {vision_mode!r} does not match the durable job setting {stored_mode!r}"
+                )
+            stored_chunk_size = int(stored_config.get("chunk_size", chunk_size))
+            stored_chunk_overlap = int(stored_config.get("chunk_overlap", chunk_overlap))
+            stored_model = str(stored_config.get("embedding_model") or model)
+            if (
+                (chunk_size_explicit and stored_chunk_size != chunk_size)
+                or (chunk_overlap_explicit and stored_chunk_overlap != chunk_overlap)
+                or (model_explicit and stored_model != model)
+            ):
+                raise ValueError(
+                    "chunk or embedding settings do not match the durable PDF job; "
+                    "resume with the original settings or use a new collection"
+                )
+            chunk_size = stored_chunk_size
+            chunk_overlap = stored_chunk_overlap
+            model = stored_model
+            vision_mode = stored_mode
+        else:
+            # Adopt settings for checkpoints created before configuration became
+            # part of the durable job contract.
+            state["version"] = 2
+            state["config"] = {
+                "chunk_size": chunk_size,
+                "chunk_overlap": chunk_overlap,
+                "embedding_model": model,
+                "vision_mode": vision_mode,
+            }
 
     with open(path, "rb") as stream:
         reader = pypdf.PdfReader(stream)
@@ -389,50 +516,64 @@ def _index_pdf_incremental(
                 raise ValueError("PDF is encrypted and cannot be indexed without a password") from exc
         total_pages = len(reader.pages)
         next_page = max(1, min(int(state.get("next_page", 1)), total_pages + 1))
+        state["page_count"] = total_pages
+        state["config"] = {
+            "chunk_size": chunk_size,
+            "chunk_overlap": chunk_overlap,
+            "embedding_model": model,
+            "vision_mode": vision_mode,
+        }
+        if total_pages == 0:
+            state["complete"] = True
+            state["next_page"] = 1
+        # Persist the initialized job before page work so a failure on page one
+        # still has a truthful, resumable checkpoint and durable configuration.
+        with _INDEX_JOB_LOCK:
+            _save_index_job(collection_name, path, state)
         if resume_page is not None and int(resume_page) != next_page:
             raise ValueError(
                 f"resume_page {resume_page} does not match durable checkpoint next_page {next_page}"
             )
-        stop_page = min(total_pages, next_page + max_pages - 1)
         generation_prefix = f"{rel}::pdf::{fingerprint}::"
         failed_at_start = {
             int(value) for value in state.get("vision_failed_pages", [])
         }
         retrying_vision = bool(failed_at_start) and int(state.get("indexed_pages", 0)) >= total_pages
+        retry_order: list[int] = []
         if retrying_vision and vision_mode == "off":
             state["complete"] = True
             state["next_page"] = total_pages + 1
             with _INDEX_JOB_LOCK:
                 _save_index_job(collection_name, path, state)
-            stop_page = total_pages
             next_page = total_pages + 1
 
+        if retrying_vision and vision_mode != "off":
+            ordered_failed = sorted(failed_at_start)
+            split_index = next(
+                (index for index, page in enumerate(ordered_failed) if page >= next_page),
+                0,
+            )
+            retry_order = ordered_failed[split_index:] + ordered_failed[:split_index]
+            page_numbers = retry_order[:max_pages]
+        else:
+            stop_page = min(total_pages, next_page + max_pages - 1)
+            page_numbers = range(next_page, stop_page + 1)
+
         with tempfile.TemporaryDirectory(prefix="selene-pdf-page-") as image_dir:
-            for page_number in range(next_page, stop_page + 1):
+            for page_number in page_numbers:
                 if cancellation_token:
                     cancellation_token.raise_if_cancelled()
-                if retrying_vision and page_number not in failed_at_start:
-                    state["next_page"] = page_number + 1
-                    reached_end = page_number >= total_pages
-                    if reached_end and state.get("vision_failed_pages"):
-                        state["complete"] = False
-                        state["next_page"] = min(
-                            int(value) for value in state["vision_failed_pages"]
-                        )
-                    elif reached_end:
-                        state["complete"] = True
-                    with _INDEX_JOB_LOCK:
-                        _save_index_job(collection_name, path, state)
-                    continue
                 page = reader.pages[page_number - 1]
                 warnings = state.setdefault("warnings", [])
+                warning_count = max(int(state.get("warning_count", 0)), len(warnings))
                 try:
                     page_text = (page.extract_text() or "").strip()
                 except Exception as exc:
                     page_text = ""
                     warnings.append(f"Page {page_number} text extraction failed: {exc}")
+                    warning_count += 1
 
-                should_describe = vision_mode == "all" or (
+                should_describe = retrying_vision or vision_mode == "all" or (
                     vision_mode == "auto"
                     and (len(page_text) < PDF_VISION_TEXT_THRESHOLD or _page_has_images(page))
                 )
@@ -442,21 +583,23 @@ def _index_pdf_incremental(
                         visual_text = _describe_pdf_page(
                             path, page_number, image_dir, cancellation_token
                         )
-                        if visual_text:
-                            completed_vision = {
-                                int(value) for value in state.get("vision_completed_pages", [])
-                            }
-                            completed_vision.add(page_number)
-                            state["vision_completed_pages"] = sorted(completed_vision)
-                            state["vision_pages"] = len(completed_vision)
-                            state["vision_failed_pages"] = [
-                                value for value in state.get("vision_failed_pages", [])
-                                if int(value) != page_number
-                            ]
+                        if not str(visual_text or "").strip():
+                            raise RuntimeError("Vision model returned no page description")
+                        completed_vision = {
+                            int(value) for value in state.get("vision_completed_pages", [])
+                        }
+                        completed_vision.add(page_number)
+                        state["vision_completed_pages"] = sorted(completed_vision)
+                        state["vision_pages"] = len(completed_vision)
+                        state["vision_failed_pages"] = [
+                            value for value in state.get("vision_failed_pages", [])
+                            if int(value) != page_number
+                        ]
                     except OperationCancelled:
                         raise
                     except Exception as exc:
                         warnings.append(f"Page {page_number} visual extraction failed: {exc}")
+                        warning_count += 1
                         failed_pages = {
                             int(value) for value in state.get("vision_failed_pages", [])
                         }
@@ -518,17 +661,33 @@ def _index_pdf_incremental(
                 state["indexed_chunks"] = sum(int(value) for value in page_chunk_counts.values())
 
                 state["indexed_pages"] = max(int(state.get("indexed_pages", 0)), page_number)
-                state["next_page"] = page_number + 1
                 state["page_count"] = total_pages
-                state["warning_count"] = len(warnings)
+                state["warning_count"] = warning_count
                 state["warnings"] = warnings[-50:]
-                reached_end = page_number >= total_pages
                 failed_vision_pages = state.get("vision_failed_pages", [])
-                if reached_end and vision_mode != "off" and failed_vision_pages:
-                    state["complete"] = False
-                    state["next_page"] = min(int(value) for value in failed_vision_pages)
+                if retrying_vision:
+                    retry_position = retry_order.index(page_number)
+                    remaining_in_pass = retry_order[retry_position + 1:]
+                    if not failed_vision_pages:
+                        state["complete"] = True
+                        state["next_page"] = total_pages + 1
+                    elif remaining_in_pass:
+                        state["complete"] = False
+                        state["next_page"] = remaining_in_pass[0]
+                    else:
+                        # A full failed-page pass made no guarantee that transient
+                        # vision failures recovered. A progress-aware runtime may
+                        # retry this next cycle, but will stop if the signature repeats.
+                        state["complete"] = False
+                        state["next_page"] = min(int(value) for value in failed_vision_pages)
                 else:
-                    state["complete"] = reached_end
+                    reached_end = page_number >= total_pages
+                    if reached_end and vision_mode != "off" and failed_vision_pages:
+                        state["complete"] = False
+                        state["next_page"] = min(int(value) for value in failed_vision_pages)
+                    else:
+                        state["complete"] = reached_end
+                        state["next_page"] = total_pages + 1 if reached_end else page_number + 1
                 with _INDEX_JOB_LOCK:
                     _save_index_job(collection_name, path, state)
 
@@ -545,33 +704,23 @@ def _index_pdf_incremental(
             state.setdefault("warnings", []).append(
                 f"New index completed but stale-generation cleanup failed: {exc}"
             )
-            state["warning_count"] = len(state["warnings"])
+            state["warning_count"] = max(
+                int(state.get("warning_count", 0)) + 1,
+                len(state["warnings"]),
+            )
+            state["warnings"] = state["warnings"][-50:]
             with _INDEX_JOB_LOCK:
                 _save_index_job(collection_name, path, state)
 
-    return {
-        "source": rel,
-        "page_count": int(state.get("page_count", 0)),
-        "indexed_pages": int(state.get("indexed_pages", 0)),
-        "indexed_chunks": int(state.get("indexed_chunks", 0)),
-        "vision_pages": int(state.get("vision_pages", 0)),
-        "vision_failed_pages": list(state.get("vision_failed_pages", [])),
-        "vision_complete": not bool(state.get("vision_failed_pages", [])),
-        "next_page": None if state.get("complete") else int(state.get("next_page", 1)),
-        "complete": bool(state.get("complete")),
-        "warning_count": int(state.get("warning_count", 0)),
-        "warnings": list(state.get("warnings", []))[-20:],
-        "checkpoint": str(_index_job_path(collection_name, path)),
-        "fingerprint": fingerprint,
-    }
+    return _index_job_summary(collection_name, path, state, source=rel)
 
 
 def index_vault(
     vault_path: Optional[str] = None,
     collection_name: str = "vault",
-    chunk_size: int = DEFAULT_CHUNK_SIZE,
-    chunk_overlap: int = DEFAULT_CHUNK_OVERLAP,
-    model: str = DEFAULT_EMBED_MODEL,
+    chunk_size: int | None = None,
+    chunk_overlap: int | None = None,
+    model: str | None = None,
     batch_size: int = DEFAULT_BATCH_SIZE,
     file_path: Optional[str] = None,
     collection: Optional[str] = None,
@@ -593,9 +742,12 @@ def index_vault(
         vault_path (str | None): Directory containing multiple files to index.
             If None and file_path is provided, defaults to the file's directory.
         collection_name (str): The name of the ChromaDB collection to use.
-        chunk_size (int): The approximate character limit for each text chunk.
-        chunk_overlap (int): The number of characters to overlap between chunks.
-        model (str): The embedding model name to pass to Ollama.
+        chunk_size (int | None): The approximate character limit for each text
+            chunk. Omitted resumes inherit the durable job setting.
+        chunk_overlap (int | None): The number of characters to overlap between
+            chunks. Omitted resumes inherit the durable job setting.
+        model (str | None): The embedding model name. Omitted resumes inherit
+            the durable job setting.
         batch_size (int): Number of chunks to process in a single batch.
         file_path (str | None): A single explicit file path to index.
         collection (str | None): An alias for collection_name.
@@ -625,6 +777,10 @@ def index_vault(
     action = str(action or "index").strip().lower()
     if action not in {"index", "status"}:
         return _json({"error": "action must be 'index' or 'status'"})
+    chunk_size_explicit = chunk_size is not None
+    chunk_overlap_explicit = chunk_overlap is not None
+    model_explicit = model is not None
+    vision_mode_explicit = vision_mode is not None
     if vision_mode is None:
         vision_mode = "auto" if include_vision else "off"
     vision_mode = str(vision_mode).strip().lower()
@@ -646,7 +802,18 @@ def index_vault(
         return _json({"error": f"vault path not found: {vault_path}"})
 
     if file_path:
-        candidates = [os.path.abspath(file_path)]
+        file_path = os.path.abspath(file_path)
+        try:
+            inside_vault = os.path.commonpath((vault_path, file_path)) == vault_path
+        except ValueError:
+            inside_vault = False
+        if not inside_vault:
+            return _json({
+                "error": "vault_path must contain file_path; omit vault_path to use the file's directory",
+                "vault_path": vault_path,
+                "file_path": file_path,
+            })
+        candidates = [file_path]
     else:
         if not os.path.isdir(vault_path):
             return _json({"error": f"vault_path must be a folder when file_path is not provided: {vault_path}"})
@@ -662,12 +829,11 @@ def index_vault(
             except PersistenceError as exc:
                 jobs.append({"source_path": path, "error": str(exc), "preserved": True})
                 continue
-            jobs.append({
-                "source_path": path,
-                "checkpoint": str(_index_job_path(collection_name, path)),
-                **state,
-            })
+            job = _index_job_summary(collection_name, path, state)
+            job["checkpoint_exists"] = bool(state)
+            jobs.append(job)
         return _json({
+            "complete": all(job.get("complete", False) for job in jobs) if jobs else False,
             "collection": collection_name,
             "action": "status",
             "jobs": jobs,
@@ -677,6 +843,7 @@ def index_vault(
     batch_size = _positive_int(batch_size, DEFAULT_BATCH_SIZE, minimum=1, maximum=128)
     chunk_size = _positive_int(chunk_size, DEFAULT_CHUNK_SIZE, minimum=500, maximum=20000)
     chunk_overlap = _positive_int(chunk_overlap, DEFAULT_CHUNK_OVERLAP, minimum=0, maximum=max(0, chunk_size // 2))
+    model = str(model or DEFAULT_EMBED_MODEL)
 
     try:
         client = get_chroma_client()
@@ -718,6 +885,10 @@ def index_vault(
                     max_pages=max_pages,
                     resume_page=resume_page,
                     cancellation_token=cancellation_token,
+                    vision_mode_explicit=vision_mode_explicit,
+                    chunk_size_explicit=chunk_size_explicit,
+                    chunk_overlap_explicit=chunk_overlap_explicit,
+                    model_explicit=model_explicit,
                 )
                 pdf_jobs.append(job)
                 indexed_chunks += int(job.get("indexed_chunks", 0))
@@ -726,10 +897,30 @@ def index_vault(
             except OperationCancelled:
                 raise
             except Exception as exc:
+                try:
+                    failed_state = _load_index_job(collection_name, path)
+                except PersistenceError:
+                    failed_state = {}
+                preserved = bool(failed_state)
+                error_text = (
+                    "incremental PDF indexing failed; durable checkpoint and previous "
+                    f"index preserved: {exc}"
+                    if preserved
+                    else f"incremental PDF indexing failed before a checkpoint could be saved: {exc}"
+                )
                 skipped_files.append({
                     "file": path,
-                    "error": f"incremental PDF indexing failed; checkpoint and previous index preserved: {exc}",
+                    "error": error_text,
                 })
+                failed_job = _index_job_summary(
+                    collection_name,
+                    path,
+                    failed_state,
+                    source=rel,
+                    error=error_text,
+                )
+                pdf_jobs.append(failed_job)
+                indexed_chunks += int(failed_job.get("indexed_chunks", 0))
             continue
 
         try:
@@ -827,26 +1018,70 @@ def index_vault(
             file_path=os.path.abspath(file_path),
         )
 
-    return _json({
+    incomplete_pdf_count = sum(not job.get("complete", False) for job in pdf_jobs)
+    failed_pdf_count = sum(bool(job.get("error")) for job in pdf_jobs)
+    complete = bool(candidates) and not skipped_files and incomplete_pdf_count == 0
+    resumable_jobs = [
+        job for job in pdf_jobs
+        if not job.get("complete") and not job.get("error") and job.get("next_page") is not None
+    ]
+    continuation = None
+    if file_path and len(resumable_jobs) == 1:
+        job = resumable_jobs[0]
+        continuation = {
+            "tool": "index_vault",
+            "arguments": {
+                "action": "index",
+                "collection": collection_name,
+                "file_path": os.path.abspath(file_path),
+                "vision_mode": job.get("vision_mode", vision_mode),
+                "max_pages": max_pages,
+                "chunk_size": int(job.get("chunk_size", chunk_size)),
+                "chunk_overlap": int(job.get("chunk_overlap", chunk_overlap)),
+                "resume_page": int(job["next_page"]),
+            },
+        }
+    effective_vision_mode = (
+        str(pdf_jobs[0].get("vision_mode") or vision_mode)
+        if len(pdf_jobs) == 1 else vision_mode
+    )
+    effective_chunk_size = (
+        int(pdf_jobs[0].get("chunk_size", chunk_size))
+        if len(pdf_jobs) == 1 else chunk_size
+    )
+    effective_chunk_overlap = (
+        int(pdf_jobs[0].get("chunk_overlap", chunk_overlap))
+        if len(pdf_jobs) == 1 else chunk_overlap
+    )
+
+    result = {
+        "complete": complete,
+        "continuation_required": continuation is not None,
+        "next_page": continuation["arguments"]["resume_page"] if continuation else None,
+        "continuation": continuation,
         "collection": collection_name,
         "persist_directory": CHROMA_DIR,
         "indexed_files": indexed_files,
         "indexed_chunks": indexed_chunks,
         "skipped_files": skipped_files[:20],
         "skipped_count": len(skipped_files),
-        "chunk_size": chunk_size,
-        "chunk_overlap": chunk_overlap,
+        "chunk_size": effective_chunk_size,
+        "chunk_overlap": effective_chunk_overlap,
         "include_vision": bool(include_vision),
-        "vision_mode": vision_mode,
+        "vision_mode": effective_vision_mode,
         "max_pages_per_run": max_pages,
         "pdf_jobs": pdf_jobs,
-        "incomplete_pdf_count": sum(not job.get("complete", False) for job in pdf_jobs),
+        "incomplete_pdf_count": incomplete_pdf_count,
+        "failed_pdf_count": failed_pdf_count,
         "alias": os.path.splitext(os.path.basename(file_path))[0] if file_path and (indexed_files == 1 or has_pdf_chunks) else None,
         "guidance": (
             "Call index_vault again with the same file and collection plus resume_page=next_page to resume incomplete PDF jobs. "
             "Use action=status to inspect progress, vault_search for semantic lookup, and vault_read for exhaustive ordered retrieval."
         ),
-    })
+    }
+    if skipped_files and len(skipped_files) == len(candidates):
+        result["error"] = skipped_files[0]["error"]
+    return _json(result)
 
 
 def delete_vault_item(

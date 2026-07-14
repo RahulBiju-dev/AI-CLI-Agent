@@ -489,8 +489,8 @@ TOOL_SCHEMAS.extend([
         "function": {
             "name": "index_vault",
             "description": (
-                "Incrementally index a folder or file into a persistent ChromaDB vault. "
-                "Large PDFs checkpoint after every page and resume across calls. Use action=status for progress."
+                "Index/resume vaults. Handwriting: vision_mode=all. "
+                "Pass next_page as resume_page until complete."
             ),
             "parameters": {
                 "type": "object",
@@ -500,7 +500,7 @@ TOOL_SCHEMAS.extend([
                     "file_path": {"type": "string", "description": "File to index."},
                     "chunk_size": {"type": "integer", "description": "Chunk size (default 1800)."},
                     "chunk_overlap": {"type": "integer", "description": "Overlap between chunks (default 250)."},
-                    "include_vision": {"type": "boolean", "description": "Include moondream page descriptions for PDFs (default true; false is faster for text-only PDFs)."},
+                    "include_vision": {"type": "boolean", "description": "Enable automatic Moondream page selection (default true; false is text-only)."},
                     "vision_mode": {"type": "string", "enum": ["off", "auto", "all"], "description": "PDF vision policy. auto analyzes image-bearing/low-text pages; all runs Moondream on every page."},
                     "max_pages": {"type": "integer", "minimum": 1, "maximum": 500, "description": "PDF pages processed per resumable call (default 20)."},
                     "resume_page": {"type": "integer", "minimum": 1, "description": "For recursive resume calls, pass the previous PDF job's next_page exactly."},

@@ -460,6 +460,22 @@ def select_tool_schemas(
             score += 20
         scores[name] = score
 
+    recent_called = _recent_called_tool_names(messages)
+    if (
+        messages
+        and _is_tool_continuation_prompt(messages[-1])
+        and recent_called
+        and recent_called[-1] == "index_vault"
+    ):
+        # A resumable vault checkpoint has an exact next action. Keeping only
+        # that tool and its post-completion readers prevents unrelated schemas
+        # from crowding the control envelope out of a 4K context.
+        continuation_names = {"index_vault", "vault_search", "vault_read"}
+        return [
+            schema for name, schema in by_name.items()
+            if name in continuation_names
+        ]
+
     chosen: list[str] = [
         name for name, score in sorted(scores.items(), key=lambda item: (-item[1], item[0]))
         if score > 0
@@ -691,8 +707,107 @@ def _compact_tool_continuation_tail(messages: list[dict]) -> list[dict]:
                 "tool_calls": message.get("tool_calls", []),
             })
         else:
-            compacted.append(dict(message))
+            item = dict(message)
+            if (
+                item.get("role") == "tool"
+                and (item.get("tool_name") or item.get("name")) == "index_vault"
+            ):
+                item["content"] = _compact_index_vault_content_for_context(
+                    str(item.get("content") or "")
+                )
+            compacted.append(item)
     return compacted
+
+
+def _compact_index_vault_content_for_context(content: str) -> str:
+    """Preserve vault completion controls while dropping verbose diagnostics."""
+    try:
+        payload = json.loads(content)
+    except (TypeError, json.JSONDecodeError):
+        return content
+    if not isinstance(payload, dict):
+        return content
+
+    raw_jobs = payload.get("pdf_jobs")
+    if not isinstance(raw_jobs, list):
+        raw_jobs = payload.get("jobs") if isinstance(payload.get("jobs"), list) else []
+    jobs: list[dict] = []
+    keep_job_fields = (
+        "complete",
+        "next_page",
+        "revision",
+        "source",
+        "source_path",
+        "page_count",
+        "indexed_pages",
+        "indexed_chunks",
+        "chunk_size",
+        "chunk_overlap",
+        "vision_mode",
+        "vision_pages",
+        "vision_failed_count",
+        "vision_failed_pages",
+        "vision_complete",
+        "warning_count",
+        "warnings",
+        "error",
+        "retryable",
+        "checkpoint_exists",
+        "fingerprint",
+    )
+    for raw_job in raw_jobs[:8]:
+        if not isinstance(raw_job, dict):
+            continue
+        job = {key: raw_job[key] for key in keep_job_fields if key in raw_job}
+        if isinstance(job.get("warnings"), list):
+            job["warnings"] = [str(value) for value in job["warnings"][-3:]]
+        if isinstance(job.get("vision_failed_pages"), list):
+            job["vision_failed_pages"] = job["vision_failed_pages"][:25]
+        if "vision_failed_count" not in job:
+            failed = raw_job.get("vision_failed_pages")
+            if isinstance(failed, list):
+                job["vision_failed_count"] = len(failed)
+                job["vision_failed_pages"] = failed[:25]
+        jobs.append(job)
+
+    incomplete = payload.get("incomplete_pdf_count")
+    if incomplete is None:
+        incomplete = sum(not job.get("complete", False) for job in jobs)
+    next_page = payload.get("next_page")
+    if next_page is None:
+        next_page = next(
+            (job.get("next_page") for job in jobs if not job.get("complete")),
+            None,
+        )
+    # Missing completion controls are unknown, never implicit success. This is
+    # especially important for the tool runner's bounded-result wrapper.
+    complete = payload.get("complete") is True
+
+    continuation_required = bool(payload.get("continuation_required"))
+    if "continuation_required" not in payload:
+        continuation_required = next_page is not None and not bool(payload.get("error"))
+    compact = {
+        "complete": complete,
+        "continuation_required": continuation_required,
+        "next_page": next_page,
+        "continuation": payload.get("continuation"),
+        "collection": payload.get("collection"),
+        "action": payload.get("action", "index"),
+        "incomplete_pdf_count": incomplete,
+        "failed_pdf_count": payload.get("failed_pdf_count", 0),
+        "indexed_files": payload.get("indexed_files", 0),
+        "indexed_chunks": payload.get("indexed_chunks", 0),
+        "skipped_count": payload.get("skipped_count", 0),
+        "pdf_jobs" if "pdf_jobs" in payload else "jobs": jobs,
+    }
+    if payload.get("error"):
+        compact["error"] = payload["error"]
+    elif payload.get("truncated"):
+        compact["error"] = (
+            "index_vault result was truncated before its completion controls could be read"
+        )
+        compact["truncated"] = True
+    return json.dumps(compact, ensure_ascii=False, separators=(",", ":"), default=str)
 
 
 def _truncate_tool_content_for_context(content: str, preview_chars: int) -> str:
@@ -1501,6 +1616,229 @@ def _process_tool_calls(tool_calls: list[dict]) -> list[dict]:
     return [result.as_tool_message() for result in results]
 
 
+def _tool_result_payload(message: dict | None) -> dict:
+    try:
+        payload = json.loads(str((message or {}).get("content") or ""))
+    except (TypeError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _vault_index_call_arguments(call: dict) -> dict:
+    function = call.get("function") if isinstance(call, dict) else None
+    function = function if isinstance(function, dict) else {}
+    if str(function.get("name") or "").strip() != "index_vault":
+        return {}
+    arguments, argument_error = normalize_tool_arguments(function.get("arguments"))
+    return {} if argument_error else arguments
+
+
+def _vault_index_job_identity(arguments: dict) -> tuple[str, str] | None:
+    file_path = str(arguments.get("file_path") or "").strip()
+    collection = str(arguments.get("collection") or "").strip()
+    if not file_path or not collection:
+        return None
+    return collection, os.path.normcase(os.path.abspath(file_path))
+
+
+def _new_vault_index_loop_state() -> dict:
+    return {
+        "expected_arguments": None,
+        "identity": None,
+        "scope": None,
+        "seen_progress": set(),
+        "blocked_reason": None,
+    }
+
+
+def _automatic_vault_index_tool_call(state: dict) -> dict | None:
+    """Build the exact trusted continuation when the model stops prematurely."""
+    expected = state.get("expected_arguments")
+    if not isinstance(expected, dict):
+        return None
+    return {
+        "function": {
+            "name": "index_vault",
+            "arguments": dict(expected),
+        }
+    }
+
+
+def _vault_index_progress_signature(payload: dict, job: dict) -> str:
+    failed_count = job.get("vision_failed_count")
+    if failed_count is None and isinstance(job.get("vision_failed_pages"), list):
+        failed_count = len(job["vision_failed_pages"])
+    values = (
+        str(job.get("fingerprint") or ""),
+        int(job.get("indexed_pages", 0) or 0),
+        int(job.get("indexed_chunks", payload.get("indexed_chunks", 0)) or 0),
+        int(job.get("vision_pages", 0) or 0),
+        int(failed_count or 0),
+        job.get("next_page", payload.get("next_page")),
+    )
+    return json.dumps(values, ensure_ascii=False, separators=(",", ":"), default=str)
+
+
+def _update_vault_index_loop_state(
+    state: dict,
+    tool_calls: list[dict],
+    tool_results: list[dict],
+) -> None:
+    """Track the exact next durable resume and detect a no-progress cycle."""
+    for call, result in zip(tool_calls, tool_results):
+        arguments = _vault_index_call_arguments(call)
+        if not arguments or str(arguments.get("action") or "index").lower() != "index":
+            continue
+        payload = _tool_result_payload(result)
+        if not payload:
+            continue
+
+        jobs = payload.get("pdf_jobs") if isinstance(payload.get("pdf_jobs"), list) else []
+        job = next((item for item in jobs if isinstance(item, dict)), {})
+        if payload.get("complete") is True:
+            state.update({
+                "expected_arguments": None,
+                "identity": None,
+                "scope": None,
+                "blocked_reason": None,
+            })
+            return
+        error = payload.get("error") or job.get("error")
+        if error or payload.get("truncated"):
+            state["expected_arguments"] = None
+            state["identity"] = None
+            state["blocked_reason"] = (
+                "Vault indexing stopped after an error; its last durable checkpoint was "
+                f"preserved. {error or 'The tool result was truncated before completion could be verified.'}"
+            )
+            return
+
+        continuation = payload.get("continuation")
+        expected = (
+            continuation.get("arguments")
+            if isinstance(continuation, dict) and isinstance(continuation.get("arguments"), dict)
+            else None
+        )
+        next_page = payload.get("next_page", job.get("next_page"))
+        if expected is None and next_page is not None:
+            expected = {
+                "action": "index",
+                "collection": payload.get("collection") or arguments.get("collection"),
+                "file_path": arguments.get("file_path"),
+                "resume_page": next_page,
+            }
+            for key in ("vision_mode", "max_pages", "chunk_size", "chunk_overlap"):
+                value = job.get(key) if key in {"vision_mode", "chunk_size", "chunk_overlap"} else arguments.get(key)
+                if value is not None:
+                    expected[key] = value
+        if not isinstance(expected, dict):
+            state["expected_arguments"] = None
+            state["identity"] = None
+            state["blocked_reason"] = (
+                "Vault indexing stopped because the tool returned an incomplete result "
+                "without a valid durable continuation. Inspect the saved checkpoint before retrying."
+            )
+            return
+
+        identity = _vault_index_job_identity(expected)
+        if identity is None:
+            continue
+        scope = (identity, str(job.get("fingerprint") or ""))
+        prior_scope = state.get("scope")
+        if (
+            prior_scope
+            and prior_scope[0] == identity
+            and prior_scope[1]
+            and scope[1]
+            and prior_scope[1] != scope[1]
+        ):
+            state["expected_arguments"] = None
+            state["identity"] = None
+            state["blocked_reason"] = (
+                "Vault indexing stopped because the source PDF changed during this turn. "
+                "Start a new indexing turn so the replacement file gets a fresh checkpoint."
+            )
+            return
+        if prior_scope != scope:
+            state["scope"] = scope
+            state["seen_progress"] = set()
+        signature = _vault_index_progress_signature(payload, job)
+        if signature in state["seen_progress"]:
+            state["expected_arguments"] = None
+            state["blocked_reason"] = (
+                "Vault indexing stopped because its durable checkpoint repeated without "
+                "indexing another page or recovering a vision failure. Fix the reported "
+                "vision-model error, then continue from the saved checkpoint."
+            )
+            return
+        state["seen_progress"].add(signature)
+        state["expected_arguments"] = dict(expected)
+        state["identity"] = identity
+        state["blocked_reason"] = None
+
+
+def _is_progressing_vault_index_round(tool_calls: list[dict], state: dict) -> bool:
+    """Allow only the exact next single-file checkpoint beyond the normal cap."""
+    expected = state.get("expected_arguments")
+    if state.get("blocked_reason") or not isinstance(expected, dict) or len(tool_calls) != 1:
+        return False
+    arguments = _vault_index_call_arguments(tool_calls[0])
+    return bool(
+        arguments
+        and str(arguments.get("action") or "index").lower() == "index"
+        and arguments == expected
+        and _vault_index_job_identity(arguments) == state.get("identity")
+    )
+
+
+def _tool_loop_stop_message(tool_rounds: int, tool_calls: list[dict], state: dict) -> str | None:
+    if state.get("blocked_reason"):
+        return str(state["blocked_reason"])
+    if tool_rounds < MAX_TOOL_CALL_ROUNDS:
+        return None
+    if _is_progressing_vault_index_round(tool_calls, state):
+        return None
+    return (
+        f"Stopped after {MAX_TOOL_CALL_ROUNDS} tool-call rounds to avoid an unreliable loop. "
+        "Please narrow the request or ask me to continue from the latest result."
+    )
+
+
+def build_tool_continuation_prompt(user_input: str, state: dict | None = None) -> str:
+    guidance = ""
+    loop_state = state or {}
+    expected = loop_state.get("expected_arguments")
+    if isinstance(expected, dict):
+        encoded = json.dumps(expected, ensure_ascii=False, separators=(",", ":"), default=str)
+        guidance = (
+            "\n\nVault indexing is incomplete. Call index_vault again with exactly these arguments: "
+            f"{encoded}. Keep following each returned continuation until complete=true. "
+            "Do not claim that a checkpoint is completion."
+        )
+    elif loop_state.get("blocked_reason"):
+        guidance = f"\n\n{loop_state['blocked_reason']} Do not call index_vault again unchanged."
+    marker = "\n\nOriginal user request:\n"
+    base = TOOL_CONTINUATION_PROMPT.format(user_input=user_input)
+    return base.replace(marker, guidance + marker, 1) if guidance else base
+
+
+def _should_reexecute_turn_duplicate(call: dict, cached_result: dict) -> bool:
+    """Incomplete checkpoint calls are progressive even when arguments repeat."""
+    if not _vault_index_call_arguments(call):
+        return False
+    payload = _tool_result_payload(cached_result)
+    try:
+        incomplete = int(payload.get("incomplete_pdf_count", 0) or 0)
+    except (TypeError, ValueError):
+        incomplete = 0
+    return bool(
+        payload
+        and not payload.get("error")
+        and not payload.get("complete", False)
+        and (payload.get("continuation_required") or incomplete > 0)
+    )
+
+
 def _tool_call_turn_key(call: dict) -> str | None:
     """Return a stable key for suppressing identical calls in one turn."""
     function = call.get("function") or {}
@@ -1529,8 +1867,10 @@ def _process_tool_calls_with_turn_guard(tool_calls: list[dict], executed_tool_ca
     for index, call in enumerate(tool_calls):
         turn_key = _tool_call_turn_key(call)
         if turn_key and turn_key in executed_tool_calls:
-            results_by_index[index] = dict(executed_tool_calls[turn_key])
-            continue
+            cached = executed_tool_calls[turn_key]
+            if not _should_reexecute_turn_duplicate(call, cached):
+                results_by_index[index] = dict(cached)
+                continue
         if turn_key and turn_key in pending_key_to_index:
             duplicate_source_by_index[index] = pending_key_to_index[turn_key]
             continue
@@ -2628,7 +2968,11 @@ def _handle_vault(args: str) -> None:
         indexed_chunks = data.get("indexed_chunks", 0)
         skipped_count = data.get("skipped_count", 0)
         incomplete_count = data.get("incomplete_pdf_count", 0)
-        status_label = "Index checkpoint saved" if incomplete_count else "Vault indexed"
+        status_label = (
+            "Vault indexed" if data.get("complete")
+            else "Index checkpoint saved" if incomplete_count
+            else "Index incomplete"
+        )
         print_ok(
             f"{status_label} · {indexed_files} file{'s' if indexed_files != 1 else ''}, "
             f"{indexed_chunks} chunk{'s' if indexed_chunks != 1 else ''}",
@@ -2962,8 +3306,10 @@ def process_user_turn(
                                     f"{job.get('indexed_pages', '?')}/{job.get('page_count', '?')}; "
                                     "resume required."
                                 )
-                            else:
+                            elif index_payload.get("complete"):
                                 print_ok("Indexing complete")
+                            else:
+                                print_warn("Indexing stopped before completion; inspect the tool result.")
                         else:
                             print_warn(
                                 "Indexing did not complete; the model will receive the error."
@@ -3002,29 +3348,93 @@ def process_user_turn(
 
     # ── Tool-call loop (iterative, in case of chained calls) ──────
     executed_tool_calls: dict[str, dict] = {}
+    vault_index_loop_state = _new_vault_index_loop_state()
     tool_rounds = 0
-    while assistant_msg.get("tool_calls"):
-        if tool_rounds >= MAX_TOOL_CALL_ROUNDS:
-            message = (
-                f"Stopped after {MAX_TOOL_CALL_ROUNDS} tool-call rounds to avoid an unreliable loop. "
-                "Please narrow the request or ask me to continue from the latest result."
-            )
+    while (
+        assistant_msg.get("tool_calls")
+        or vault_index_loop_state.get("expected_arguments")
+        or vault_index_loop_state.get("blocked_reason")
+    ):
+        if not assistant_msg.get("tool_calls"):
+            automatic_call = _automatic_vault_index_tool_call(vault_index_loop_state)
+            if automatic_call is None:
+                message = str(vault_index_loop_state.get("blocked_reason") or "")
+                if message:
+                    print_warn(message)
+                    if not display_is_tui():
+                        _console.print()
+                    if session["history"]:
+                        if history and history[-1] is assistant_msg:
+                            history.pop()
+                        history.append({"role": "assistant", "content": message})
+                break
+            if session["history"] and history and history[-1] is assistant_msg:
+                history.pop()
+            assistant_msg = {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [automatic_call],
+            }
+            if session["history"]:
+                history.append(assistant_msg)
+        message = _tool_loop_stop_message(
+            tool_rounds,
+            assistant_msg["tool_calls"],
+            vault_index_loop_state,
+        )
+        if message:
             print_warn(message)
             if not display_is_tui():
                 _console.print()
             if session["history"]:
+                # Never persist a model tool call that was deliberately not run.
+                if history and history[-1] is assistant_msg:
+                    history.pop()
                 history.append({"role": "assistant", "content": message})
             break
         tool_rounds += 1
         tool_results = _process_tool_calls_with_turn_guard(
             assistant_msg["tool_calls"], executed_tool_calls
         )
+        _update_vault_index_loop_state(
+            vault_index_loop_state,
+            assistant_msg["tool_calls"],
+            tool_results,
+        )
 
         if session["history"]:
             history.extend(tool_results)
+        else:
+            messages_to_send.append(assistant_msg)
+            messages_to_send.extend(tool_results)
+
+        automatic_call = _automatic_vault_index_tool_call(vault_index_loop_state)
+        if automatic_call is not None:
+            assistant_msg = {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [automatic_call],
+            }
+            if session["history"]:
+                history.append(assistant_msg)
+            continue
+
+        if vault_index_loop_state.get("blocked_reason"):
+            message = str(vault_index_loop_state["blocked_reason"])
+            print_warn(message)
+            if not display_is_tui():
+                _console.print()
+            if session["history"]:
+                history.append({"role": "assistant", "content": message})
+            break
+
+        if session["history"]:
             reminder = {
                 "role": "user",
-                "content": TOOL_CONTINUATION_PROMPT.format(user_input=user_input),
+                "content": build_tool_continuation_prompt(
+                    user_input,
+                    vault_index_loop_state,
+                ),
             }
             messages_to_send = prepare_messages_for_model(
                 [*history, reminder],
@@ -3033,11 +3443,12 @@ def process_user_turn(
                 extra_reserved_tokens=CONTEXT_TOOL_LOOP_RESERVE,
             )
         else:
-            messages_to_send.append(assistant_msg)
-            messages_to_send.extend(tool_results)
             messages_to_send.append({
                 "role": "user",
-                "content": TOOL_CONTINUATION_PROMPT.format(user_input=user_input),
+                "content": build_tool_continuation_prompt(
+                    user_input,
+                    vault_index_loop_state,
+                ),
             })
             messages_to_send = prepare_messages_for_model(
                 messages_to_send,

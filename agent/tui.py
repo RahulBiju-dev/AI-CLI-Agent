@@ -1091,6 +1091,14 @@ def build_app_class():
 
         BINDINGS = [
             Binding("ctrl+c", "interrupt_or_quit", "Stop / quit", show=True, priority=True),
+            # Ctrl+Shift+C is the usual terminal “copy” chord — never treat it as interrupt.
+            Binding(
+                "ctrl+shift+c",
+                "copy_selection",
+                "Copy selection",
+                show=False,
+                priority=True,
+            ),
             Binding("ctrl+d", "quit_app", "Quit", show=False, priority=True),
             Binding("ctrl+l", "clear_chat", "Clear chat", show=True),
             Binding("ctrl+k", "clear_input", "Clear input", show=True),
@@ -1408,9 +1416,7 @@ def build_app_class():
             brand.append("Type a message below", style=pal["muted"])
             brand.append("  ·  ", style=pal["faint"])
             brand.append("/", style=f"bold {pal['text_soft']}")
-            brand.append(" commands  ·  ", style=pal["muted"])
-            brand.append("/theme", style=f"bold {pal['text_soft']}")
-            brand.append(" colors", style=pal["muted"])
+            brand.append(" commands", style=pal["muted"])
             from agent.tui_themes import DEFAULT_THEME, theme_label
 
             theme_name = DEFAULT_THEME
@@ -1607,6 +1613,7 @@ def build_app_class():
 
         def ui_status(self, message: str, kind: str = "info", detail: str | None = None) -> None:
             # While generating, keep chat clean — fold run-like noise into activity.
+            # Tool lines stay visible (named steps), not swallowed as a spinner label.
             if self._busy and kind in {"run", "info"}:
                 label = message if not detail else f"{message} · {detail}"
                 # Skip pure chrome / duplicate thinking notices.
@@ -1618,21 +1625,43 @@ def build_app_class():
                     self.ui_activity_start(label)
                     return
 
+            pal = self._pal()
+            soft = pal.get("text_soft", "#d8d8d8")
+            muted = pal.get("muted", "#6b6b6b")
+            faint = pal.get("faint", "#555555")
             glyphs = {
-                "info": (GLYPH_MARK, "#6b6b6b"),
+                "info": (GLYPH_MARK, muted),
                 "run": (GLYPH_RUN, "#7a7a60"),
                 "ok": (GLYPH_OK, "#6a8a6a"),
                 "warn": (GLYPH_WARN, "#8a8a60"),
                 "error": (GLYPH_ERR, "#c08080"),
-                "tool": (GLYPH_TOOL, "#6b6b6b"),
+                "tool": (GLYPH_TOOL, soft),
             }
             glyph, color = glyphs.get(kind, glyphs["info"])
             line = Text()
             line.append(f"{glyph}  ", style=color)
-            line.append(message, style=color if kind == "error" else "#6b6b6b")
+            # Never treat Rich markup tags as plain text (legacy tool lines).
+            raw_message = str(message or "")
+            if "[" in raw_message and "]" in raw_message:
+                try:
+                    line.append_text(Text.from_markup(raw_message))
+                except Exception:
+                    import re
+
+                    cleaned = re.sub(r"\[[^\]]*\]", "", raw_message)
+                    line.append(cleaned, style=color if kind == "error" else muted)
+            elif kind == "tool":
+                # Tool name is the message; phase/detail stays secondary.
+                line.append(raw_message, style=f"bold {soft}")
+            elif kind == "error":
+                line.append(raw_message, style=color)
+            elif kind == "ok":
+                line.append(raw_message, style=color)
+            else:
+                line.append(raw_message, style=muted)
             if detail:
-                line.append(f"  {detail}", style="#555555")
-            cls = "error" if kind == "error" else "status"
+                line.append(f"  {detail}", style=faint)
+            cls = "error" if kind == "error" else ("tool" if kind == "tool" else "status")
             self._mount_block(line, cls)
 
         def ui_console_line(self, text: str) -> None:
@@ -2516,12 +2545,59 @@ def build_app_class():
         def action_quit_app(self) -> None:
             self.exit()
 
-        def action_interrupt_or_quit(self) -> None:
-            """Ctrl+C: stop generation first; press again to exit.
+        def _selection_to_copy(self) -> str | None:
+            """Return currently selected text (screen drag or focused Input), if any."""
+            # Mouse selection over the transcript / panels.
+            try:
+                selected = self.screen.get_selected_text()
+            except Exception:
+                selected = None
+            if selected:
+                return selected
+            # In-widget selection inside the composer (or speech field).
+            try:
+                focused = self.focused
+            except Exception:
+                focused = None
+            if focused is None:
+                return None
+            try:
+                text = getattr(focused, "selected_text", None)
+            except Exception:
+                text = None
+            if isinstance(text, str) and text:
+                return text
+            return None
 
-            - While a turn is running: request cooperative stream cancel.
+        def action_copy_selection(self) -> None:
+            """Ctrl+Shift+C — copy selection only (never interrupt generation)."""
+            selected = self._selection_to_copy()
+            if not selected:
+                return
+            try:
+                self.copy_to_clipboard(selected)
+            except Exception:
+                pass
+
+        def action_interrupt_or_quit(self) -> None:
+            """Ctrl+C: copy selection if present, else stop generation / quit.
+
+            - With selected text: copy to clipboard (do **not** interrupt).
+            - While a turn is running (no selection): request stream cancel.
             - Second Ctrl+C within a short window (or when idle after arming): quit.
+
+            Ctrl+Shift+C is handled separately by ``action_copy_selection`` so
+            the terminal copy chord never cancels a running response.
             """
+            # Prefer copy over interrupt when the user has highlighted text.
+            selected = self._selection_to_copy()
+            if selected:
+                try:
+                    self.copy_to_clipboard(selected)
+                except Exception:
+                    pass
+                return
+
             now = time.monotonic()
             with self._busy_lock:
                 busy = self._busy

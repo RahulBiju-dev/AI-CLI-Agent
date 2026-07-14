@@ -50,6 +50,9 @@ class FakeClient:
     def get_collection(self, name):
         return self.collection
 
+    def get_or_create_collection(self, name):
+        return self.collection
+
 
 class VaultReadTests(unittest.TestCase):
     def test_partial_cursor_reads_oversized_chunk_without_gaps(self):
@@ -200,8 +203,403 @@ class IncrementalPdfIndexTests(unittest.TestCase):
         self.assertFalse(first["complete"])
         self.assertEqual(first["vision_failed_pages"], [1])
         self.assertEqual(first["next_page"], 1)
+        self.assertFalse(first["vision_complete"])
         self.assertTrue(second["complete"])
         self.assertTrue(second["vision_complete"])
+
+    def test_empty_visual_output_remains_an_incomplete_all_vision_job(self):
+        class FakePage:
+            def extract_text(self):
+                return "handwritten page"
+
+            def get(self, key):
+                return {}
+
+        class FakeReader:
+            is_encrypted = False
+
+            def __init__(self, stream):
+                self.pages = [FakePage()]
+
+        collection = FakeCollection({})
+        with tempfile.TemporaryDirectory() as temporary:
+            pdf_path = Path(temporary) / "notes.pdf"
+            pdf_path.write_bytes(b"fake pdf")
+            with (
+                patch.dict(sys.modules, {"pypdf": SimpleNamespace(PdfReader=FakeReader)}),
+                patch.object(vault_indexer, "VAULTS_DIR", temporary),
+                patch.object(vault_indexer, "_pdf_fingerprint", return_value="fingerprint"),
+                patch.object(vault_indexer, "_describe_pdf_page", return_value=""),
+                patch.object(
+                    vault_indexer,
+                    "embed_texts",
+                    side_effect=lambda docs, **kwargs: [[1.0] for _ in docs],
+                ),
+            ):
+                result = vault_indexer._index_pdf_incremental(
+                    path=str(pdf_path), rel="notes.pdf", collection_name="notes",
+                    collection_obj=collection, chunk_size=500, chunk_overlap=0,
+                    model="embed", vision_mode="all", max_pages=1,
+                    resume_page=None, cancellation_token=None,
+                )
+
+        self.assertFalse(result["complete"])
+        self.assertEqual(result["next_page"], 1)
+        self.assertEqual(result["vision_pages"], 0)
+        self.assertEqual(result["vision_failed_pages"], [1])
+        self.assertFalse(result["vision_complete"])
+
+    def test_empty_moondream_response_uses_short_handwriting_fallback(self):
+        fake_pdf2image = SimpleNamespace(
+            convert_from_path=lambda *args, **kwargs: ["/tmp/rendered-page.jpg"]
+        )
+        with (
+            patch.dict(sys.modules, {"pdf2image": fake_pdf2image}),
+            patch(
+                "tools.vision_describer.describe_image",
+                side_effect=(
+                    "Error describing image: Ollama returned an empty response",
+                    "Recovered handwritten content",
+                ),
+            ) as describe,
+        ):
+            result = vault_indexer._describe_pdf_page(
+                "/tmp/notes.pdf",
+                1,
+                "/tmp",
+                None,
+            )
+
+        self.assertEqual(result, "Recovered handwritten content")
+        self.assertEqual(describe.call_count, 2)
+        self.assertEqual(
+            describe.call_args_list[1].kwargs["prompt"],
+            "Describe this page in detail.",
+        )
+
+    def test_vision_retry_queue_skips_pages_that_already_succeeded(self):
+        class FakePage:
+            def __init__(self, number):
+                self.number = number
+
+            def extract_text(self):
+                return f"page {self.number}"
+
+            def get(self, key):
+                return {}
+
+        class FakeReader:
+            is_encrypted = False
+
+            def __init__(self, stream):
+                self.pages = [FakePage(number) for number in range(1, 7)]
+
+        collection = FakeCollection({})
+        described_pages = []
+        with tempfile.TemporaryDirectory() as temporary:
+            pdf_path = Path(temporary) / "slides.pdf"
+            pdf_path.write_bytes(b"fake pdf")
+            state = {
+                "version": 2,
+                "collection": "lecture",
+                "source": "slides.pdf",
+                "source_path": str(pdf_path),
+                "fingerprint": "fingerprint",
+                "revision": 0,
+                "next_page": 1,
+                "indexed_pages": 6,
+                "indexed_chunks": 4,
+                "vision_pages": 4,
+                "page_count": 6,
+                "page_chunk_counts": {str(page): 1 for page in (2, 3, 4, 6)},
+                "vision_completed_pages": [2, 3, 4, 6],
+                "vision_failed_pages": [1, 5],
+                "warning_count": 2,
+                "warnings": ["page 1 failed", "page 5 failed"],
+                "complete": False,
+                "config": {
+                    "chunk_size": 500,
+                    "chunk_overlap": 0,
+                    "embedding_model": "embed",
+                    "vision_mode": "all",
+                },
+            }
+            with (
+                patch.dict(sys.modules, {"pypdf": SimpleNamespace(PdfReader=FakeReader)}),
+                patch.object(vault_indexer, "VAULTS_DIR", temporary),
+                patch.object(vault_indexer, "_pdf_fingerprint", return_value="fingerprint"),
+                patch.object(
+                    vault_indexer,
+                    "_describe_pdf_page",
+                    side_effect=lambda path, page, *args: described_pages.append(page) or f"visual {page}",
+                ),
+                patch.object(vault_indexer, "embed_texts", side_effect=lambda docs, **kwargs: [[1.0] for _ in docs]),
+            ):
+                vault_indexer._save_index_job("lecture", str(pdf_path), state)
+                first = vault_indexer._index_pdf_incremental(
+                    path=str(pdf_path), rel="slides.pdf", collection_name="lecture",
+                    collection_obj=collection, chunk_size=500, chunk_overlap=0,
+                    model="embed", vision_mode="all", max_pages=1,
+                    resume_page=1, cancellation_token=None,
+                )
+                second = vault_indexer._index_pdf_incremental(
+                    path=str(pdf_path), rel="slides.pdf", collection_name="lecture",
+                    collection_obj=collection, chunk_size=500, chunk_overlap=0,
+                    model="embed", vision_mode="all", max_pages=1,
+                    resume_page=5, cancellation_token=None,
+                )
+
+        self.assertEqual(described_pages, [1, 5])
+        self.assertEqual(first["next_page"], 5)
+        self.assertTrue(second["complete"])
+
+    def test_resume_inherits_durable_all_vision_policy(self):
+        class FakePage:
+            def __init__(self, number):
+                self.number = number
+
+            def extract_text(self):
+                return "text " * 150
+
+            def get(self, key):
+                return {}
+
+        class FakeReader:
+            is_encrypted = False
+
+            def __init__(self, stream):
+                self.pages = [FakePage(1), FakePage(2)]
+
+        collection = FakeCollection({})
+        described_pages = []
+        with tempfile.TemporaryDirectory() as temporary:
+            pdf_path = Path(temporary) / "slides.pdf"
+            pdf_path.write_bytes(b"fake pdf")
+            with (
+                patch.dict(sys.modules, {"pypdf": SimpleNamespace(PdfReader=FakeReader)}),
+                patch.object(vault_indexer, "VAULTS_DIR", temporary),
+                patch.object(vault_indexer, "_pdf_fingerprint", return_value="fingerprint"),
+                patch.object(
+                    vault_indexer,
+                    "_describe_pdf_page",
+                    side_effect=lambda path, page, *args: described_pages.append(page) or f"visual {page}",
+                ),
+                patch.object(vault_indexer, "embed_texts", side_effect=lambda docs, **kwargs: [[1.0] for _ in docs]),
+            ):
+                first = vault_indexer._index_pdf_incremental(
+                    path=str(pdf_path), rel="slides.pdf", collection_name="lecture",
+                    collection_obj=collection, chunk_size=500, chunk_overlap=0,
+                    model="embed", vision_mode="all", max_pages=1,
+                    resume_page=None, cancellation_token=None,
+                )
+                second = vault_indexer._index_pdf_incremental(
+                    path=str(pdf_path), rel="slides.pdf", collection_name="lecture",
+                    collection_obj=collection, chunk_size=500, chunk_overlap=0,
+                    model="embed", vision_mode="auto", max_pages=1,
+                    resume_page=2, cancellation_token=None,
+                    vision_mode_explicit=False,
+                )
+                with self.assertRaisesRegex(ValueError, "durable job setting"):
+                    vault_indexer._index_pdf_incremental(
+                        path=str(pdf_path), rel="slides.pdf", collection_name="lecture",
+                        collection_obj=collection, chunk_size=500, chunk_overlap=0,
+                        model="embed", vision_mode="auto", max_pages=1,
+                        resume_page=None, cancellation_token=None,
+                        vision_mode_explicit=True,
+                    )
+
+        self.assertFalse(first["complete"])
+        self.assertTrue(second["complete"])
+        self.assertEqual(second["vision_mode"], "all")
+        self.assertEqual(described_pages, [1, 2])
+
+    def test_public_pdf_failure_returns_incomplete_checkpoint_not_false_success(self):
+        class FakePage:
+            def __init__(self, number):
+                self.number = number
+
+            def extract_text(self):
+                return f"page {self.number} text"
+
+            def get(self, key):
+                return {}
+
+        class FakeReader:
+            is_encrypted = False
+
+            def __init__(self, stream):
+                self.pages = [FakePage(1), FakePage(2)]
+
+        collection = FakeCollection({})
+        embed_attempt = 0
+
+        def embed(documents, **kwargs):
+            nonlocal embed_attempt
+            embed_attempt += 1
+            if embed_attempt == 2:
+                raise RuntimeError("embedding model stopped")
+            return [[1.0] for _ in documents]
+
+        with tempfile.TemporaryDirectory() as temporary:
+            pdf_path = Path(temporary) / "slides.pdf"
+            pdf_path.write_bytes(b"fake pdf")
+            with (
+                patch.dict(sys.modules, {"pypdf": SimpleNamespace(PdfReader=FakeReader)}),
+                patch.object(vault_indexer, "VAULTS_DIR", temporary),
+                patch.object(vault_indexer, "CHROMA_DIR", str(Path(temporary) / ".chroma")),
+                patch.object(vault_indexer, "get_chroma_client", return_value=FakeClient(collection)),
+                patch.object(vault_indexer, "_pdf_fingerprint", return_value="fingerprint"),
+                patch.object(vault_indexer, "embed_texts", side_effect=embed),
+                patch.object(vault_indexer, "register_vault_alias"),
+            ):
+                payload = json.loads(vault_indexer.index_vault(
+                    file_path=str(pdf_path),
+                    collection="lecture",
+                    include_vision=False,
+                    vision_mode="off",
+                    max_pages=2,
+                    chunk_size=500,
+                    chunk_overlap=0,
+                    model="embed",
+                ))
+
+        self.assertFalse(payload["complete"])
+        self.assertIn("embedding model stopped", payload["error"])
+        self.assertEqual(payload["incomplete_pdf_count"], 1)
+        self.assertEqual(payload["failed_pdf_count"], 1)
+        self.assertEqual(payload["pdf_jobs"][0]["indexed_pages"], 1)
+        self.assertEqual(payload["pdf_jobs"][0]["next_page"], 2)
+        self.assertEqual(payload["indexed_chunks"], payload["pdf_jobs"][0]["indexed_chunks"])
+
+    def test_public_continuation_round_trip_preserves_custom_chunk_settings(self):
+        class FakePage:
+            def __init__(self, number):
+                self.number = number
+
+            def extract_text(self):
+                return f"page {self.number} text"
+
+            def get(self, key):
+                return {}
+
+        class FakeReader:
+            is_encrypted = False
+
+            def __init__(self, stream):
+                self.pages = [FakePage(1), FakePage(2)]
+
+        collection = FakeCollection({})
+        with tempfile.TemporaryDirectory() as temporary:
+            pdf_path = Path(temporary) / "slides.pdf"
+            pdf_path.write_bytes(b"fake pdf")
+            with (
+                patch.dict(sys.modules, {"pypdf": SimpleNamespace(PdfReader=FakeReader)}),
+                patch.object(vault_indexer, "VAULTS_DIR", temporary),
+                patch.object(vault_indexer, "CHROMA_DIR", str(Path(temporary) / ".chroma")),
+                patch.object(vault_indexer, "get_chroma_client", return_value=FakeClient(collection)),
+                patch.object(vault_indexer, "_pdf_fingerprint", return_value="fingerprint"),
+                patch.object(
+                    vault_indexer,
+                    "embed_texts",
+                    side_effect=lambda docs, **kwargs: [[1.0] for _ in docs],
+                ),
+                patch.object(vault_indexer, "register_vault_alias"),
+            ):
+                first = json.loads(vault_indexer.index_vault(
+                    file_path=str(pdf_path), collection="lecture",
+                    vision_mode="off", max_pages=1,
+                    chunk_size=700, chunk_overlap=0, model="embed",
+                ))
+                continuation = first["continuation"]["arguments"]
+                second = json.loads(vault_indexer.index_vault(**continuation))
+
+        self.assertEqual(continuation["chunk_size"], 700)
+        self.assertEqual(continuation["chunk_overlap"], 0)
+        self.assertTrue(second["complete"])
+        self.assertEqual(second["chunk_size"], 700)
+        self.assertEqual(second["chunk_overlap"], 0)
+
+    def test_first_page_failure_saves_a_truthful_checkpoint_visible_to_status(self):
+        class FakePage:
+            def extract_text(self):
+                return "page text"
+
+            def get(self, key):
+                return {}
+
+        class FakeReader:
+            is_encrypted = False
+
+            def __init__(self, stream):
+                self.pages = [FakePage(), FakePage()]
+
+        collection = FakeCollection({})
+        with tempfile.TemporaryDirectory() as temporary:
+            pdf_path = Path(temporary) / "slides.pdf"
+            pdf_path.write_bytes(b"fake pdf")
+            with (
+                patch.dict(sys.modules, {"pypdf": SimpleNamespace(PdfReader=FakeReader)}),
+                patch.object(vault_indexer, "VAULTS_DIR", temporary),
+                patch.object(vault_indexer, "CHROMA_DIR", str(Path(temporary) / ".chroma")),
+                patch.object(vault_indexer, "get_chroma_client", return_value=FakeClient(collection)),
+                patch.object(vault_indexer, "_pdf_fingerprint", return_value="fingerprint"),
+                patch.object(vault_indexer, "embed_texts", side_effect=RuntimeError("embed offline")),
+                patch.object(vault_indexer, "register_vault_alias"),
+            ):
+                failed = json.loads(vault_indexer.index_vault(
+                    file_path=str(pdf_path), collection="lecture",
+                    vision_mode="off", max_pages=2,
+                    chunk_size=500, chunk_overlap=0, model="embed",
+                ))
+                status = json.loads(vault_indexer.index_vault(
+                    action="status", file_path=str(pdf_path), collection="lecture"
+                ))
+
+        job = failed["pdf_jobs"][0]
+        self.assertFalse(failed["complete"])
+        self.assertIn("checkpoint", failed["error"])
+        self.assertEqual(job["page_count"], 2)
+        self.assertEqual(job["next_page"], 1)
+        self.assertEqual(job["fingerprint"], "fingerprint")
+        self.assertEqual(job["vision_mode"], "off")
+        self.assertTrue(job["retryable"])
+        self.assertEqual(status["job_count"], 1)
+        self.assertTrue(status["jobs"][0]["checkpoint_exists"])
+        self.assertEqual(status["jobs"][0]["next_page"], 1)
+
+    def test_folder_status_includes_pdfs_without_checkpoints(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            indexed = root / "indexed.pdf"
+            missing = root / "missing.pdf"
+            indexed.write_bytes(b"one")
+            missing.write_bytes(b"two")
+            state = {
+                "fingerprint": "fingerprint",
+                "next_page": 2,
+                "page_count": 1,
+                "indexed_pages": 1,
+                "indexed_chunks": 1,
+                "complete": True,
+                "config": {
+                    "chunk_size": 500,
+                    "chunk_overlap": 0,
+                    "embedding_model": "embed",
+                    "vision_mode": "off",
+                },
+            }
+            with patch.object(vault_indexer, "VAULTS_DIR", temporary):
+                vault_indexer._save_index_job("lecture", str(indexed), state)
+                status = json.loads(vault_indexer.index_vault(
+                    action="status", vault_path=temporary, collection="lecture"
+                ))
+
+        self.assertFalse(status["complete"])
+        self.assertEqual(status["job_count"], 2)
+        self.assertEqual(
+            sorted(job["checkpoint_exists"] for job in status["jobs"]),
+            [False, True],
+        )
 
 
 class PdfToolTests(unittest.TestCase):

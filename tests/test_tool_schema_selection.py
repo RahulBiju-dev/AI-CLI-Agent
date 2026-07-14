@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import unittest
 
-from agent.core import select_tool_schemas
+from agent.core import compact_tool_schemas, select_tool_schemas
 from tools.registry import TOOL_SCHEMAS
 
 
@@ -26,6 +26,18 @@ class ToolSchemaSelectionTests(unittest.TestCase):
     def test_vault_phrasing_selects_vault_tools(self):
         names = self._names("search my vault notes for the meeting summary")
         self.assertIn("vault_search", names)
+
+    def test_compact_index_schema_retains_handwriting_and_resume_contract(self):
+        compact = compact_tool_schemas(TOOL_SCHEMAS)
+        schema = next(
+            item for item in compact
+            if item.get("function", {}).get("name") == "index_vault"
+        )
+        description = schema["function"]["description"]
+        self.assertIn("vision_mode=all", description)
+        self.assertIn("next_page", description)
+        self.assertIn("resume_page", description)
+        self.assertIn("complete", description)
 
     def test_spotify_phrasing_selects_spotify(self):
         names = self._names("play a song on spotify")

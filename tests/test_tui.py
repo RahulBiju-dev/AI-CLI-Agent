@@ -285,6 +285,85 @@ class TuiAppSmokeTests(unittest.TestCase):
         asyncio.run(_run())
         core_mod._interrupted = False
 
+    def test_ctrl_c_with_selection_copies_instead_of_interrupt(self):
+        try:
+            import textual  # noqa: F401
+        except ImportError:
+            self.skipTest("textual not installed")
+
+        import asyncio
+        from unittest.mock import patch
+
+        from agent import core as core_mod
+        from agent.tui import build_app_class
+
+        AppCls = build_app_class()
+        app = AppCls(
+            session={
+                "history": True,
+                "system": "",
+                "options": {},
+                "verbose": False,
+                "wordwrap": True,
+                "format": "",
+                "think": True,
+                "runtime_profile": "manual",
+            },
+            history=[],
+            default_system_prompt="sys",
+            process_turn=lambda *a, **k: None,
+            handle_command=lambda *a, **k: True,
+            slash_completions=("/help",),
+            slash_descriptions={"/help": "Help"},
+            status_meta={"profile": "manual"},
+        )
+        copied: list[str] = []
+
+        async def _run():
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                core_mod._interrupted = False
+                app._busy = True
+                with patch.object(
+                    app, "_selection_to_copy", return_value="highlighted answer"
+                ), patch.object(
+                    app, "copy_to_clipboard", side_effect=lambda t: copied.append(t)
+                ):
+                    app.action_interrupt_or_quit()
+                    app.action_copy_selection()
+                # Selection path must never cancel generation.
+                self.assertFalse(core_mod.generation_interrupt_requested())
+                self.assertEqual(copied, ["highlighted answer", "highlighted answer"])
+
+                # Ctrl+Shift+C with nothing selected is a no-op (not interrupt).
+                with patch.object(app, "_selection_to_copy", return_value=None):
+                    app.action_copy_selection()
+                self.assertFalse(core_mod.generation_interrupt_requested())
+
+                # Plain Ctrl+C with no selection still interrupts.
+                app.action_interrupt_or_quit()
+                self.assertTrue(core_mod.generation_interrupt_requested())
+
+        asyncio.run(_run())
+        core_mod._interrupted = False
+
+    def test_ctrl_shift_c_binding_is_copy_not_interrupt(self):
+        try:
+            import textual  # noqa: F401
+        except ImportError:
+            self.skipTest("textual not installed")
+
+        from agent.tui import build_app_class
+
+        AppCls = build_app_class()
+        by_key = {}
+        for binding in AppCls.BINDINGS:
+            key = getattr(binding, "key", "") or ""
+            for part in str(key).split(","):
+                by_key[part.strip()] = getattr(binding, "action", "")
+        self.assertEqual(by_key.get("ctrl+shift+c"), "copy_selection")
+        self.assertEqual(by_key.get("ctrl+c"), "interrupt_or_quit")
+
     def test_thinking_fold_is_collapsible_after_stream(self):
         try:
             import textual  # noqa: F401

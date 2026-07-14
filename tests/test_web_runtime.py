@@ -365,6 +365,232 @@ class TestChatEventTerminalState(unittest.TestCase):
         self.assertEqual(len(assistant_calls), len(tool_results))
         self.assertNotIn("tool_calls", terminal_history[-1])
 
+    def test_progressing_vault_checkpoints_can_exceed_generic_round_cap(self):
+        from agent import web
+
+        chunks = []
+        for page in range(1, 11):
+            arguments = {
+                "action": "index",
+                "collection": "DSA",
+                "file_path": "/tmp/DSA_notes.pdf",
+                "vision_mode": "all",
+                "max_pages": 1,
+            }
+            if page > 1:
+                arguments["resume_page"] = page
+            call = SimpleNamespace(
+                function=SimpleNamespace(name="index_vault", arguments=arguments)
+            )
+            chunks.append(SimpleNamespace(
+                message=SimpleNamespace(tool_calls=[call], thinking="", content=""),
+                prompt_eval_count=0,
+                eval_count=0,
+                done_reason="stop",
+            ))
+        chunks.append(SimpleNamespace(
+            message=SimpleNamespace(
+                tool_calls=[],
+                thinking="",
+                content="The full document is indexed.",
+            ),
+            prompt_eval_count=0,
+            eval_count=10,
+            done_reason="stop",
+        ))
+        service = MagicMock()
+        service.chat.side_effect = [iter([chunk]) for chunk in chunks]
+        executed = 0
+
+        def execute(calls, **kwargs):
+            nonlocal executed
+            spec = web.normalize_tool_calls(calls)[0]
+            executed += 1
+            complete = executed == 10
+            next_page = None if complete else executed + 1
+            continuation_arguments = {
+                "action": "index",
+                "collection": "DSA",
+                "file_path": "/tmp/DSA_notes.pdf",
+                "vision_mode": "all",
+                "max_pages": 1,
+                "resume_page": next_page,
+            } if next_page is not None else None
+            payload = {
+                "complete": complete,
+                "continuation_required": not complete,
+                "next_page": next_page,
+                "continuation": (
+                    {"tool": "index_vault", "arguments": continuation_arguments}
+                    if continuation_arguments else None
+                ),
+                "collection": "DSA",
+                "incomplete_pdf_count": 0 if complete else 1,
+                "pdf_jobs": [{
+                    "complete": complete,
+                    "next_page": next_page,
+                    "fingerprint": "same-file",
+                    "indexed_pages": executed,
+                    "indexed_chunks": executed,
+                    "vision_pages": executed,
+                    "vision_failed_count": 0,
+                }],
+            }
+            return [ToolCallResult(spec, json.dumps(payload))]
+
+        session = {
+            "runtime_profile": "low-vram",
+            "options": {},
+            "history": True,
+            "system": "",
+            "think": False,
+        }
+        history = []
+        with (
+            patch.object(web, "TOOL_DISPATCH", {}),
+            patch.object(web, "OllamaService", return_value=service),
+            patch.object(web, "execute_tool_calls", side_effect=execute),
+            patch.object(web, "load_default_system_prompt", return_value=""),
+            patch.object(web, "prepare_messages_for_model", side_effect=lambda messages, *args, **kwargs: list(messages)),
+            patch.object(web, "tool_schemas_for_model", return_value=[]),
+            patch.object(web, "guarded_options_for_call", return_value={"num_ctx": 4096, "num_predict": 768}),
+            patch.object(web, "effective_session_model_options", return_value=(None, {"num_ctx": 4096, "num_predict": 768})),
+            patch.object(web, "save_session_snapshot", return_value="conversation.json"),
+            patch.object(web, "list_saved_sessions", return_value=["conversation.json"]),
+        ):
+            events = list(web._generate_chat_events_impl(
+                "Index all handwritten pages",
+                session,
+                history,
+                "conversation.json",
+                cancellation_token=CancellationToken(),
+                publish_global=False,
+                client_id="client-one",
+            ))
+
+        terminal = next(event for event in reversed(events) if event.get("type") == "done")
+        self.assertEqual(terminal["state"], "completed")
+        self.assertEqual(executed, 10)
+        self.assertEqual(terminal["history"][-1]["content"], "The full document is indexed.")
+        self.assertFalse(any(
+            "Stopped after 8" in str(event.get("message") or event.get("text") or "")
+            for event in events
+        ))
+
+    def test_web_ignores_premature_vault_completion_and_runs_exact_resume(self):
+        from agent import web
+
+        initial_arguments = {
+            "action": "index",
+            "collection": "DSA",
+            "file_path": "/tmp/DSA_notes.pdf",
+            "vision_mode": "all",
+            "max_pages": 1,
+        }
+        expected_arguments = {
+            **initial_arguments,
+            "chunk_size": 1800,
+            "chunk_overlap": 250,
+            "resume_page": 2,
+        }
+        initial_call = SimpleNamespace(
+            function=SimpleNamespace(name="index_vault", arguments=initial_arguments)
+        )
+
+        def chunk(*, calls=None, content=""):
+            return SimpleNamespace(
+                message=SimpleNamespace(tool_calls=calls or [], thinking="", content=content),
+                prompt_eval_count=0,
+                eval_count=10,
+                done_reason="stop",
+            )
+
+        service = MagicMock()
+        service.chat.side_effect = [
+            iter([chunk(calls=[initial_call])]),
+            iter([chunk(content="Everything is indexed.")]),
+            iter([chunk(content="The document is now fully indexed.")]),
+        ]
+        executed_arguments = []
+
+        def execute(calls, **kwargs):
+            spec = web.normalize_tool_calls(calls)[0]
+            executed_arguments.append(spec.arguments)
+            complete = len(executed_arguments) == 2
+            payload = {
+                "complete": complete,
+                "continuation_required": not complete,
+                "next_page": None if complete else 2,
+                "continuation": None if complete else {
+                    "tool": "index_vault",
+                    "arguments": expected_arguments,
+                },
+                "collection": "DSA",
+                "incomplete_pdf_count": 0 if complete else 1,
+                "pdf_jobs": [{
+                    "complete": complete,
+                    "next_page": None if complete else 2,
+                    "fingerprint": "same-file",
+                    "indexed_pages": len(executed_arguments),
+                    "indexed_chunks": len(executed_arguments),
+                    "vision_pages": len(executed_arguments),
+                    "vision_failed_count": 0,
+                }],
+            }
+            return [ToolCallResult(spec, json.dumps(payload))]
+
+        session = {
+            "runtime_profile": "low-vram",
+            "options": {},
+            "history": True,
+            "system": "",
+            "think": False,
+        }
+        history = []
+        with (
+            patch.object(web, "TOOL_DISPATCH", {}),
+            patch.object(web, "OllamaService", return_value=service),
+            patch.object(web, "execute_tool_calls", side_effect=execute),
+            patch.object(web, "load_default_system_prompt", return_value=""),
+            patch.object(
+                web,
+                "prepare_messages_for_model",
+                side_effect=lambda messages, *args, **kwargs: list(messages),
+            ),
+            patch.object(web, "tool_schemas_for_model", return_value=[]),
+            patch.object(
+                web,
+                "guarded_options_for_call",
+                return_value={"num_ctx": 4096, "num_predict": 768},
+            ),
+            patch.object(
+                web,
+                "effective_session_model_options",
+                return_value=(None, {"num_ctx": 4096, "num_predict": 768}),
+            ),
+            patch.object(web, "save_session_snapshot", return_value="conversation.json"),
+            patch.object(web, "list_saved_sessions", return_value=["conversation.json"]),
+        ):
+            events = list(web._generate_chat_events_impl(
+                "Index all handwritten pages",
+                session,
+                history,
+                "conversation.json",
+                cancellation_token=CancellationToken(),
+                publish_global=False,
+                client_id="client-one",
+            ))
+
+        terminal = next(event for event in reversed(events) if event.get("type") == "done")
+        streamed_text = "".join(
+            str(event.get("text") or "") for event in events
+            if event.get("type") == "content_chunk"
+        )
+        self.assertEqual(executed_arguments, [initial_arguments, expected_arguments])
+        self.assertNotIn("Everything is indexed.", streamed_text)
+        self.assertEqual(terminal["state"], "completed")
+        self.assertEqual(terminal["history"][-1]["content"], "The document is now fully indexed.")
+
     def test_length_limited_web_segments_stream_and_persist_as_one_answer(self):
         from agent import web
 

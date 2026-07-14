@@ -875,32 +875,33 @@ def print_tool_event(
     detail: str | None = None,
     message: str | None = None,
 ) -> None:
-    """Print a tool lifecycle line: run / ok / error / parallel."""
+    """Print a tool lifecycle line: run / ok / error / parallel.
+
+    Classic scrollback uses Rich markup for the tool name. The full-screen TUI
+    styles the name itself — never embed ``[bold cyan]…`` markup in the message
+    (Textual would paint those tags as literal grey text).
+    """
     if phase == "parallel":
         print_lab_status(
             message or f"parallel tools {GLYPH_DOT} {detail or '?'}",
             kind="info",
         )
         return
-    if phase == "error":
-        print_lab_status(
-            f"[{THEME.label}]{name}[/]  {message or 'failed'}",
-            kind="error",
-            detail=detail,
-        )
+
+    default_body = {"error": "failed", "ok": "complete"}.get(phase, "running")
+    body = message or default_body
+    kind = {"error": "error", "ok": "ok"}.get(phase, "tool")
+    tool_name = str(name or "?").strip() or "?"
+
+    sink = get_display_sink()
+    if sink is not None and getattr(sink, "is_tui", False):
+        # Plain text — TUI applies accent styling to the tool name.
+        status_detail = body if not detail else f"{body}  {detail}"
+        print_lab_status(tool_name, kind=kind, detail=status_detail)
         return
-    if phase == "ok":
-        print_lab_status(
-            f"[{THEME.label}]{name}[/]  {message or 'complete'}",
-            kind="ok",
-            detail=detail,
-        )
-        return
-    print_lab_status(
-        f"[{THEME.label}]{name}[/]  {message or 'running'}",
-        kind="run",
-        detail=detail,
-    )
+
+    styled = f"[{THEME.label}]{tool_name}[/]  {body}"
+    print_lab_status(styled, kind=kind if kind != "tool" else "run", detail=detail)
 
 
 def print_generation_stats(

@@ -123,7 +123,7 @@ Documents ──→ Page/Text/Vision ──→ Chunk ──→ Embed ──→ C
 
 2. **Embedding:** Each chunk is converted into a dense vector (a list of floating-point numbers) using an embedding model (`embeddinggemma` by default, running locally via Ollama). This vector captures the *semantic meaning* of the text — chunks about similar topics will have vectors that are close together in the embedding space, regardless of exact wording.
 
-3. **Storage and checkpoints:** Vectors and source metadata are stored in [ChromaDB](https://www.trychroma.com/). Large-PDF progress is atomically checkpointed after every committed page under `vaults/.index_jobs/`. Repeating `index_vault` resumes at `next_page`; changed files get a new fingerprint, and stale chunks are removed only after the replacement generation completes.
+3. **Storage and checkpoints:** Vectors and source metadata are stored in [ChromaDB](https://www.trychroma.com/). Large-PDF progress is atomically checkpointed after every committed page under `vaults/.index_jobs/`. Pass each returned `next_page` as `resume_page`; changed files get a new fingerprint, and stale chunks are removed only after the replacement generation completes.
 
 4. **Retrieval:** `vault_search` performs approximate nearest-neighbour retrieval for focused questions. `vault_read` instead walks every matching source/page/chunk through a stable `next_cursor`; oversized chunks use a character sub-cursor so exhaustive reads do not skip text.
 
@@ -218,7 +218,7 @@ The agent autonomously decides when to call tools based on the user's query:
 | 📅 **Google Calendar** | List calendars and upcoming events, search a time range, and create or edit events; deletion requires explicit confirmation |
 | ✅ **Google Tasks** | List task lists and tasks, create tasks with notes or due dates, and update status or details; deletion requires explicit confirmation |
 
-Large PDF indexing is deliberately resumable rather than one enormous tool call. The conservative default processes up to 20 pages per call so full Moondream runs stay within the bounded tool timeout on slower local GPUs. `vision_mode=auto` uses Moondream on image-bearing or low-text pages, `vision_mode=all` analyzes every page, and `vision_mode=off` is text-only. Call the tool again with the same file/collection and `resume_page=next_page` until `complete=true`, or use `action=status` to inspect the durable checkpoint. This is suitable for 900–1,200-page slide collections without retaining rendered page batches or the whole extracted document in RAM.
+Large PDF indexing is deliberately resumable rather than one enormous tool call. The conservative default processes up to 20 pages per call so full Moondream runs stay within the bounded tool timeout on slower local GPUs. `vision_mode=auto` uses Moondream on image-bearing or low-text pages, `vision_mode=all` analyzes every page and is required for handwritten-document requests, and `vision_mode=off` is text-only. Call the tool again with the same file/collection and `resume_page=next_page` until `complete=true`, or use `action=status` to inspect the compact durable checkpoint. Progressing `index_vault` continuations are not stopped by the ordinary eight-round tool cap; malformed, mixed, failed, or repeated no-progress checkpoints remain bounded. This is suitable for 900–1,200-page collections without retaining rendered page batches or the whole extracted document in RAM.
 
 ### Spreadsheet Tool
 
