@@ -699,7 +699,9 @@ Settings resolve in this order (highest wins):
 1. Session / slash-command override (`/set …`)
 2. Environment variables (`SELENE_*`)
 3. Selected hardware profile (`auto`, `low-vram`, `balanced`, `manual`)
-4. Conservative defaults (4 GiB-safe low-VRAM profile)
+4. Bundled Modelfile defaults (`manual`)
+
+The desktop app and browser UI ask which runtime profile to use when they open. **Manual** is preselected and keeps the bundled Modelfile values; choose **Auto** to inspect the device, or explicitly select **Low VRAM** or **Balanced**. The same choice remains available under Settings → Model.
 
 All model parameters can be adjusted without restarting:
 
@@ -732,9 +734,9 @@ Common environment overrides (see `agent/runtime_config.py` for the full list):
 
 ## Performance Tuning
 
-Selene selects a **hardware profile** at startup (`auto`, `low-vram`, `balanced`, `manual`). When VRAM cannot be measured, or a ~4 GiB class GPU is detected, the conservative **low-vram** profile is used. All chat, title, summary, embedding, and vision work shares one Ollama coordinator; low-VRAM mode serializes model-heavy work without serializing ordinary tools.
+Selene defaults to the **manual** profile and the bundled Modelfile parameters. Hardware inspection only selects a profile when you choose **auto**; in Auto mode, unmeasurable VRAM or a ~4 GiB class GPU selects the conservative **low-vram** profile. All chat, title, summary, embedding, and vision work shares one Ollama coordinator; low-VRAM mode serializes model-heavy work without serializing ordinary tools.
 
-| Setting | low-vram (default safeguard) | balanced (larger GPU) | Purpose |
+| Setting | low-vram (Auto safeguard) | balanced (larger GPU) | Purpose |
 |---------|------------------------------|------------------------|---------|
 | `num_ctx` | 4096 | 8192 | Context window |
 | `num_predict` | 768 | 2048 | Output ceiling (per call; manual/Modelfile default is 2048) |

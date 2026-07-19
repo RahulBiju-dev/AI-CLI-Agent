@@ -103,6 +103,7 @@
       </section>
       <section class="settings-group">
         <h3>Model</h3>
+        <label class="field-row"><span>Runtime profile</span><small>Manual is the default. Choose Auto for hardware detection or select a fixed profile.</small><select id="setting-profile"><option value="manual" selected>Manual — Modelfile defaults</option><option value="auto">Auto — detect this device</option><option value="low-vram">Low VRAM — about 4 GiB</option><option value="balanced">Balanced — more headroom</option></select></label>
         <label class="field-row"><span>Temperature <output id="temperature-value">0.25</output></span><small>Higher values produce more varied answers.</small><input id="setting-temperature" type="range" min="0" max="2" step="0.05" value="0.25"></label>
         <label class="field-row"><span>Context window</span><small>Maximum tokens available to prompts and responses.</small><select id="setting-context" disabled><option value="" selected>Loading…</option><option value="4096">4k</option><option value="8192">8k</option><option value="16384">16k</option><option value="32768">32k</option><option value="65536">64k</option><option value="131072">128k</option></select></label>
       </section>
@@ -120,6 +121,34 @@
       </header>
       <div id="theme-options" class="theme-options" role="radiogroup" aria-label="Selene color theme"></div>
       <p class="theme-hint"><span>←↑↓→</span> navigate <span>Enter</span> select <span>Tab</span> cycle <span>Esc</span> close</p>
+    </section>
+  </div>
+
+  <div id="profile-backdrop" class="profile-backdrop" hidden>
+    <section id="profile-dialog" class="profile-dialog" role="dialog" aria-modal="true" aria-labelledby="profile-title" aria-describedby="profile-intro" aria-hidden="true">
+      <header class="profile-header">
+        <div>
+          <p class="eyebrow">startup</p>
+          <h2 id="profile-title">Configure this device</h2>
+        </div>
+      </header>
+      <div class="profile-body">
+        <p id="profile-intro">Selene starts in Manual mode. You can let Auto inspect your hardware, or select the appropriate profile yourself.</p>
+        <label class="profile-field" for="profile-choice">
+          <span>Runtime profile</span>
+          <select id="profile-choice">
+            <option value="manual" selected>Manual — Modelfile defaults</option>
+            <option value="auto">Auto — detect this device</option>
+            <option value="low-vram">Low VRAM — about 4 GiB</option>
+            <option value="balanced">Balanced — more headroom</option>
+          </select>
+        </label>
+        <p id="profile-choice-description" class="profile-description"></p>
+        <p id="profile-runtime-summary" class="profile-runtime-summary"></p>
+      </div>
+      <footer class="profile-footer">
+        <button id="profile-apply" class="profile-apply-btn" type="button">Continue</button>
+      </footer>
     </section>
   </div>
 

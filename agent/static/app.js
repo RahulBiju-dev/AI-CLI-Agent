@@ -4,7 +4,7 @@ const DEFAULT_SETTINGS = {
   // Explicit per-session overrides only. Effective values come from the
   // backend-selected hardware profile.
   options: {},
-  runtime_profile: "auto",
+  runtime_profile: "manual",
   verbose: true,
   wordwrap: true,
   system: "",
@@ -13,12 +13,31 @@ const DEFAULT_SETTINGS = {
   think: true
 };
 
+const RUNTIME_PROFILES = {
+  manual: {
+    label: "Manual",
+    description: "Use the bundled Modelfile defaults and preserve your explicit settings."
+  },
+  auto: {
+    label: "Auto",
+    description: "Inspect this device and choose a conservative hardware profile automatically."
+  },
+  "low-vram": {
+    label: "Low VRAM",
+    description: "Use conservative settings intended for GPUs with about 4 GiB of VRAM."
+  },
+  balanced: {
+    label: "Balanced",
+    description: "Use a larger batch and more concurrency on systems with additional headroom."
+  }
+};
+
 const FALLBACK_MODEL_OPTIONS = {
   temperature: 0.25,
   top_p: 0.85,
   top_k: 40,
   repeat_penalty: 1.08,
-  num_predict: 768,
+  num_predict: 2048,
   num_batch: 128
 };
 
@@ -190,6 +209,7 @@ function bindElements() {
   el.temperature = document.getElementById("setting-temperature");
   el.temperatureValue = document.getElementById("temperature-value");
   el.context = document.getElementById("setting-context");
+  el.profileSetting = document.getElementById("setting-profile");
   el.system = document.getElementById("setting-system");
   el.settingsPanel = document.getElementById("settings-panel");
   el.settingsBackdrop = document.getElementById("settings-backdrop");
@@ -198,6 +218,12 @@ function bindElements() {
   el.themeDialog = document.getElementById("theme-dialog");
   el.themeOptions = document.getElementById("theme-options");
   el.themeButton = document.getElementById("theme-btn");
+  el.profileBackdrop = document.getElementById("profile-backdrop");
+  el.profileDialog = document.getElementById("profile-dialog");
+  el.profileChoice = document.getElementById("profile-choice");
+  el.profileChoiceDescription = document.getElementById("profile-choice-description");
+  el.profileRuntimeSummary = document.getElementById("profile-runtime-summary");
+  el.profileApply = document.getElementById("profile-apply");
 }
 
 function bindEvents() {
@@ -239,7 +265,13 @@ function bindEvents() {
   el.themeBackdrop?.addEventListener("click", (event) => {
     if (event.target === el.themeBackdrop) closeThemeDialog();
   });
+  el.profileChoice?.addEventListener("change", updateStartupProfileCopy);
+  el.profileApply?.addEventListener("click", applyStartupProfile);
   document.addEventListener("keydown", (event) => {
+    if (el.profileBackdrop?.classList.contains("open")) {
+      handleStartupProfileKeydown(event);
+      return;
+    }
     if (el.themeBackdrop?.classList.contains("open")) {
       handleThemeDialogKeydown(event);
       return;
@@ -290,6 +322,11 @@ function bindEvents() {
     state.settings.options.num_ctx = Number(el.context.value);
     persistSettings();
     updateContextMeter();
+  });
+
+  el.profileSetting?.addEventListener("change", () => {
+    state.settings.runtime_profile = el.profileSetting.value;
+    persistSettings();
   });
 
   const persistSystemPrompt = debounce(persistSettings, 350);
@@ -415,6 +452,7 @@ async function loadState() {
     renderSessions();
     renderMessages();
     updateComposerState();
+    showStartupProfileDialog();
   } catch (error) {
     toast("Could not reach Selene. Make sure the backend and Ollama are running.");
     renderWelcome();
@@ -437,6 +475,9 @@ function syncSettingsUI() {
   if (el.history) el.history.checked = state.settings.history !== false;
   if (el.think) el.think.checked = state.settings.think !== false;
   if (el.system) el.system.value = state.settings.system || "";
+  if (el.profileSetting && RUNTIME_PROFILES[state.settings.runtime_profile]) {
+    el.profileSetting.value = state.settings.runtime_profile;
+  }
 
   const temp = Number(
     state.settings.options?.temperature
@@ -479,11 +520,91 @@ function persistSettings() {
       syncSettingsUI();
       // Refresh after the server resolves profile defaults and session overrides.
       updateContextMeter();
+      return true;
     } catch {
       toast("Settings could not be saved.");
+      return false;
     }
   });
   return settingsWriteChain;
+}
+
+function showStartupProfileDialog() {
+  if (!el.profileBackdrop || !el.profileDialog || !el.profileChoice) return;
+  const requested = RUNTIME_PROFILES[state.settings.runtime_profile]
+    ? state.settings.runtime_profile
+    : "manual";
+  el.profileChoice.value = requested;
+  updateStartupProfileCopy();
+  updateStartupProfileRuntimeSummary();
+  el.profileBackdrop.hidden = false;
+  requestAnimationFrame(() => {
+    el.profileBackdrop.classList.add("open");
+    el.profileDialog.setAttribute("aria-hidden", "false");
+    el.profileChoice.focus();
+  });
+}
+
+function updateStartupProfileCopy() {
+  const profile = RUNTIME_PROFILES[el.profileChoice?.value] || RUNTIME_PROFILES.manual;
+  if (el.profileChoiceDescription) el.profileChoiceDescription.textContent = profile.description;
+}
+
+function updateStartupProfileRuntimeSummary() {
+  if (!el.profileRuntimeSummary) return;
+  const requested = RUNTIME_PROFILES[state.runtime?.requested_profile]?.label
+    || RUNTIME_PROFILES[state.settings.runtime_profile]?.label
+    || RUNTIME_PROFILES.manual.label;
+  const effective = RUNTIME_PROFILES[state.runtime?.profile]?.label || requested;
+  el.profileRuntimeSummary.textContent = requested === effective
+    ? `Current profile: ${effective}.`
+    : `Current profile: ${requested} selected ${effective} for this device.`;
+}
+
+async function applyStartupProfile() {
+  const selected = el.profileChoice?.value;
+  if (!RUNTIME_PROFILES[selected] || !el.profileApply || el.profileApply.disabled) return;
+
+  el.profileChoice.disabled = true;
+  el.profileApply.disabled = true;
+  el.profileApply.textContent = "Applying…";
+  state.settings.runtime_profile = selected;
+  const saved = await persistSettings();
+
+  el.profileChoice.disabled = false;
+  el.profileApply.disabled = false;
+  el.profileApply.textContent = "Continue";
+  if (!saved) return;
+
+  updateStartupProfileRuntimeSummary();
+  el.profileBackdrop.classList.remove("open");
+  el.profileDialog.setAttribute("aria-hidden", "true");
+  setTimeout(() => {
+    if (el.profileBackdrop) el.profileBackdrop.hidden = true;
+  }, 160);
+  el.input?.focus({ preventScroll: true });
+}
+
+function handleStartupProfileKeydown(event) {
+  if (event.key === "Escape") {
+    event.preventDefault();
+    return;
+  }
+  if (event.key === "Enter" && event.target !== el.profileApply) {
+    event.preventDefault();
+    applyStartupProfile();
+    return;
+  }
+  if (event.key !== "Tab") return;
+
+  const focusable = [el.profileChoice, el.profileApply].filter((element) => element && !element.disabled);
+  if (!focusable.length) return;
+  const current = focusable.indexOf(document.activeElement);
+  const next = event.shiftKey
+    ? (current <= 0 ? focusable.length - 1 : current - 1)
+    : (current === focusable.length - 1 ? 0 : current + 1);
+  event.preventDefault();
+  focusable[next].focus();
 }
 
 function renderSessions() {

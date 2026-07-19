@@ -29,6 +29,23 @@ def _custom_properties(block: str) -> dict[str, str]:
 
 
 class WebThemeTests(unittest.TestCase):
+    def test_startup_profile_chooser_defaults_to_manual_and_is_wired(self) -> None:
+        self.assertRegex(
+            APP,
+            re.compile(
+                r'const DEFAULT_SETTINGS\s*=\s*\{.*?runtime_profile:\s*"manual"',
+                re.DOTALL,
+            ),
+        )
+        self.assertIn('id="profile-dialog"', HTML)
+        self.assertIn('id="profile-choice"', HTML)
+        self.assertIn('id="profile-apply"', HTML)
+        self.assertIn('id="setting-profile"', HTML)
+        self.assertIn("function showStartupProfileDialog()", APP)
+        self.assertIn("function applyStartupProfile()", APP)
+        self.assertIn("state.settings.runtime_profile = selected", APP)
+        self.assertRegex(STYLE, r"\.profile-backdrop\[hidden\]\s*\{\s*display:\s*none;")
+
     def test_every_tui_place_theme_is_available_on_web(self) -> None:
         for name in theme_names():
             with self.subTest(theme=name):
