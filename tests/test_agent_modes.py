@@ -7,6 +7,7 @@ from agent.runtime_config import RuntimeConfigurationError
 from agent.modes import (
     DEEP_RESEARCH_COMPACT_MARKER,
     compact_deep_research_messages,
+    force_hard_web_search_schema,
     force_high_tool_difficulty,
     normalize_agent_mode,
     parse_research_queries,
@@ -54,6 +55,32 @@ class AgentModePolicyTests(unittest.TestCase):
         hardened = force_high_tool_difficulty(calls)
         self.assertEqual(hardened[0]["function"]["arguments"]["difficulty"], "hard")
         self.assertEqual(calls[0]["function"]["arguments"]["difficulty"], "easy")
+
+    def test_enhanced_mode_schema_only_allows_hard_web_search(self):
+        tools = [{
+            "type": "function",
+            "function": {
+                "name": "web_search",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string"},
+                        "difficulty": {
+                            "type": "string",
+                            "enum": ["easy", "medium", "hard"],
+                        },
+                    },
+                },
+            },
+        }]
+        hardened = force_hard_web_search_schema(tools)
+        difficulty = hardened[0]["function"]["parameters"]["properties"]["difficulty"]
+        self.assertEqual(difficulty["enum"], ["hard"])
+        self.assertEqual(difficulty["default"], "hard")
+        self.assertEqual(
+            tools[0]["function"]["parameters"]["properties"]["difficulty"]["enum"],
+            ["easy", "medium", "hard"],
+        )
 
     def test_deep_research_compaction_keeps_exact_request_and_bounded_evidence(self):
         original_request = "Compare the evidence without losing this exact request"
@@ -149,6 +176,7 @@ class AgentModeFrontendTests(unittest.TestCase):
         self.assertIn("function setAgentMode(mode)", APP)
         self.assertIn('agent_mode: "normal"', APP)
         self.assertIn('normal: { label: "Fast"', APP)
+        self.assertIn("await settingsWriteChain;", APP)
         self.assertIn('appendStatus(event.message || "", event.activity_mode || "")', APP)
         self.assertIn('status.classList.add("mode-activity", "running")', APP)
         self.assertIn('runtime_profile: "manual"', APP)

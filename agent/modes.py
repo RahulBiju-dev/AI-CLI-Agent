@@ -11,6 +11,7 @@ AGENT_MODE_NORMAL = "normal"
 AGENT_MODE_ULTRA = "ultra"
 AGENT_MODE_DEEP_RESEARCH = "deep-research"
 DEEP_RESEARCH_COMPACT_INTERVAL = 3
+DEEP_RESEARCH_SCRAPE_COMPACT_INTERVAL = 2
 DEEP_RESEARCH_COMPACT_MARKER = "[Deep Research auto-compaction checkpoint]"
 AGENT_MODES = frozenset({
     AGENT_MODE_NORMAL,
@@ -158,6 +159,33 @@ def force_high_tool_difficulty(tool_calls: list[dict]) -> list[dict]:
             arguments = {}
         function["arguments"] = {**arguments, "difficulty": "hard"}
         hardened.append(call)
+    return hardened
+
+
+def force_hard_web_search_schema(tools: list[dict] | None) -> list[dict] | None:
+    """Tell the model that enhanced modes only accept hard web searches."""
+    if not tools:
+        return tools
+    hardened = deepcopy(tools)
+    for tool in hardened:
+        function = tool.get("function") if isinstance(tool, dict) else None
+        if not isinstance(function, dict) or function.get("name") != "web_search":
+            continue
+        parameters = function.get("parameters")
+        if not isinstance(parameters, dict):
+            parameters = {}
+            function["parameters"] = parameters
+        properties = parameters.get("properties")
+        if not isinstance(properties, dict):
+            properties = {}
+            parameters["properties"] = properties
+        difficulty = properties.get("difficulty")
+        if not isinstance(difficulty, dict):
+            difficulty = {"type": "string"}
+            properties["difficulty"] = difficulty
+        difficulty["enum"] = ["hard"]
+        difficulty["default"] = "hard"
+        difficulty["description"] = "Required hard-depth search for the active enhanced mode."
     return hardened
 
 

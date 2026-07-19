@@ -956,6 +956,9 @@ async function sendMessage() {
   updateComposerState();
 
   try {
+    // Mode/profile changes are persisted asynchronously. Do not let a quick
+    // send race the backend and start with the previous mode.
+    await settingsWriteChain;
     const response = await fetch("/api/chat", {
       method: "POST",
       headers: apiHeaders(true),
