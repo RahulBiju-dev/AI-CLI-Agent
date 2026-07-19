@@ -76,6 +76,7 @@ from agent.modes import (
     AGENT_MODE_NORMAL,
     AGENT_MODE_ULTRA,
     DEEP_RESEARCH_COMPACT_INTERVAL,
+    DEEP_RESEARCH_SCRAPE_COMPACT_INTERVAL,
     DEEP_RESEARCH_PLANNER_PROMPT,
     DEEP_RESEARCH_SYNTHESIS_PROMPT,
     ULTRA_MODE_PROMPT,
@@ -1596,6 +1597,8 @@ def _generate_chat_events_impl(
     initial_research_results: list[dict] = []
     deep_research_search_count = 0
     deep_research_next_compaction = DEEP_RESEARCH_COMPACT_INTERVAL
+    deep_research_scrape_count = 0
+    deep_research_next_scrape_compaction = DEEP_RESEARCH_SCRAPE_COMPACT_INTERVAL
     deep_research_compacted_prefix: list[dict] | None = None
     deep_research_history_checkpoint_index = 0
     deep_research_checkpoint_chars = max(3000, min(16000, int(runtime.num_ctx)))
@@ -1669,14 +1672,6 @@ def _generate_chat_events_impl(
                 deep_research_history_checkpoint_index = len(history_data)
             while deep_research_next_compaction <= deep_research_search_count:
                 deep_research_next_compaction += DEEP_RESEARCH_COMPACT_INTERVAL
-            yield {
-                "type": "status",
-                "message": (
-                    "Auto-compacted Deep Research context after "
-                    f"{deep_research_search_count} web searches."
-                ),
-                "color": "blue",
-            }
         messages_to_send = prepare_messages_for_model(
             [
                 *research_base,
@@ -2197,8 +2192,12 @@ def _generate_chat_events_impl(
             deep_research_search_count += sum(
                 spec.name == "web_search" for spec in execution_specs
             )
+            deep_research_scrape_count += sum(
+                spec.name == "web_scrape" for spec in execution_specs
+            )
             research_compaction_due = (
                 deep_research_search_count >= deep_research_next_compaction
+                or deep_research_scrape_count >= deep_research_next_scrape_compaction
             )
             if research_compaction_due:
                 compaction_source = (
@@ -2217,14 +2216,8 @@ def _generate_chat_events_impl(
                     messages_to_send = list(deep_research_compacted_prefix)
                 while deep_research_next_compaction <= deep_research_search_count:
                     deep_research_next_compaction += DEEP_RESEARCH_COMPACT_INTERVAL
-                yield {
-                    "type": "status",
-                    "message": (
-                        "Auto-compacted Deep Research context after "
-                        f"{deep_research_search_count} web searches."
-                    ),
-                    "color": "blue",
-                }
+                while deep_research_next_scrape_compaction <= deep_research_scrape_count:
+                    deep_research_next_scrape_compaction += DEEP_RESEARCH_SCRAPE_COMPACT_INTERVAL
 
         if vault_index_loop_state.get("blocked_reason"):
             message = str(vault_index_loop_state["blocked_reason"])

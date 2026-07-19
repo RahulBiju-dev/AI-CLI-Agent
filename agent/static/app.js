@@ -166,6 +166,7 @@ let settingsWriteChain = Promise.resolve();
 let lastRuntimeWarning = "";
 let themeCloseTimer = null;
 let themeTriggerElement = null;
+let startupProfilePromptShown = false;
 
 function reportRuntimeWarnings(runtime) {
   const warnings = Array.isArray(runtime?.warnings) ? runtime.warnings : [];
@@ -199,6 +200,12 @@ function bindElements() {
   el.temperatureValue = document.getElementById("temperature-value");
   el.context = document.getElementById("setting-context");
   el.profileSetting = document.getElementById("setting-profile");
+  el.profileBackdrop = document.getElementById("profile-backdrop");
+  el.profileDialog = document.getElementById("profile-dialog");
+  el.profileChoice = document.getElementById("profile-choice");
+  el.profileDescription = document.getElementById("profile-choice-description");
+  el.profileRuntimeSummary = document.getElementById("profile-runtime-summary");
+  el.profileApply = document.getElementById("profile-apply");
   el.system = document.getElementById("setting-system");
   el.settingsPanel = document.getElementById("settings-panel");
   el.settingsBackdrop = document.getElementById("settings-backdrop");
@@ -460,6 +467,72 @@ async function loadState() {
     toast("Could not reach Selene. Make sure the backend and Ollama are running.");
     renderWelcome();
   }
+}
+
+function updateStartupProfileCopy() {
+  const selected = el.profileChoice?.value || "manual";
+  const descriptions = {
+    manual: "Use the Modelfile and your explicit session settings without hardware-based overrides.",
+    auto: "Inspect this device and choose a conservative hardware profile automatically.",
+    "low-vram": "Use smaller context and batch defaults for GPUs with about 4 GiB of VRAM.",
+    balanced: "Use larger context and batch defaults when the device has more headroom."
+  };
+  if (el.profileDescription) {
+    el.profileDescription.textContent = descriptions[selected] || descriptions.manual;
+  }
+  if (el.profileRuntimeSummary) {
+    const effective = state.runtime?.profile || state.settings.runtime_profile || "manual";
+    const reason = state.runtime?.selection_reason || "Manual is the startup default.";
+    el.profileRuntimeSummary.textContent = `Currently active: ${effective}. ${reason}`;
+  }
+}
+
+function showStartupProfileDialog() {
+  if (startupProfilePromptShown || !el.profileBackdrop || !el.profileDialog) return;
+  startupProfilePromptShown = true;
+  const selected = ["manual", "auto", "low-vram", "balanced"].includes(
+    state.settings.runtime_profile
+  ) ? state.settings.runtime_profile : "manual";
+  if (el.profileChoice) el.profileChoice.value = selected;
+  updateStartupProfileCopy();
+  el.profileBackdrop.hidden = false;
+  el.profileDialog.setAttribute("aria-hidden", "false");
+  requestAnimationFrame(() => {
+    el.profileBackdrop?.classList.add("open");
+    el.profileChoice?.focus();
+  });
+}
+
+async function applyStartupProfile() {
+  const selected = el.profileChoice?.value || "manual";
+  if (!el.profileBackdrop || !el.profileDialog) return;
+  state.settings.runtime_profile = selected;
+  if (el.profileApply) el.profileApply.disabled = true;
+  await persistSettings();
+  el.profileBackdrop.classList.remove("open");
+  el.profileDialog.setAttribute("aria-hidden", "true");
+  if (el.profileApply) el.profileApply.disabled = false;
+  setTimeout(() => {
+    if (el.profileBackdrop) el.profileBackdrop.hidden = true;
+    el.input?.focus();
+  }, 180);
+}
+
+function handleStartupProfileKeydown(event) {
+  if (event.key === "Enter" && event.target !== el.profileChoice) {
+    event.preventDefault();
+    applyStartupProfile();
+    return;
+  }
+  if (event.key !== "Tab") return;
+  const focusable = [el.profileChoice, el.profileApply].filter(Boolean);
+  if (!focusable.length) return;
+  const current = focusable.indexOf(document.activeElement);
+  const next = event.shiftKey
+    ? (current <= 0 ? focusable.length - 1 : current - 1)
+    : (current + 1) % focusable.length;
+  event.preventDefault();
+  focusable[next].focus();
 }
 
 function mergeSettings(settings) {
@@ -1273,7 +1346,7 @@ function resetStream() {
 }
 
 function settleModeStatus() {
-  state.stream.modeStatusLine?.classList.remove("running");
+  state.stream.modeStatusLine?.remove();
   state.stream.modeStatusLine = null;
 }
 
@@ -1331,16 +1404,34 @@ function stopGeneration({ refresh = true } = {}) {
 }
 
 function appendStatus(text, activityMode = "") {
+  if (activityMode === "ultra" || activityMode === "deep-research") {
+    appendModeActivity(text, activityMode);
+    return;
+  }
   settleModeStatus();
   const status = document.createElement("div");
   status.className = "status-line";
   status.textContent = text;
-  if (activityMode === "ultra" || activityMode === "deep-research") {
-    status.classList.add("mode-activity", "running");
-    status.dataset.mode = activityMode;
-    state.stream.modeStatusLine = status;
-  }
   el.messages.appendChild(status);
+  scrollToBottom();
+}
+
+function appendModeActivity(text, activityMode) {
+  settleModeStatus();
+  ensureAssistantStack();
+  if (!state.stream.thinkingBlock) {
+    state.stream.thinkingBlock = detailBlock("Thinking", "reasoning", "", false);
+    state.stream.thinkingContent = state.stream.thinkingBlock.querySelector(".block-content");
+    state.stream.assistantStack.appendChild(state.stream.thinkingBlock);
+  }
+
+  state.stream.thinkingBlock.classList.add("running");
+  const activity = document.createElement("span");
+  activity.className = "mode-activity-inline running";
+  activity.dataset.mode = activityMode;
+  activity.textContent = text;
+  state.stream.thinkingBlock.querySelector(".block-title")?.appendChild(activity);
+  state.stream.modeStatusLine = activity;
   scrollToBottom();
 }
 

@@ -775,6 +775,14 @@ class TestChatEventTerminalState(unittest.TestCase):
                     '"topic overview","topic latest","topic primary sources","topic limitations"]}'
                 )])
             if call_number <= 10:
+                if call_number in {2, 3}:
+                    tool_call = SimpleNamespace(
+                        function=SimpleNamespace(
+                            name="web_scrape",
+                            arguments={"url": f"https://scrape.example/{call_number - 1}"},
+                        )
+                    )
+                    return iter([chunk(tool_call=tool_call)])
                 tool_call = SimpleNamespace(
                     function=SimpleNamespace(
                         name="web_search",
@@ -793,13 +801,19 @@ class TestChatEventTerminalState(unittest.TestCase):
 
         def execute(calls, **kwargs):
             executed_calls.extend(calls)
-            return [
-                ToolCallResult(
-                    spec,
-                    json.dumps({"results": [{"url": f"https://example.com/{spec.index}"}]}),
+            results = []
+            for spec in web.normalize_tool_calls(calls):
+                payload = (
+                    {
+                        "url": spec.arguments["url"],
+                        "title": f"Scraped page {spec.index}",
+                        "text": "Detailed scraped evidence",
+                    }
+                    if spec.name == "web_scrape"
+                    else {"results": [{"url": f"https://example.com/{spec.index}"}]}
                 )
-                for spec in web.normalize_tool_calls(calls)
-            ]
+                results.append(ToolCallResult(spec, json.dumps(payload)))
+            return results
 
         runtime = SimpleNamespace(num_ctx=8192, chat_timeout_seconds=180.0)
         session = {
@@ -846,9 +860,19 @@ class TestChatEventTerminalState(unittest.TestCase):
             if event.get("type") == "content_chunk"
         )
         self.assertEqual(len(executed_calls), 13)
+        search_calls = [
+            call for call in executed_calls
+            if call["function"]["name"] == "web_search"
+        ]
+        scrape_calls = [
+            call for call in executed_calls
+            if call["function"]["name"] == "web_scrape"
+        ]
+        self.assertEqual(len(search_calls), 11)
+        self.assertEqual(len(scrape_calls), 2)
         self.assertTrue(all(
             call["function"]["arguments"]["difficulty"] == "hard"
-            for call in executed_calls
+            for call in search_calls
         ))
         self.assertEqual(visible, "Evidence-backed synthesis")
         self.assertEqual(service.chat.call_count, 11)
@@ -864,18 +888,25 @@ class TestChatEventTerminalState(unittest.TestCase):
             for message in first_research_prompt
         ))
         self.assertFalse(any(message.get("role") == "tool" for message in first_research_prompt))
+        prompt_after_second_scrape = service.chat.call_args_list[3].kwargs["messages"]
+        scrape_checkpoint = "\n".join(
+            str(message.get("content") or "")
+            for message in prompt_after_second_scrape
+            if "[Deep Research auto-compaction checkpoint]" in str(message.get("content") or "")
+        )
+        self.assertIn("2 scrape(s)", scrape_checkpoint)
+        self.assertIn("https://scrape.example/1", scrape_checkpoint)
+        self.assertIn("https://scrape.example/2", scrape_checkpoint)
+        self.assertFalse(any(
+            message.get("role") == "tool" for message in prompt_after_second_scrape
+        ))
         compaction_messages = [
             event.get("message", "")
             for event in events
             if event.get("type") == "status"
             and "Auto-compacted Deep Research context" in event.get("message", "")
         ]
-        self.assertEqual(compaction_messages, [
-            "Auto-compacted Deep Research context after 4 web searches.",
-            "Auto-compacted Deep Research context after 6 web searches.",
-            "Auto-compacted Deep Research context after 9 web searches.",
-            "Auto-compacted Deep Research context after 12 web searches.",
-        ])
+        self.assertEqual(compaction_messages, [])
         enhanced_statuses = [
             event for event in events
             if event.get("activity_mode") == "deep-research"
