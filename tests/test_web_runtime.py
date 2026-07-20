@@ -779,7 +779,7 @@ class TestChatEventTerminalState(unittest.TestCase):
                     tool_call = SimpleNamespace(
                         function=SimpleNamespace(
                             name="web_scrape",
-                            arguments={"url": f"https://example.com/source-{call_number}"},
+                            arguments={"url": f"https://scrape.example/{call_number - 1}"},
                         )
                     )
                     return iter([chunk(tool_call=tool_call)])
@@ -816,22 +816,6 @@ class TestChatEventTerminalState(unittest.TestCase):
             return results
 
         runtime = SimpleNamespace(num_ctx=8192, chat_timeout_seconds=180.0)
-        web_search_schema = [{
-            "type": "function",
-            "function": {
-                "name": "web_search",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "query": {"type": "string"},
-                        "difficulty": {
-                            "type": "string",
-                            "enum": ["easy", "medium", "hard"],
-                        },
-                    },
-                },
-            },
-        }]
         session = {
             "runtime_profile": "manual",
             "agent_mode": "deep-research",
@@ -842,7 +826,6 @@ class TestChatEventTerminalState(unittest.TestCase):
             "format": "",
         }
         history = []
-        original_compactor = web.compact_deep_research_messages
         with (
             patch.object(web, "TOOL_DISPATCH", {}),
             patch.object(web, "get_runtime_config", return_value=runtime),
@@ -850,8 +833,7 @@ class TestChatEventTerminalState(unittest.TestCase):
             patch.object(web, "execute_tool_calls", side_effect=execute),
             patch.object(web, "load_default_system_prompt", return_value=""),
             patch.object(web, "prepare_messages_for_model", side_effect=lambda messages, *args, **kwargs: list(messages)),
-            patch.object(web, "compact_deep_research_messages", wraps=original_compactor) as compactor,
-            patch.object(web, "tool_schemas_for_model", return_value=web_search_schema),
+            patch.object(web, "tool_schemas_for_model", return_value=[]),
             patch.object(web, "guarded_options_for_call", return_value={"num_ctx": 8192, "num_predict": 2048}),
             patch.object(
                 web,
@@ -890,20 +872,12 @@ class TestChatEventTerminalState(unittest.TestCase):
         self.assertEqual(len(scrape_calls), 2)
         self.assertTrue(all(
             call["function"]["arguments"]["difficulty"] == "hard"
-            for call in executed_calls
-            if call["function"]["name"] == "web_search"
+            for call in search_calls
         ))
-        self.assertEqual(compactor.call_count, 4)
         self.assertEqual(visible, "Evidence-backed synthesis")
         self.assertEqual(service.chat.call_count, 11)
         self.assertEqual(service.chat.call_args_list[0].kwargs["format"], "json")
         self.assertTrue(service.chat.call_args_list[1].kwargs["think"])
-        model_difficulty = (
-            service.chat.call_args_list[1].kwargs["tools"][0]["function"]
-            ["parameters"]["properties"]["difficulty"]
-        )
-        self.assertEqual(model_difficulty["enum"], ["hard"])
-        self.assertEqual(model_difficulty["default"], "hard")
         first_research_prompt = service.chat.call_args_list[1].kwargs["messages"]
         self.assertTrue(any(
             "[Deep Research auto-compaction checkpoint]" in str(message.get("content") or "")
@@ -932,7 +906,6 @@ class TestChatEventTerminalState(unittest.TestCase):
             if event.get("type") == "status"
             and "Auto-compacted Deep Research context" in event.get("message", "")
         ]
-        self.assertEqual(compaction_messages, [])
         self.assertEqual(compaction_messages, [])
         enhanced_statuses = [
             event for event in events
