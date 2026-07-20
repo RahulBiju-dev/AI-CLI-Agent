@@ -266,13 +266,13 @@ The tool has three actions:
 |--------|-----------|
 | `query` | Refreshes when necessary, then retrieves the most relevant code and repository-map chunks for the model to analyse. This is the default. |
 | `index` | Explicitly indexes or refreshes a repository. Set `force_reindex=true` to bypass the cooldown when querying. |
-| `status` | Reports the collection name, last successful index time, age, and next refresh time without indexing. |
+| `status` | Reports collection availability, the last successful index time, age, and next refresh time without indexing. A missing collection is marked for refresh even during the recorded cooldown. |
 
 Each absolute repository path receives its own stable ChromaDB collection. On the first reference, the tool recursively indexes supported source, configuration, and documentation files, records symbols and line ranges, and builds a chunked repository map. Later references reuse that collection. The first reference after the index becomes 24 hours old automatically refreshes it; this is a rolling 24-hour cooldown rather than a calendar-day reset.
 
-Refreshes update changed files and remove chunks for deleted files. If embedding a particular file fails, its previous valid chunks are retained. Simultaneous first-use queries share a refresh lock so they do not duplicate the full embedding job.
+Refreshes update changed files, remove chunks for deleted or intentionally emptied files, and refuse to record a successful refresh if stale chunks could not be removed. If reading or embedding a non-empty file fails, its previous valid chunks are retained. Simultaneous first-use queries share a refresh lock so they do not duplicate the full embedding job.
 
-Common dependency, cache, VCS, and build directories—such as `.git`, `node_modules`, `.venv`, `dist`, `build`, and `target`—are excluded. A single file is capped at 2 MiB, with repository caps of 5,000 files and 50 MiB of source text. These bounds keep accidental generated trees from overwhelming local Ollama and ChromaDB.
+Common dependency, cache, VCS, and build directories—such as `.git`, `node_modules`, `.venv`, `dist`, `dist-electron`, `build`, and `target`—are excluded. A single file is capped at 2 MiB, with repository caps of 5,000 files and 50 MiB of source text. These bounds keep accidental generated trees from overwhelming local Ollama and ChromaDB.
 
 Indexes use the same local embedding model and Chroma storage as the document vault. Refresh metadata is stored in `~/.selene-agent/codebase_indexes.json`; vectors remain under `~/.selene-agent/.chroma/`. `SELENE_DATA_DIR` relocates both.
 

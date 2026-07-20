@@ -47,9 +47,11 @@ SPECIAL_FILES = {
 }
 IGNORED_DIRS = {
     ".git", ".hg", ".svn", ".chroma", ".idea", ".vscode", ".pytest_cache",
-    ".mypy_cache", ".ruff_cache", ".tox", ".nox", ".venv", "venv", "env",
+    ".mypy_cache", ".ruff_cache", ".tox", ".nox", ".venv", ".gradle",
+    ".parcel-cache", ".svelte-kit", ".turbo", "venv", "env",
     "__pycache__", "node_modules", "bower_components", "vendor", "dist", "build",
-    "coverage", "htmlcov", "target", "out", ".next", ".nuxt", ".cache",
+    "dist-electron", "coverage", "htmlcov", "target", "out", ".next", ".nuxt",
+    ".cache", "deriveddata", "pods",
 }
 LANGUAGES = {
     ".py": "Python", ".pyi": "Python", ".js": "JavaScript", ".jsx": "JavaScript",
@@ -85,7 +87,7 @@ def _load_state() -> dict:
 
 def _save_state(state: dict) -> None:
     with _STATE_LOCK:
-        atomic_write_json(STATE_FILE, state)
+        atomic_write_json(STATE_FILE, state, private=True)
 
 
 def _is_indexable(path: Path) -> bool:
@@ -102,7 +104,12 @@ def _discover_files(
     for current, dirs, names in os.walk(root, followlinks=False):
         if cancellation_token:
             cancellation_token.raise_if_cancelled()
-        dirs[:] = sorted(name for name in dirs if name not in IGNORED_DIRS and not os.path.islink(os.path.join(current, name)))
+        dirs[:] = sorted(
+            name
+            for name in dirs
+            if name.casefold() not in IGNORED_DIRS
+            and not os.path.islink(os.path.join(current, name))
+        )
         for name in sorted(names):
             if cancellation_token:
                 cancellation_token.raise_if_cancelled()
@@ -175,17 +182,24 @@ def _overview_document(root: str, records: list[dict]) -> str:
 
 
 def _existing_ids(collection: Any) -> tuple[set[str], dict[str, set[str]]]:
-    try:
-        existing = collection.get(include=["metadatas"])
-    except Exception:
-        return set(), {}
+    existing = collection.get(include=["metadatas"])
+    if not isinstance(existing, dict):
+        raise RuntimeError("ChromaDB returned malformed existing-index metadata")
     ids = existing.get("ids", []) or []
     metas = existing.get("metadatas", []) or []
+    if not isinstance(ids, list) or not isinstance(metas, list):
+        raise RuntimeError("ChromaDB returned malformed existing-index metadata")
     by_source: dict[str, set[str]] = {}
-    for item_id, metadata in zip(ids, metas):
+    normalized_ids: set[str] = set()
+    for index, item_id in enumerate(ids):
+        if not isinstance(item_id, str) or not item_id:
+            raise RuntimeError("ChromaDB returned an invalid existing chunk ID")
+        metadata = metas[index] if index < len(metas) else {}
+        metadata = metadata if isinstance(metadata, dict) else {}
         source = str((metadata or {}).get("source", ""))
         by_source.setdefault(source, set()).add(item_id)
-    return set(ids), by_source
+        normalized_ids.add(item_id)
+    return normalized_ids, by_source
 
 
 def _index_repository(
@@ -194,6 +208,8 @@ def _index_repository(
     model: str,
     now: float,
     cancellation_token: CancellationToken | None = None,
+    *,
+    refresh_reason: str = "forced or index older than 24 hours",
 ) -> dict:
     files, discovery_skips = _discover_files(root, cancellation_token)
     if not files:
@@ -204,7 +220,15 @@ def _index_repository(
     except Exception as exc:
         return {"error": f"Could not open ChromaDB: {exc}", "persist_directory": CHROMA_DIR}
 
-    previous_ids, previous_by_source = _existing_ids(collection)
+    try:
+        previous_ids, previous_by_source = _existing_ids(collection)
+    except Exception as exc:
+        return {
+            "error": f"Could not inspect the existing codebase index: {exc}",
+            "codebase_path": root,
+            "collection": collection_name,
+            "preserved": True,
+        }
     active_ids: set[str] = set()
     records: list[dict] = []
     skipped = list(discovery_skips)
@@ -216,14 +240,27 @@ def _index_repository(
         relative = path.relative_to(root).as_posix()
         try:
             text = _read_source(path)
+            extension = path.suffix.lower()
+            language = LANGUAGES.get(extension, extension.lstrip(".").upper() or "Text")
+            symbols = _symbol_hints(text)
+            record = {
+                "source": relative,
+                "extension": extension,
+                "language": language,
+                "line_count": text.count("\n") + (1 if text else 0),
+                "symbols": symbols,
+            }
+            if not text.strip():
+                # Emptying a tracked file is a valid repository change. Do not
+                # preserve its old chunks as though the read or embedding failed.
+                records.append(record)
+                continue
             chunks = chunk_text_with_offsets(text, chunk_size=2200, chunk_overlap=300)
             if not chunks:
-                raise ValueError("empty file")
-            extension = path.suffix.lower()
-            symbols = _symbol_hints(text)
+                raise ValueError("source produced no indexable text")
             ids = [f"{hashlib.sha256(relative.encode()).hexdigest()[:20]}::{item['index']}" for item in chunks]
             documents = [
-                f"File: {relative}\nLanguage: {LANGUAGES.get(extension, extension.lstrip('.').upper() or 'Text')}\n\n{item['text']}"
+                f"File: {relative}\nLanguage: {language}\n\n{item['text']}"
                 for item in chunks
             ]
             metadatas = [{
@@ -231,7 +268,7 @@ def _index_repository(
                 "source_path": str(path),
                 "filename": path.name,
                 "extension": extension,
-                "language": LANGUAGES.get(extension, extension.lstrip(".").upper() or "Text"),
+                "language": language,
                 "chunk_index": item["index"],
                 "char_start": item["char_start"],
                 "char_end": item["char_end"],
@@ -251,13 +288,7 @@ def _index_repository(
             collection.upsert(ids=ids, documents=documents, embeddings=embeddings, metadatas=metadatas)
             active_ids.update(ids)
             indexed_chunks += len(ids)
-            records.append({
-                "source": relative,
-                "extension": extension,
-                "language": metadatas[0]["language"],
-                "line_count": text.count("\n") + (1 if text else 0),
-                "symbols": symbols,
-            })
+            records.append(record)
         except OperationCancelled:
             raise
         except Exception as exc:
@@ -306,7 +337,13 @@ def _index_repository(
         try:
             collection.delete(ids=sorted(stale_ids))
         except Exception as exc:
-            skipped.append({"file": "[stale index entries]", "reason": str(exc)})
+            return {
+                "error": f"The code index was updated, but stale chunks could not be removed: {exc}",
+                "codebase_path": root,
+                "collection": collection_name,
+                "preserved": True,
+                "stale_chunks": len(stale_ids),
+            }
 
     try:
         state = _load_state()
@@ -333,7 +370,7 @@ def _index_repository(
         }
     return {
         "refreshed": True,
-        "refresh_reason": "forced or index older than 24 hours",
+        "refresh_reason": refresh_reason,
         "codebase_path": root,
         "collection": collection_name,
         "indexed_at": _utc_iso(now),
@@ -346,22 +383,59 @@ def _index_repository(
     }
 
 
-def _refresh_status(root: str, now: float) -> dict:
+def _refresh_status(
+    root: str,
+    now: float,
+    *,
+    index_available: bool | None = None,
+) -> dict:
     entry = _load_state().get(root)
     if not isinstance(entry, dict):
-        return {"needs_refresh": True, "reason": "not indexed"}
+        return {
+            "needs_refresh": True,
+            "reason": "not indexed",
+            **({"index_available": index_available} if index_available is not None else {}),
+        }
     try:
         indexed_at = float(entry["last_indexed_at"])
-    except (KeyError, TypeError, ValueError):
-        return {"needs_refresh": True, "reason": "index timestamp missing"}
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return {
+            **entry,
+            "needs_refresh": True,
+            "reason": "index timestamp missing",
+            **({"index_available": index_available} if index_available is not None else {}),
+        }
+    if not math.isfinite(indexed_at):
+        return {
+            **entry,
+            "needs_refresh": True,
+            "reason": "index timestamp is invalid",
+            **({"index_available": index_available} if index_available is not None else {}),
+        }
+    try:
+        indexed_at_iso = _utc_iso(indexed_at)
+        refresh_after_iso = _utc_iso(indexed_at + REFRESH_SECONDS)
+    except (OSError, OverflowError, ValueError):
+        return {
+            **entry,
+            "needs_refresh": True,
+            "reason": "index timestamp is invalid",
+            **({"index_available": index_available} if index_available is not None else {}),
+        }
     age = max(0.0, now - indexed_at)
+    needs_refresh = age >= REFRESH_SECONDS
+    reason = "index is at least 24 hours old" if needs_refresh else "inside 24-hour cooldown"
+    if index_available is False:
+        needs_refresh = True
+        reason = "index collection is missing or unavailable"
     return {
-        "needs_refresh": age >= REFRESH_SECONDS,
-        "reason": "index is at least 24 hours old" if age >= REFRESH_SECONDS else "inside 24-hour cooldown",
-        "last_indexed_at": _utc_iso(indexed_at),
-        "age_seconds": round(age),
-        "refresh_after": _utc_iso(indexed_at + REFRESH_SECONDS),
         **entry,
+        "needs_refresh": needs_refresh,
+        "reason": reason,
+        "last_indexed_at": indexed_at_iso,
+        "age_seconds": round(age),
+        "refresh_after": refresh_after_iso,
+        **({"index_available": index_available} if index_available is not None else {}),
     }
 
 
@@ -400,9 +474,18 @@ def _search(
     except Exception as exc:
         return {"error": f"Could not search codebase index: {exc}", "collection": collection_name}
 
-    documents = (results.get("documents") or [[]])[0]
-    metadatas = (results.get("metadatas") or [[]])[0]
-    distances = (results.get("distances") or [[]])[0]
+    if not isinstance(results, dict):
+        return {"error": "Codebase search returned malformed results", "collection": collection_name}
+
+    def first_result_list(name: str) -> list:
+        values = results.get(name)
+        if not isinstance(values, list) or not values:
+            return []
+        return values[0] if isinstance(values[0], list) else []
+
+    documents = first_result_list("documents")
+    metadatas = first_result_list("metadatas")
+    distances = first_result_list("distances")
     matches: list[dict] = []
     context_parts: list[str] = []
     used = 0
@@ -419,12 +502,19 @@ def _search(
         document = str(document or "")
         header = f"Source: {metadata.get('source', 'unknown')} | lines {metadata.get('line_start', '?')}-{metadata.get('line_end', '?')}"
         entry = f"{header}\n{document}\n---"
-        remaining = max_chars - used
+        separator_size = 2 if context_parts else 0
+        remaining = max_chars - used - separator_size
         if remaining <= 0:
             break
-        entry = entry if len(entry) <= remaining else entry[:max(0, remaining - 3)].rstrip() + "..."
+        if len(entry) > remaining:
+            if remaining <= 3:
+                break
+            entry = entry[:remaining - 3].rstrip()
+            if not entry:
+                break
+            entry += "..."
         context_parts.append(entry)
-        used += len(entry)
+        used += separator_size + len(entry)
         matches.append({
             "rank": rank,
             "source": metadata.get("source"),
@@ -473,22 +563,30 @@ def codebase_indexer(
         return _json({"error": "action must be query, index, or status"})
     if query is not None and len(str(query)) > 4000:
         return _json({"error": "query exceeds the 4000-character limit"})
-    if not isinstance(model, str) or not model.strip() or len(model) > 200:
-        return _json({"error": "model must be a non-empty name of at most 200 characters"})
+    if (
+        not isinstance(model, str)
+        or not model.strip()
+        or len(model) > 200
+        or any(character.isspace() or ord(character) < 32 for character in model)
+    ):
+        return _json({
+            "error": "model must be a non-empty name of at most 200 characters without whitespace or control characters"
+        })
     model = model.strip()
     if cancellation_token:
         cancellation_token.raise_if_cancelled()
 
-    now = time.time()
     collection_name = _collection_name(root)
+    now = time.time()
+    index_available = _index_available(collection_name)
     try:
-        status = _refresh_status(root, now)
+        status = _refresh_status(root, now, index_available=index_available)
     except PersistenceError as exc:
         return _json({"error": str(exc), "state_file": STATE_FILE, "preserved": True})
     if action == "status":
-        return _json({"codebase_path": root, "collection": collection_name, **status})
+        return _json({**status, "codebase_path": root, "collection": collection_name})
 
-    refresh = bool(force_reindex) or action == "index" or status["needs_refresh"] or not _index_available(collection_name)
+    refresh = bool(force_reindex) or action == "index" or status["needs_refresh"]
     index_result: dict | None = None
     if refresh:
         while not _INDEX_LOCK.acquire(timeout=0.1):
@@ -498,23 +596,34 @@ def codebase_indexer(
             # A second query may have waited while the first refreshed this repo.
             # Recheck inside the lock so simultaneous first-use requests do not
             # duplicate all embedding work.
+            locked_index_available = _index_available(collection_name)
             try:
-                locked_status = _refresh_status(root, time.time())
+                locked_status = _refresh_status(
+                    root,
+                    time.time(),
+                    index_available=locked_index_available,
+                )
             except PersistenceError as exc:
                 return _json({"error": str(exc), "state_file": STATE_FILE, "preserved": True})
             should_refresh = (
                 bool(force_reindex)
                 or action == "index"
                 or locked_status["needs_refresh"]
-                or not _index_available(collection_name)
             )
             if should_refresh:
+                if force_reindex:
+                    refresh_reason = "forced by caller"
+                elif action == "index":
+                    refresh_reason = "explicit index action"
+                else:
+                    refresh_reason = str(locked_status.get("reason") or "refresh required")
                 index_result = _index_repository(
                     root,
                     collection_name,
                     model,
-                    now,
+                    time.time(),
                     cancellation_token,
+                    refresh_reason=refresh_reason,
                 )
                 if "error" in index_result:
                     return _json(index_result)
@@ -529,11 +638,11 @@ def codebase_indexer(
 
     try:
         top_k = int(top_k or DEFAULT_TOP_K)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         top_k = DEFAULT_TOP_K
     try:
         max_chars = int(max_chars or DEFAULT_MAX_CHARS)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         max_chars = DEFAULT_MAX_CHARS
     top_k = max(1, min(20, top_k))
     max_chars = max(1000, min(30000, max_chars))
@@ -546,5 +655,5 @@ def codebase_indexer(
         max_chars,
         cancellation_token,
     )
-    result["refresh"] = index_result or {"refreshed": False, **status}
+    result["refresh"] = index_result or {**status, "refreshed": False}
     return _json(result)
