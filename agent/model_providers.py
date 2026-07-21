@@ -1,0 +1,1336 @@
+"""Provider-agnostic chat model registry and response adapters.
+
+The rest of Selene speaks one Ollama-like internal message/chunk contract.
+Provider-specific authentication, URLs, payloads, streaming formats, and
+errors are contained here so adding a provider does not touch the agent loop.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+from copy import deepcopy
+from dataclasses import dataclass, field
+from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
+from urllib.parse import quote, urlsplit
+
+import requests
+
+from agent.cancellation import CancellationToken
+from agent.environment import load_dotenv
+from agent.runtime_config import RuntimeConfig
+
+
+LOCAL_MODEL_ID = "local:default"
+ERROR_FALLBACK_MODEL = "gemma-4-31b-it"
+ERROR_FALLBACK_MODEL_ID = f"gemini:{ERROR_FALLBACK_MODEL}"
+DEFAULT_CAPABILITIES = frozenset({"chat", "streaming", "tools", "thinking", "json"})
+REMOTE_CAPABILITIES = frozenset({"chat", "streaming", "tools", "json"})
+GEMINI_FREE_CHAT_MODELS = (
+    "gemini-3.5-flash",
+    "gemini-3.1-flash-lite",
+    "gemini-3-flash-preview",
+    "gemini-2.5-pro",
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+    "gemma-4-31b-it",
+    "gemma-4-26b-a4b-it",
+)
+GEMINI_CONTEXT_WINDOWS = {
+    model: 262_144 if model.startswith("gemma-4-") else 1_048_576
+    for model in GEMINI_FREE_CHAT_MODELS
+}
+DEFAULT_REMOTE_CONTEXT_WINDOW = 131_072
+MAX_REMOTE_CONTEXT_WINDOW = 1_048_576
+LOCAL_MODEL_DISPLAY_NAME = "Gemma 4 E4B"
+SELENE_IDENTITY = (
+    "You are Selene, a precise assistant with calm, subtle warmth. Always identify "
+    "and present yourself as Selene regardless of the underlying model endpoint."
+)
+
+
+class ModelProviderError(RuntimeError):
+    """A provider failure already reduced to a safe user-facing message."""
+
+    def __init__(self, message: str, *, code: str = "provider_error") -> None:
+        super().__init__(message)
+        self.code = code
+
+
+class MissingProviderConfiguration(ModelProviderError):
+    pass
+
+
+class UnsupportedModelError(ModelProviderError):
+    pass
+
+
+class ProviderTimeoutError(ModelProviderError):
+    pass
+
+
+class ProviderRateLimitError(ModelProviderError):
+    pass
+
+
+class InvalidProviderKeyError(ModelProviderError):
+    pass
+
+
+class MalformedProviderResponse(ModelProviderError):
+    pass
+
+
+class ProviderNetworkError(ModelProviderError):
+    pass
+
+
+@dataclass(frozen=True)
+class ModelDefinition:
+    id: str
+    display_name: str
+    provider: str
+    model: str
+    endpoint: str
+    api_key_env: str | None
+    context_window: int | None = None
+    required_env: tuple[str, ...] = ()
+    capabilities: frozenset[str] = DEFAULT_CAPABILITIES
+    available: bool = False
+    unavailable_reason: str | None = None
+    unavailable_code: str | None = None
+
+    def public_dict(self) -> dict[str, Any]:
+        """Return client-safe metadata; endpoints and environment values stay server-side."""
+        return {
+            "id": self.id,
+            "display_name": self.display_name,
+            "provider": self.provider,
+            "context_window": self.context_window,
+            "capabilities": sorted(self.capabilities),
+            "available": self.available,
+        }
+
+
+@dataclass
+class NormalizedFunction:
+    name: str
+    arguments: dict[str, Any]
+
+
+@dataclass
+class NormalizedToolCall:
+    function: NormalizedFunction
+    id: str = ""
+    provider_metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class NormalizedMessage:
+    content: str = ""
+    thinking: str = ""
+    tool_calls: list[NormalizedToolCall] = field(default_factory=list)
+    provider_metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class NormalizedChunk:
+    message: NormalizedMessage
+    prompt_eval_count: int = 0
+    eval_count: int = 0
+    done_reason: str = ""
+
+
+def _clean(value: object) -> str:
+    return str(value or "").strip()
+
+
+def normalize_provider_text(value: object) -> str:
+    """Return displayable text from provider string or content-part payloads.
+
+    OpenAI-compatible endpoints are allowed to return either a plain string or
+    an array of typed content parts.  Keeping this conversion in the adapter
+    prevents Python representations such as ``[{'type': 'text', ...}]`` from
+    leaking into Web/TUI markdown renderers.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (int, float, bool)):
+        return str(value)
+    if isinstance(value, (list, tuple)):
+        fragments = [normalize_provider_text(part) for part in value]
+        return "\n".join(fragment for fragment in fragments if fragment)
+    if isinstance(value, Mapping):
+        for key in ("text", "content", "output_text", "value"):
+            if key in value:
+                return normalize_provider_text(value.get(key))
+        # Unknown structured content is still useful diagnostic output, but it
+        # should be stable JSON rather than a language-specific repr.
+        return json.dumps(value, ensure_ascii=False, default=str)
+    return str(value)
+
+
+def _configured_model(
+    environ: Mapping[str, str],
+    *,
+    id: str,
+    display_name: str | None,
+    provider: str,
+    model_env: str,
+    default_model: str,
+    endpoint_env: str,
+    default_endpoint: str,
+    api_key_env: str | None,
+    required_env: Sequence[str] = (),
+    capabilities: frozenset[str] = REMOTE_CAPABILITIES,
+    require_free_model: bool = False,
+    model_value: str | None = None,
+    allowed_models: frozenset[str] | None = None,
+    context_window: int | None = DEFAULT_REMOTE_CONTEXT_WINDOW,
+    context_window_env: str | None = None,
+) -> ModelDefinition:
+    model = _clean(model_value) if model_value is not None else _clean(environ.get(model_env))
+    model = model or default_model
+    endpoint = _clean(environ.get(endpoint_env)) or default_endpoint
+    required = tuple(required_env) or ((api_key_env,) if api_key_env else ())
+    missing = [name for name in required if not _clean(environ.get(name))]
+    reason = None
+    unavailable_code = None
+    configured_context = _clean(environ.get(context_window_env or ""))
+    if configured_context:
+        try:
+            context_window = int(configured_context)
+        except ValueError:
+            context_window = None
+        if context_window is None or not 1024 <= context_window <= MAX_REMOTE_CONTEXT_WINDOW:
+            reason = (
+                f"Set {context_window_env} to an integer between 1024 and "
+                f"{MAX_REMOTE_CONTEXT_WINDOW}."
+            )
+            unavailable_code = "missing_configuration"
+    if missing:
+        reason = f"Set {', '.join(missing)} on the server to enable this model."
+        unavailable_code = "missing_api_key" if api_key_env in missing else "missing_configuration"
+    elif reason is not None:
+        pass
+    elif not model or len(model) > 255 or any(character.isspace() or ord(character) < 32 for character in model):
+        reason = f"Set {model_env} to a valid provider model identifier."
+        unavailable_code = "unsupported_model"
+    elif require_free_model and model != "openrouter/free" and not model.endswith(":free"):
+        reason = f"Set {model_env} to openrouter/free or a model identifier ending in :free."
+        unavailable_code = "unsupported_model"
+    elif allowed_models is not None and model not in allowed_models:
+        reason = f"{model} is not registered as a supported free chat model."
+        unavailable_code = "unsupported_model"
+    else:
+        parsed_endpoint = urlsplit(endpoint)
+        if parsed_endpoint.scheme not in {"http", "https"} or not parsed_endpoint.netloc:
+            reason = f"Set {endpoint_env} to a valid HTTP(S) provider endpoint."
+            unavailable_code = "missing_configuration"
+    return ModelDefinition(
+        id=id,
+        display_name=display_name or model,
+        provider=provider,
+        model=model,
+        endpoint=endpoint.rstrip("/"),
+        api_key_env=api_key_env,
+        context_window=context_window,
+        required_env=required,
+        capabilities=capabilities,
+        available=reason is None,
+        unavailable_reason=reason,
+        unavailable_code=unavailable_code,
+    )
+
+
+def _configured_gemini_models(environ: Mapping[str, str]) -> list[ModelDefinition]:
+    configured = _clean(environ.get("GEMINI_MODELS"))
+    source_env = "GEMINI_MODELS"
+    if not configured:
+        configured = _clean(environ.get("GEMINI_MODEL"))
+        source_env = "GEMINI_MODEL"
+    models = list(dict.fromkeys(
+        model.strip() for model in configured.split(",") if model.strip()
+    ))
+    if not models:
+        return [_configured_model(
+            environ,
+            id="gemini:default",
+            display_name=None,
+            provider="Google Gemini",
+            model_env="GEMINI_MODELS",
+            default_model="",
+            endpoint_env="GEMINI_BASE_URL",
+            default_endpoint="https://generativelanguage.googleapis.com/v1beta",
+            api_key_env="GEMINI_API_KEY",
+            required_env=("GEMINI_API_KEY", "GEMINI_MODELS"),
+        )]
+    allowed = frozenset(GEMINI_FREE_CHAT_MODELS)
+    return [
+        _configured_model(
+            environ,
+            id=f"gemini:{model}",
+            display_name=None,
+            provider="Google Gemini",
+            model_env=source_env,
+            model_value=model,
+            default_model="",
+            endpoint_env="GEMINI_BASE_URL",
+            default_endpoint="https://generativelanguage.googleapis.com/v1beta",
+            api_key_env="GEMINI_API_KEY",
+            required_env=("GEMINI_API_KEY",),
+            allowed_models=allowed,
+            capabilities=(
+                DEFAULT_CAPABILITIES
+                if model.startswith(("gemini-2.5-", "gemini-3"))
+                else REMOTE_CAPABILITIES
+            ),
+            context_window=GEMINI_CONTEXT_WINDOWS.get(
+                model, DEFAULT_REMOTE_CONTEXT_WINDOW
+            ),
+            context_window_env="GEMINI_CONTEXT_WINDOW",
+        )
+        for model in models
+    ]
+
+
+def build_model_registry(
+    runtime: RuntimeConfig,
+    environ: Mapping[str, str] | None = None,
+) -> dict[str, ModelDefinition]:
+    """Build model metadata from server-side configuration only."""
+    environment = os.environ if environ is None else environ
+    local_model = _clean(getattr(runtime, "chat_model", None)) or "selene"
+    local = ModelDefinition(
+        id=LOCAL_MODEL_ID,
+        display_name=LOCAL_MODEL_DISPLAY_NAME,
+        provider="Ollama (local)",
+        model=local_model,
+        endpoint=_clean(environment.get("OLLAMA_HOST")) or "http://127.0.0.1:11434",
+        api_key_env=None,
+        context_window=None,
+        capabilities=DEFAULT_CAPABILITIES,
+        available=True,
+    )
+    entries = [
+        local,
+        _configured_model(
+            environment,
+            id="openrouter:default",
+            display_name=None,
+            provider="OpenRouter (free)",
+            model_env="OPENROUTER_MODEL",
+            default_model="",
+            endpoint_env="OPENROUTER_BASE_URL",
+            default_endpoint="https://openrouter.ai/api/v1/chat/completions",
+            api_key_env="OPENROUTER_API_KEY",
+            required_env=("OPENROUTER_API_KEY", "OPENROUTER_MODEL"),
+            require_free_model=True,
+            context_window_env="OPENROUTER_CONTEXT_WINDOW",
+        ),
+        *_configured_gemini_models(environment),
+        _configured_model(
+            environment,
+            id="custom:default",
+            display_name=None,
+            provider="OpenAI-compatible / self-hosted",
+            model_env="CUSTOM_LLM_MODEL",
+            default_model="custom-model",
+            endpoint_env="CUSTOM_LLM_BASE_URL",
+            default_endpoint="",
+            api_key_env="CUSTOM_LLM_API_KEY",
+            required_env=("CUSTOM_LLM_BASE_URL", "CUSTOM_LLM_MODEL"),
+            context_window_env="CUSTOM_LLM_CONTEXT_WINDOW",
+        ),
+    ]
+    return {entry.id: entry for entry in entries}
+
+
+def available_models(runtime: RuntimeConfig, environ: Mapping[str, str] | None = None) -> list[dict[str, Any]]:
+    return [
+        model.public_dict()
+        for model in build_model_registry(runtime, environ).values()
+        if model.available
+    ]
+
+
+def resolve_model(
+    model_id: object,
+    runtime: RuntimeConfig,
+    environ: Mapping[str, str] | None = None,
+) -> ModelDefinition:
+    requested = _clean(model_id) or LOCAL_MODEL_ID
+    registry = build_model_registry(runtime, environ)
+    if requested == "gemini:default" and requested not in registry:
+        requested = next(
+            (model.id for model in registry.values() if model.id.startswith("gemini:") and model.available),
+            requested,
+        )
+    model = registry.get(requested)
+    if model is None:
+        raise UnsupportedModelError(
+            "The selected model is not registered. Choose another model in the Model menu.",
+            code="unsupported_model",
+        )
+    if not model.available:
+        if model.unavailable_code == "unsupported_model":
+            raise UnsupportedModelError(
+                model.unavailable_reason or "The selected model is not supported.",
+                code="unsupported_model",
+            )
+        raise MissingProviderConfiguration(
+            model.unavailable_reason or "The selected model is not configured on the server.",
+            code=model.unavailable_code or "missing_configuration",
+        )
+    return model
+
+
+def resolve_error_fallback(
+    current_model_id: object,
+    runtime: RuntimeConfig,
+    environ: Mapping[str, str] | None = None,
+) -> ModelDefinition | None:
+    """Return the configured one-shot error fallback, or None if already active."""
+    if _clean(current_model_id) == ERROR_FALLBACK_MODEL_ID:
+        return None
+    return resolve_model(ERROR_FALLBACK_MODEL_ID, runtime, environ)
+
+
+def session_for_model(
+    session: Mapping[str, Any] | None,
+    runtime: RuntimeConfig,
+    environ: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    """Return request-only settings with the selected provider's context limit."""
+    source = deepcopy(dict(session or {}))
+    selected = resolve_model(source.get("model_id"), runtime, environ)
+    if selected.id == LOCAL_MODEL_ID or not selected.context_window:
+        return source
+
+    options = deepcopy(source.get("options") or {})
+    explicit_context = options.get("num_ctx")
+    if explicit_context is None:
+        options["num_ctx"] = selected.context_window
+    else:
+        options["num_ctx"] = min(int(explicit_context), selected.context_window)
+    source["options"] = options
+    return source
+
+
+def normalize_model_id(
+    model_id: object,
+    runtime: RuntimeConfig,
+    environ: Mapping[str, str] | None = None,
+) -> str:
+    return resolve_model(model_id, runtime, environ).id
+
+
+def _json_arguments(value: object) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if value in (None, ""):
+        return {}
+    try:
+        parsed = json.loads(str(value))
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise MalformedProviderResponse(
+            "The provider returned malformed tool arguments.",
+            code="malformed_response",
+        ) from exc
+    if not isinstance(parsed, dict):
+        raise MalformedProviderResponse(
+            "The provider returned tool arguments in an unsupported format.",
+            code="malformed_response",
+        )
+    return parsed
+
+
+def _provider_reasoning_text(message: Mapping[str, Any]) -> str:
+    """Normalize provider reasoning and planning metadata into Thinking."""
+    fragments: list[str] = []
+    for key in ("reasoning_content", "reasoning", "planning_content", "planning", "plan"):
+        value = message.get(key)
+        if isinstance(value, str) and value:
+            fragments.append(value)
+        elif isinstance(value, (list, dict)) and value:
+            fragments.append(json.dumps(value, ensure_ascii=False))
+    details = message.get("reasoning_details")
+    if isinstance(details, list):
+        for detail in details:
+            if not isinstance(detail, dict):
+                continue
+            detail_type = _clean(detail.get("type")).casefold()
+            if "encrypted" in detail_type:
+                continue
+            value = detail.get("text") or detail.get("summary") or detail.get("content")
+            if value:
+                fragments.append(normalize_provider_text(value))
+    return "\n".join(fragments)
+
+
+def _raise_for_provider_payload_error(payload: Mapping[str, Any], provider: str) -> None:
+    """Map OpenAI-compatible in-body and HTTP-200 stream errors safely."""
+    error = payload.get("error")
+    choices = payload.get("choices")
+    choice = choices[0] if isinstance(choices, list) and choices else None
+    if not error and isinstance(choice, dict):
+        error = choice.get("error")
+    if not error and isinstance(choice, dict) and choice.get("finish_reason") == "error":
+        raise ModelProviderError(
+            f"{provider} stopped while generating the response. Try again or select another model.",
+            code="provider_error",
+        )
+    if not error:
+        return
+
+    if isinstance(error, Mapping):
+        metadata = error.get("metadata")
+        metadata = metadata if isinstance(metadata, Mapping) else {}
+        raw_code = error.get("code") or error.get("status") or ""
+        error_type = _clean(
+            metadata.get("error_type")
+            or error.get("error_type")
+            or error.get("type")
+        ).casefold()
+        # The upstream message is used only for classification. It is never
+        # returned because providers can echo request data in error messages.
+        fingerprint = " ".join((
+            error_type,
+            _clean(raw_code).casefold(),
+            _clean(error.get("message")).casefold(),
+        ))
+    else:
+        raw_code = ""
+        error_type = ""
+        fingerprint = _clean(error).casefold()
+
+    try:
+        status = int(raw_code)
+    except (TypeError, ValueError):
+        status = 0
+
+    if status == 401 or "authentication" in fingerprint or "invalid_api_key" in fingerprint:
+        raise InvalidProviderKeyError(
+            f"{provider} rejected its API key. Update the server environment and restart Selene.",
+            code="invalid_api_key",
+        )
+    if status == 429 or "rate_limit" in fingerprint or "rate limited" in fingerprint:
+        raise ProviderRateLimitError(
+            f"{provider} has reached its current rate or free-capacity limit. "
+            "Wait a moment and retry, or select another model.",
+            code="rate_limited",
+        )
+    if status in {408, 504} or error_type == "timeout" or "timed out" in fingerprint:
+        raise ProviderTimeoutError(
+            f"{provider} timed out. Try again or select another model.",
+            code="timeout",
+        )
+    if (
+        status in {502, 503}
+        or error_type in {"provider_overloaded", "provider_unavailable", "server"}
+    ):
+        raise ModelProviderError(
+            f"{provider} has no available capacity for this model right now. "
+            "Try again shortly or select another model.",
+            code="provider_unavailable",
+        )
+    if error_type in {
+        "context_length_exceeded",
+        "max_tokens_exceeded",
+        "token_limit_exceeded",
+        "string_too_long",
+    }:
+        raise ModelProviderError(
+            f"{provider} could not fit this conversation in the selected model's limits. "
+            "Start a new conversation or reduce the requested context.",
+            code="context_length",
+        )
+    if status == 402 or error_type == "payment_required":
+        raise ModelProviderError(
+            f"{provider} says this account cannot run the request under its current quota. "
+            "Check the provider account limits or select another model.",
+            code="quota_exhausted",
+        )
+    if status == 403 or error_type == "permission_denied":
+        raise ModelProviderError(
+            f"{provider} blocked this request or the API key lacks permission for the model.",
+            code="access_denied",
+        )
+    if status in {400, 404, 422} or error_type in {"invalid_request", "invalid_prompt"}:
+        raise UnsupportedModelError(
+            f"{provider} rejected the selected model or request options. "
+            "Check the configured model identifier or select another model.",
+            code="unsupported_model",
+        )
+    raise ModelProviderError(
+        f"{provider} stopped while generating the response. Try again or select another model.",
+        code="provider_error",
+    )
+
+
+def _request_error(provider: str, exc: Exception) -> ModelProviderError:
+    if isinstance(exc, requests.Timeout):
+        return ProviderTimeoutError(
+            f"{provider} timed out. Try again or select another model.",
+            code="timeout",
+        )
+    return ProviderNetworkError(
+        f"Could not reach {provider}. Check the server network connection and try again.",
+        code="network_failure",
+    )
+
+
+def _raise_for_status(response: requests.Response, provider: str) -> None:
+    status = response.status_code
+    if 200 <= status < 300:
+        return
+    provider_status = ""
+    provider_error_fingerprint = ""
+    if provider == "Google Gemini":
+        try:
+            error_payload = response.json()
+        except (TypeError, ValueError, json.JSONDecodeError):
+            error_payload = {}
+        if isinstance(error_payload, dict):
+            error = error_payload.get("error") or {}
+            if isinstance(error, dict):
+                provider_status = _clean(error.get("status")).upper()
+                try:
+                    provider_error_fingerprint = json.dumps(error, default=str).upper()
+                except (TypeError, ValueError):
+                    provider_error_fingerprint = provider_status
+    response.close()
+    if provider == "Google Gemini" and (
+        "API_KEY_INVALID" in provider_error_fingerprint
+        or provider_status == "UNAUTHENTICATED"
+    ):
+        raise InvalidProviderKeyError(
+            "Google Gemini rejected its API key. Update GEMINI_API_KEY and restart Selene.",
+            code="invalid_api_key",
+        )
+    if status in {401, 403}:
+        if provider == "Google Gemini":
+            raise ModelProviderError(
+                "Google Gemini denied this project access to the selected model. "
+                "Check the key restrictions, project, region, and model access.",
+                code="access_denied",
+            )
+        raise InvalidProviderKeyError(
+            f"{provider} rejected its API key. Update the server environment and restart Selene.",
+            code="invalid_api_key",
+        )
+    if status == 400 and provider == "Google Gemini":
+        raise ModelProviderError(
+            "Google Gemini rejected Selene's request format or options. "
+            "Try another configured Gemini model; the API key itself was accepted.",
+            code="invalid_request",
+        )
+    if status == 429:
+        raise ProviderRateLimitError(
+            f"{provider} is rate limiting requests. Wait a moment or select another model.",
+            code="rate_limited",
+        )
+    if status in {408, 504}:
+        raise ProviderTimeoutError(
+            f"{provider} timed out. Try again or select another model.",
+            code="timeout",
+        )
+    if status in {502, 503}:
+        raise ModelProviderError(
+            f"{provider} is temporarily unavailable. Try again or select another model.",
+            code="provider_unavailable",
+        )
+    if status in {400, 404, 422}:
+        raise UnsupportedModelError(
+            f"{provider} could not use the configured model. Check the model identifier.",
+            code="unsupported_model",
+        )
+    raise ModelProviderError(
+        f"{provider} request failed (HTTP {status}). Try again or select another model.",
+        code="provider_error",
+    )
+
+
+def _post(
+    definition: ModelDefinition,
+    *,
+    url: str,
+    headers: Mapping[str, str],
+    payload: Mapping[str, Any],
+    timeout: float,
+    stream: bool,
+) -> requests.Response:
+    bounded_timeout = max(1.0, float(timeout))
+    try:
+        response = requests.post(
+            url,
+            headers=dict(headers),
+            json=dict(payload),
+            timeout=(min(10.0, bounded_timeout), bounded_timeout),
+            stream=stream,
+        )
+    except requests.RequestException as exc:
+        raise _request_error(definition.provider, exc) from None
+    _raise_for_status(response, definition.provider)
+    return response
+
+
+def _response_json(response: requests.Response, provider: str) -> dict[str, Any]:
+    try:
+        payload = response.json()
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise MalformedProviderResponse(
+            f"{provider} returned a malformed response.",
+            code="malformed_response",
+        ) from exc
+    finally:
+        response.close()
+    if not isinstance(payload, dict):
+        raise MalformedProviderResponse(
+            f"{provider} returned an unsupported response.",
+            code="malformed_response",
+        )
+    return payload
+
+
+def _tool_schema_openai(tools: Sequence[dict] | None) -> list[dict]:
+    return [dict(tool) for tool in (tools or [])]
+
+
+def _selene_messages(messages: Sequence[dict]) -> list[dict[str, Any]]:
+    """Ensure every external endpoint receives Selene's stable identity."""
+    normalized = [dict(message) for message in messages]
+    for message in normalized:
+        if message.get("role") != "system":
+            continue
+        content = normalize_provider_text(message.get("content"))
+        if "you are selene" not in content.casefold():
+            message["content"] = f"{SELENE_IDENTITY}\n\n{content}".strip()
+        return normalized
+    return [{"role": "system", "content": SELENE_IDENTITY}, *normalized]
+
+
+def _openai_messages(
+    messages: Sequence[dict],
+    *,
+    preserve_reasoning: bool = False,
+) -> list[dict[str, Any]]:
+    converted: list[dict[str, Any]] = []
+    pending_ids: list[str] = []
+
+    def add_reasoning(item: dict[str, Any], source: Mapping[str, Any]) -> None:
+        if not preserve_reasoning:
+            return
+        metadata = source.get("provider_metadata")
+        if not isinstance(metadata, Mapping):
+            return
+        details = metadata.get("reasoning_details")
+        if isinstance(details, list) and all(isinstance(detail, dict) for detail in details):
+            item["reasoning_details"] = deepcopy(details)
+
+    for message_index, message in enumerate(messages):
+        role = str(message.get("role") or "user")
+        if role == "assistant" and message.get("tool_calls"):
+            calls = []
+            pending_ids = []
+            for call_index, call in enumerate(message.get("tool_calls") or []):
+                function = call.get("function", call)
+                call_id = str(call.get("id") or f"call_{message_index}_{call_index}")
+                pending_ids.append(call_id)
+                arguments = function.get("arguments", {})
+                calls.append({
+                    "id": call_id,
+                    "type": "function",
+                    "function": {
+                        "name": str(function.get("name") or ""),
+                        "arguments": arguments if isinstance(arguments, str) else json.dumps(arguments),
+                    },
+                })
+            assistant = {
+                "role": "assistant",
+                "content": normalize_provider_text(message.get("content")),
+                "tool_calls": calls,
+            }
+            add_reasoning(assistant, message)
+            converted.append(assistant)
+        elif role == "tool":
+            call_id = pending_ids.pop(0) if pending_ids else f"call_{message_index}_0"
+            converted.append({
+                "role": "tool",
+                "tool_call_id": call_id,
+                "content": normalize_provider_text(message.get("content")),
+            })
+        elif role in {"system", "user", "assistant"}:
+            item = {"role": role, "content": normalize_provider_text(message.get("content"))}
+            if role == "assistant":
+                add_reasoning(item, message)
+            converted.append(item)
+    return converted
+
+
+def _remote_options(options: Mapping[str, Any] | None) -> dict[str, Any]:
+    source = options or {}
+    mapping = {
+        "temperature": "temperature",
+        "top_p": "top_p",
+        "presence_penalty": "presence_penalty",
+        "frequency_penalty": "frequency_penalty",
+        "seed": "seed",
+        "num_predict": "max_tokens",
+    }
+    return {target: source[name] for name, target in mapping.items() if name in source}
+
+
+def _openai_url(endpoint: str) -> str:
+    base = endpoint.rstrip("/")
+    return base if base.endswith("/chat/completions") else f"{base}/chat/completions"
+
+
+def _openai_headers(definition: ModelDefinition, environ: Mapping[str, str]) -> dict[str, str]:
+    headers = {"Content-Type": "application/json", "Accept": "application/json"}
+    key = _clean(environ.get(definition.api_key_env or ""))
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+    if definition.id.startswith("openrouter:"):
+        site = _clean(environ.get("OPENROUTER_SITE_URL"))
+        title = _clean(environ.get("OPENROUTER_APP_NAME")) or "Selene"
+        if site:
+            headers["HTTP-Referer"] = site
+        headers["X-OpenRouter-Title"] = title
+    return headers
+
+
+def _openai_payload(definition: ModelDefinition, kwargs: Mapping[str, Any]) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "model": definition.model,
+        "messages": _openai_messages(
+            kwargs.get("messages") or [],
+            preserve_reasoning=definition.id.startswith("openrouter:"),
+        ),
+        "stream": bool(kwargs.get("stream")),
+        **_remote_options(kwargs.get("options")),
+    }
+    tools = _tool_schema_openai(kwargs.get("tools"))
+    if tools:
+        payload["tools"] = tools
+    if kwargs.get("format") == "json":
+        payload["response_format"] = {"type": "json_object"}
+    if payload["stream"]:
+        payload["stream_options"] = {"include_usage": True}
+    return payload
+
+
+def _openai_chunk(payload: Mapping[str, Any], provider: str) -> NormalizedChunk:
+    _raise_for_provider_payload_error(payload, provider)
+    choices = payload.get("choices")
+    if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+        raise MalformedProviderResponse(
+            "The provider returned a response without a valid model choice.",
+            code="malformed_response",
+        )
+    choice = choices[0]
+    message = choice.get("message") or choice.get("delta")
+    if not isinstance(message, dict):
+        raise MalformedProviderResponse(
+            "The provider returned a response without a valid model message.",
+            code="malformed_response",
+        )
+    usage = payload.get("usage") or {}
+    tool_calls = []
+    for call in message.get("tool_calls") or []:
+        function = call.get("function") or {}
+        tool_calls.append(NormalizedToolCall(NormalizedFunction(
+            name=str(function.get("name") or ""),
+            arguments=_json_arguments(function.get("arguments")),
+        )))
+    result = NormalizedChunk(
+        message=NormalizedMessage(
+            content=normalize_provider_text(message.get("content")),
+            thinking=_provider_reasoning_text(message),
+            tool_calls=tool_calls,
+            provider_metadata=(
+                {"reasoning_details": deepcopy(message["reasoning_details"])}
+                if isinstance(message.get("reasoning_details"), list)
+                else {}
+            ),
+        ),
+        prompt_eval_count=int(usage.get("prompt_tokens") or 0),
+        eval_count=int(usage.get("completion_tokens") or 0),
+        done_reason=str(choice.get("finish_reason") or ""),
+    )
+    if not (
+        result.message.content
+        or result.message.thinking
+        or result.message.tool_calls
+    ):
+        raise MalformedProviderResponse(
+            f"{provider} completed the request without generating content. "
+            "The endpoint may be warming up; try again shortly or select another model.",
+            code="empty_response",
+        )
+    return result
+
+
+def _iter_sse_json(response: requests.Response, provider: str) -> Iterator[dict[str, Any]]:
+    pending_data: list[str] = []
+    yielded_payload = False
+    malformed_event = False
+
+    def parse_event(value: str) -> dict[str, Any] | None:
+        nonlocal malformed_event
+        try:
+            payload = json.loads(value)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            malformed_event = True
+            return None
+        if isinstance(payload, dict):
+            return payload
+        malformed_event = True
+        return None
+
+    try:
+        for raw in response.iter_lines(decode_unicode=True):
+            line = str(raw or "").rstrip("\r")
+            if not line:
+                if pending_data:
+                    payload = parse_event("\n".join(pending_data))
+                    pending_data.clear()
+                    if payload is not None:
+                        yielded_payload = True
+                        yield payload
+                continue
+            if line.startswith(":"):
+                continue
+            field, separator, value = line.partition(":")
+            if separator and field in {"event", "id", "retry"}:
+                continue
+            if separator and field == "data":
+                value = value.lstrip()
+                if value == "[DONE]":
+                    pending_data.clear()
+                    break
+                # Providers normally send one JSON object per data line. If a
+                # proxy splits JSON across data lines, retain it until it forms
+                # a complete object. A bad event does not poison later events.
+                candidate = "\n".join([*pending_data, value])
+                payload = parse_event(candidate)
+                if payload is None and pending_data:
+                    payload = parse_event(value)
+                    if payload is not None:
+                        pending_data.clear()
+                if payload is None:
+                    pending_data.append(value)
+                    continue
+                pending_data.clear()
+                yielded_payload = True
+                yield payload
+                continue
+            stripped = line.strip()
+            if stripped == "[DONE]":
+                break
+            # Some OpenAI-compatible servers use JSONL instead of strict SSE.
+            if stripped.startswith("{"):
+                payload = parse_event(stripped)
+                if payload is not None:
+                    yielded_payload = True
+                    pending_data.clear()
+                    yield payload
+        if pending_data:
+            payload = parse_event("\n".join(pending_data))
+            if payload is not None:
+                yielded_payload = True
+                yield payload
+        if malformed_event and not yielded_payload:
+            raise MalformedProviderResponse(
+                f"{provider} returned an unreadable response stream. Try the request again.",
+                code="malformed_response",
+            )
+    except requests.RequestException as exc:
+        raise _request_error(provider, exc) from None
+    finally:
+        response.close()
+
+
+def _openai_stream(response: requests.Response, definition: ModelDefinition) -> Iterator[NormalizedChunk]:
+    pending: dict[int, dict[str, str]] = {}
+    reasoning_details: list[dict[str, Any]] = []
+    prompt_tokens = 0
+    completion_tokens = 0
+    done_reason = ""
+    saw_choice = False
+    saw_output = False
+    for payload in _iter_sse_json(response, definition.provider):
+        _raise_for_provider_payload_error(payload, definition.provider)
+        usage = payload.get("usage") or {}
+        prompt_tokens = int(usage.get("prompt_tokens") or prompt_tokens)
+        completion_tokens = int(usage.get("completion_tokens") or completion_tokens)
+        choices = payload.get("choices")
+        if choices is None:
+            continue
+        if not isinstance(choices, list):
+            raise MalformedProviderResponse(
+                f"{definition.provider} returned a malformed response stream.",
+                code="malformed_response",
+            )
+        if not choices:
+            continue
+        choice = choices[0]
+        if not isinstance(choice, dict):
+            raise MalformedProviderResponse(
+                f"{definition.provider} returned a malformed response stream.",
+                code="malformed_response",
+            )
+        saw_choice = True
+        done_reason = str(choice.get("finish_reason") or done_reason)
+        delta = choice.get("delta") or {}
+        if not isinstance(delta, dict):
+            raise MalformedProviderResponse(
+                f"{definition.provider} returned a malformed response stream.",
+                code="malformed_response",
+            )
+        details = delta.get("reasoning_details")
+        if isinstance(details, list):
+            reasoning_details.extend(
+                deepcopy(detail) for detail in details if isinstance(detail, dict)
+            )
+        for raw_call in delta.get("tool_calls") or []:
+            saw_output = True
+            index = int(raw_call.get("index") or 0)
+            current = pending.setdefault(index, {"name": "", "arguments": ""})
+            function = raw_call.get("function") or {}
+            current["name"] += str(function.get("name") or "")
+            current["arguments"] += str(function.get("arguments") or "")
+        content = normalize_provider_text(delta.get("content"))
+        thinking = _provider_reasoning_text(delta)
+        if content or thinking:
+            saw_output = True
+            yield NormalizedChunk(message=NormalizedMessage(
+                content=content,
+                thinking=thinking,
+            ))
+    if not saw_choice:
+        raise MalformedProviderResponse(
+            f"{definition.provider} ended the request without returning a model response. "
+            "The free endpoint may be warming up; try again shortly or select another model.",
+            code="empty_response",
+        )
+    tool_calls = [
+        NormalizedToolCall(NormalizedFunction(item["name"], _json_arguments(item["arguments"])))
+        for _, item in sorted(pending.items())
+    ]
+    if not saw_output and not tool_calls:
+        raise MalformedProviderResponse(
+            f"{definition.provider} completed the request without generating content. "
+            "The free endpoint may be warming up; try again shortly or select another model.",
+            code="empty_response",
+        )
+    yield NormalizedChunk(
+        message=NormalizedMessage(
+            tool_calls=tool_calls,
+            provider_metadata=(
+                {"reasoning_details": reasoning_details}
+                if reasoning_details
+                else {}
+            ),
+        ),
+        prompt_eval_count=prompt_tokens,
+        eval_count=completion_tokens,
+        done_reason=done_reason,
+    )
+
+
+def _gemini_contents(messages: Sequence[dict]) -> tuple[str, list[dict[str, Any]]]:
+    systems: list[str] = []
+    contents: list[dict[str, Any]] = []
+    pending_calls: list[dict[str, str]] = []
+    for message in messages:
+        role = str(message.get("role") or "user")
+        if role == "system":
+            systems.append(normalize_provider_text(message.get("content")))
+            continue
+        if role == "assistant" and message.get("tool_calls"):
+            parts: list[dict[str, Any]] = []
+            if message.get("content"):
+                parts.append({"text": normalize_provider_text(message.get("content"))})
+            pending_calls = []
+            for call in message.get("tool_calls") or []:
+                function = call.get("function", call)
+                name = str(function.get("name") or "")
+                call_id = str(call.get("id") or "")
+                pending_calls.append({"name": name, "id": call_id})
+                function_call = {
+                    "name": name,
+                    "args": _json_arguments(function.get("arguments")),
+                }
+                if call_id:
+                    function_call["id"] = call_id
+                part: dict[str, Any] = {"functionCall": function_call}
+                metadata = call.get("provider_metadata") or {}
+                if isinstance(metadata, dict) and metadata.get("thought_signature"):
+                    part["thoughtSignature"] = str(metadata["thought_signature"])
+                parts.append(part)
+            contents.append({"role": "model", "parts": parts})
+        elif role == "tool":
+            pending = pending_calls.pop(0) if pending_calls else {}
+            name = str(
+                pending.get("name")
+                or message.get("name")
+                or message.get("tool_name")
+                or "tool"
+            )
+            raw = str(message.get("content") or "")
+            try:
+                response_data = json.loads(raw)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                response_data = {"result": raw}
+            if not isinstance(response_data, dict):
+                response_data = {"result": response_data}
+            function_response = {
+                "name": name,
+                "response": response_data,
+            }
+            if pending.get("id"):
+                function_response["id"] = pending["id"]
+            contents.append({"role": "user", "parts": [{
+                "functionResponse": function_response,
+            }]})
+        elif role in {"user", "assistant"}:
+            contents.append({
+                "role": "model" if role == "assistant" else "user",
+                "parts": [{"text": normalize_provider_text(message.get("content"))}],
+            })
+    merged: list[dict[str, Any]] = []
+    for content in contents:
+        if merged and merged[-1]["role"] == content["role"]:
+            merged[-1]["parts"].extend(content["parts"])
+        else:
+            merged.append(content)
+    return "\n\n".join(systems), merged
+
+
+def _gemini_payload(definition: ModelDefinition, kwargs: Mapping[str, Any]) -> dict[str, Any]:
+    system, contents = _gemini_contents(kwargs.get("messages") or [])
+    options = kwargs.get("options") or {}
+    generation: dict[str, Any] = {}
+    option_map = {
+        "temperature": "temperature",
+        "top_p": "topP",
+        "top_k": "topK",
+        "num_predict": "maxOutputTokens",
+    }
+    for source, target in option_map.items():
+        if source in options:
+            generation[target] = options[source]
+    if definition.model.startswith(("gemini-2.5-", "gemini-3")):
+        # Gemini returns thought summaries as parts marked with `thought: true`
+        # only when explicitly requested. Keeping this tied to Selene's shared
+        # `think` flag lets the Web UI, TUI, and classic terminal consume the
+        # same normalized thinking channel.
+        generation["thinkingConfig"] = {
+            "includeThoughts": bool(kwargs.get("think", True)),
+        }
+    if kwargs.get("format") == "json":
+        generation["responseMimeType"] = "application/json"
+    payload: dict[str, Any] = {"contents": contents}
+    if system:
+        payload["systemInstruction"] = {"parts": [{"text": system}]}
+    if generation:
+        payload["generationConfig"] = generation
+    declarations = []
+    for tool in kwargs.get("tools") or []:
+        function = tool.get("function") or {}
+        declarations.append({
+            "name": function.get("name"),
+            "description": function.get("description", ""),
+            "parametersJsonSchema": (
+                function.get("parameters") or {"type": "object", "properties": {}}
+            ),
+        })
+    if declarations:
+        payload["tools"] = [{"functionDeclarations": declarations}]
+    return payload
+
+
+def _gemini_url(definition: ModelDefinition, *, streaming: bool) -> str:
+    base = definition.endpoint.rstrip("/")
+    if base.endswith("/models"):
+        base = base[:-7]
+    model = definition.model.removeprefix("models/")
+    operation = "streamGenerateContent?alt=sse" if streaming else "generateContent"
+    return f"{base}/models/{quote(model, safe='')}:{operation}"
+
+
+def _gemini_headers(
+    definition: ModelDefinition,
+    environ: Mapping[str, str],
+    *,
+    streaming: bool,
+) -> dict[str, str]:
+    key = _clean(environ.get(definition.api_key_env or ""))
+    return {
+        "Content-Type": "application/json",
+        "Accept": "text/event-stream" if streaming else "application/json",
+        "x-goog-api-key": key,
+    }
+
+
+def _gemini_chunk(payload: Mapping[str, Any]) -> NormalizedChunk:
+    candidates = payload.get("candidates")
+    if not isinstance(candidates, list) or not candidates or not isinstance(candidates[0], dict):
+        raise MalformedProviderResponse(
+            "Google Gemini returned a response without a valid model candidate.",
+            code="malformed_response",
+        )
+    candidate = candidates[0]
+    content_block = candidate.get("content") or {}
+    if not isinstance(content_block, dict):
+        raise MalformedProviderResponse(
+            "Google Gemini returned a malformed model message.",
+            code="malformed_response",
+        )
+    parts = content_block.get("parts") or []
+    if not isinstance(parts, list):
+        raise MalformedProviderResponse(
+            "Google Gemini returned a malformed model message.",
+            code="malformed_response",
+        )
+    content = ""
+    thinking = ""
+    calls: list[NormalizedToolCall] = []
+    for part in parts:
+        if not isinstance(part, dict):
+            raise MalformedProviderResponse(
+                "Google Gemini returned a malformed model message.",
+                code="malformed_response",
+            )
+        if part.get("thought"):
+            thought_text = str(part.get("text") or "")
+            thinking += thought_text
+        elif part.get("plan"):
+            thinking += str(part.get("plan") or "")
+        elif "text" in part:
+            content += normalize_provider_text(part.get("text"))
+        elif part.get("functionCall"):
+            call = part["functionCall"]
+            if not isinstance(call, dict):
+                raise MalformedProviderResponse(
+                    "Google Gemini returned a malformed function call.",
+                    code="malformed_response",
+                )
+            metadata = {}
+            if part.get("thoughtSignature"):
+                metadata["thought_signature"] = str(part["thoughtSignature"])
+            calls.append(NormalizedToolCall(
+                NormalizedFunction(
+                    str(call.get("name") or ""),
+                    _json_arguments(call.get("args")),
+                ),
+                id=str(call.get("id") or ""),
+                provider_metadata=metadata,
+            ))
+    usage = payload.get("usageMetadata") or {}
+    return NormalizedChunk(
+        message=NormalizedMessage(
+            content=content,
+            thinking=thinking,
+            tool_calls=calls,
+        ),
+        prompt_eval_count=int(usage.get("promptTokenCount") or 0),
+        eval_count=int(usage.get("candidatesTokenCount") or 0),
+        done_reason=str(candidate.get("finishReason") or ""),
+    )
+
+
+def _gemini_stream(response: requests.Response, definition: ModelDefinition) -> Iterator[NormalizedChunk]:
+    saw_candidate = False
+    for payload in _iter_sse_json(response, definition.provider):
+        if not payload.get("candidates"):
+            continue
+        saw_candidate = True
+        yield _gemini_chunk(payload)
+    if not saw_candidate:
+        raise MalformedProviderResponse(
+            "Google Gemini returned an empty response stream.",
+            code="malformed_response",
+        )
+
+
+def _remote_chat(
+    definition: ModelDefinition,
+    *,
+    environ: Mapping[str, str],
+    operation_timeout: float,
+    cancellation_token: CancellationToken | None,
+    **kwargs: Any,
+) -> NormalizedChunk | Iterator[NormalizedChunk]:
+    token = cancellation_token or CancellationToken()
+    token.raise_if_cancelled()
+    streaming = bool(kwargs.get("stream"))
+    kwargs["messages"] = _selene_messages(kwargs.get("messages") or [])
+
+    if definition.id.startswith("gemini:"):
+        response = _post(
+            definition,
+            url=_gemini_url(definition, streaming=streaming),
+            headers=_gemini_headers(definition, environ, streaming=streaming),
+            payload=_gemini_payload(definition, kwargs),
+            timeout=operation_timeout,
+            stream=streaming,
+        )
+        if not streaming:
+            return _gemini_chunk(_response_json(response, definition.provider))
+        return _cancellable(_gemini_stream(response, definition), token)
+
+    response = _post(
+        definition,
+        url=_openai_url(definition.endpoint),
+        headers=_openai_headers(definition, environ),
+        payload=_openai_payload(definition, kwargs),
+        timeout=operation_timeout,
+        stream=streaming,
+    )
+    if not streaming:
+        return _openai_chunk(_response_json(response, definition.provider), definition.provider)
+    return _cancellable(_openai_stream(response, definition), token)
+
+
+def _cancellable(chunks: Iterable[NormalizedChunk], token: CancellationToken) -> Iterator[NormalizedChunk]:
+    for chunk in chunks:
+        token.raise_if_cancelled()
+        yield chunk
+
+
+def chat_with_model(
+    session: Mapping[str, Any] | None,
+    runtime: RuntimeConfig,
+    *,
+    ollama_service_factory: Callable[[RuntimeConfig], Any],
+    environ: Mapping[str, str] | None = None,
+    **kwargs: Any,
+) -> Any:
+    """Route a canonical Selene chat call through the selected adapter."""
+    environment = os.environ if environ is None else environ
+    model = resolve_model((session or {}).get("model_id"), runtime, environment)
+    if model.id == LOCAL_MODEL_ID:
+        local_kwargs = dict(kwargs)
+        local_kwargs["model"] = model.model
+        return ollama_service_factory(runtime).chat(**local_kwargs)
+
+    operation_timeout = float(kwargs.pop("operation_timeout", runtime.chat_timeout_seconds))
+    kwargs.pop("kind", None)
+    kwargs.pop("owner", None)
+    cancellation_token = kwargs.pop("cancellation_token", None)
+    kwargs.pop("model", None)
+    return _remote_chat(
+        model,
+        environ=environment,
+        operation_timeout=operation_timeout,
+        cancellation_token=cancellation_token,
+        **kwargs,
+    )
+
+
+# Load only the repository-local file, and never replace exported environment.
+load_dotenv()

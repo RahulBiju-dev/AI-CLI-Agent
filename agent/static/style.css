@@ -569,6 +569,9 @@ input:focus-visible {
 }
 
 .session-open {
+  display: flex;
+  align-items: center;
+  gap: 8px;
   min-width: 0;
   padding: 12px 9px 12px 12px;
   overflow: hidden;
@@ -576,6 +579,30 @@ input:focus-visible {
   text-align: left;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.session-running {
+  flex: 0 0 auto;
+  width: 7px;
+  height: 7px;
+  margin-left: auto;
+  border-radius: 999px;
+  background: var(--accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 14%, transparent);
+  animation: session-running-pulse 1.35s ease-in-out infinite;
+}
+
+.session-item.running:not(.active) {
+  color: var(--text-soft);
+}
+
+@keyframes session-running-pulse {
+  0%, 100% { opacity: 0.42; transform: scale(0.82); }
+  50% { opacity: 1; transform: scale(1); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .session-running { animation: none; opacity: 0.85; }
 }
 
 .session-delete {
@@ -927,6 +954,24 @@ input:focus-visible {
   color: var(--text-soft);
   font-size: 1.08rem;
   line-height: 1.65;
+}
+
+.bubble.error {
+  border-color: color-mix(in srgb, var(--danger) 42%, var(--line));
+  border-left-color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 6%, var(--surface));
+}
+
+.bubble.error::before {
+  content: "model error";
+  display: block;
+  margin-bottom: 10px;
+  color: var(--danger);
+  font-family: var(--mono);
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
 }
 
 .message.user .bubble {
@@ -1402,6 +1447,67 @@ textarea::placeholder {
   align-items: center;
   gap: 10px;
   min-width: 0;
+}
+
+.model-picker {
+  display: flex;
+  align-items: center;
+  flex: 0 1 250px;
+  min-width: 0;
+  height: 34px;
+  padding-left: 9px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface-low);
+  color: var(--muted);
+  transition: border-color 140ms ease, color 140ms ease;
+}
+
+.model-picker:hover {
+  border-color: var(--line-strong);
+  color: var(--text);
+}
+
+.model-picker:focus-within {
+  border-color: var(--line-focus);
+  outline: 2px solid color-mix(in srgb, var(--accent) 35%, transparent);
+  outline-offset: 1px;
+}
+
+.model-picker-label {
+  flex: 0 0 auto;
+  color: var(--faint);
+  font-family: var(--mono);
+  font-size: 0.62rem;
+  font-weight: 650;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+#model-select {
+  min-width: 0;
+  width: 100%;
+  height: 32px;
+  padding: 0 25px 0 7px;
+  border: 0;
+  outline: 0;
+  overflow: hidden;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  font: 650 0.75rem/1 var(--sans);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+#model-select option {
+  background: var(--elevated);
+  color: var(--text);
+}
+
+#model-select:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
 }
 
 .mode-picker {
@@ -2282,6 +2388,7 @@ output {
   }
 
   .composer-footer {
+    flex-wrap: wrap;
     gap: 8px;
     padding: 6px 8px 8px 12px;
   }
@@ -2292,6 +2399,16 @@ output {
 
   .composer-meta {
     gap: 7px;
+    width: 100%;
+  }
+
+  .composer-actions {
+    margin-left: auto;
+  }
+
+  .model-picker {
+    flex-basis: 158px;
+    max-width: 158px;
   }
 
   .mode-trigger {
@@ -2330,6 +2447,17 @@ output {
   .profile-dialog {
     width: 100%;
     border-radius: 14px;
+  }
+}
+
+@media (max-width: 480px) {
+  .context-meter {
+    display: none;
+  }
+
+  .model-picker {
+    flex: 1 1 0;
+    max-width: none;
   }
 }
 

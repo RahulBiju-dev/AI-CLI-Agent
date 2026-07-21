@@ -311,6 +311,21 @@ class CoverArtTests(unittest.TestCase):
         # Ensure the panel builds without error and markdown path still runs.
         self.assertIsNotNone(panel)
 
+    def test_api_content_parts_render_as_text_in_terminal(self):
+        rendered = terminal.response_markdown([
+            {"type": "text", "text": "Hello **world**"},
+            {"type": "output_text", "text": "Second paragraph"},
+        ])
+        self.assertEqual(rendered.markup, "Hello **world**\nSecond paragraph")
+
+    def test_terminal_markdown_failure_falls_back_to_literal_text(self):
+        from rich.text import Text
+
+        with patch.object(terminal, "_render_terminal_markdown", side_effect=ValueError("bad markdown")):
+            rendered = terminal.response_markdown("still show this")
+        self.assertIsInstance(rendered, Text)
+        self.assertEqual(rendered.plain, "still show this")
+
 
 class StatusHelpersTests(unittest.TestCase):
     def test_status_kinds_emit_glyphs(self):

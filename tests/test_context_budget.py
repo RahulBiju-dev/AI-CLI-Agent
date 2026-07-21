@@ -149,6 +149,9 @@ class TestContextBudget(unittest.TestCase):
         tool_call = {
             "role": "assistant",
             "content": "discarded thinking text",
+            "provider_metadata": {
+                "reasoning_details": [{"type": "reasoning.encrypted", "data": "opaque"}],
+            },
             "tool_calls": [
                 {"function": {"name": "read_file", "arguments": {"file_path": "README.md"}}}
             ],
@@ -178,6 +181,10 @@ class TestContextBudget(unittest.TestCase):
         )
 
         self.assertEqual(prepared[-3]["tool_calls"], tool_call["tool_calls"])
+        self.assertEqual(
+            prepared[-3]["provider_metadata"],
+            tool_call["provider_metadata"],
+        )
         self.assertEqual(prepared[-3]["content"], "")
         self.assertEqual(prepared[-2], tool_result)
         self.assertEqual(prepared[-1], reminder)

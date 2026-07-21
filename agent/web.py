@@ -55,6 +55,17 @@ from agent.tool_runner import (
 )
 from agent.cancellation import CancellationToken, OperationCancelled
 from agent.ollama_runtime import OllamaService, OperationKind, get_ollama_coordinator
+from agent.model_providers import (
+    LOCAL_MODEL_ID,
+    ModelProviderError,
+    available_models,
+    chat_with_model,
+    normalize_provider_text,
+    normalize_model_id,
+    resolve_model,
+    resolve_error_fallback,
+    session_for_model,
+)
 from agent.persistence import PersistenceError, atomic_write_json, read_json_preserved
 from agent.platform_runtime import get_runtime_paths, open_url_native, resource_path
 from agent.runtime_config import (
@@ -72,6 +83,8 @@ from agent.web_runtime import (
     normalize_runtime_id,
 )
 from agent.modes import (
+    AGENT_MODE_LABELS,
+    AGENT_MODE_SLASH_COMMANDS,
     AGENT_MODE_DEEP_RESEARCH,
     AGENT_MODE_NORMAL,
     AGENT_MODE_ULTRA,
@@ -109,6 +122,7 @@ def _session_from_runtime(runtime: RuntimeConfig) -> dict:
         "format": "",
         "think": True,
         "agent_mode": AGENT_MODE_NORMAL,
+        "model_id": LOCAL_MODEL_ID,
     }
 
 
@@ -173,6 +187,10 @@ def _normalize_session_settings(session: dict, *, fallback: dict | None = None) 
         merged["agent_mode"] = normalize_agent_mode(merged.get("agent_mode"))
     except ValueError as exc:
         raise RuntimeConfigurationError(str(exc)) from exc
+    try:
+        merged["model_id"] = normalize_model_id(merged.get("model_id"), runtime)
+    except ModelProviderError as exc:
+        raise RuntimeConfigurationError(str(exc)) from exc
     for field in ("verbose", "wordwrap", "history", "think"):
         if not isinstance(merged.get(field), bool):
             raise RuntimeConfigurationError(f"{field} must be true or false")
@@ -192,20 +210,43 @@ def _active_system_prompt(session: dict | None = None) -> tuple[str, str]:
 
 def _runtime_payload(session: dict) -> dict:
     runtime = get_runtime_config(session)
+    request_session = _session_for_selected_model(session, runtime)
     paths = get_runtime_paths()
     default_system_prompt, active_system_prompt = _active_system_prompt(session)
+    selected_model = resolve_model(session.get("model_id"), runtime)
     return {
         "requested_profile": runtime.requested_profile.value,
         "profile": runtime.profile.value,
         "selection_reason": runtime.selection_reason,
         "warnings": list(runtime.warnings),
-        "effective_options": runtime.ollama_options(),
+        "effective_options": effective_session_model_options(request_session)[1],
         "storage": paths.report(),
         # Frontend context meter needs the prompt actually sent to the model.
         # Session ``system`` is only an override; empty means Modelfile default.
         "default_system_prompt": default_system_prompt,
         "active_system_prompt": active_system_prompt,
+        "selected_model": selected_model.public_dict(),
     }
+
+
+def _model_chat(session: dict | None, runtime: RuntimeConfig, **kwargs):
+    """Use the selected provider while preserving the existing local service seam."""
+    return chat_with_model(
+        session,
+        runtime,
+        ollama_service_factory=lambda config: OllamaService(config),
+        **kwargs,
+    )
+
+
+def _session_for_selected_model(
+    session: dict | None,
+    runtime: RuntimeConfig | None = None,
+) -> dict:
+    """Apply a provider's native context limit without persisting it locally."""
+    source = deepcopy(session or {})
+    resolved_runtime = runtime or get_runtime_config(source)
+    return session_for_model(source, resolved_runtime)
 
 
 def _read_session_snapshot(filename: str) -> tuple[dict, list[dict]]:
@@ -429,7 +470,9 @@ def generate_conversation_title(
     ]
     try:
         runtime = get_runtime_config(session_data)
-        response = OllamaService(runtime).chat(
+        response = _model_chat(
+            session_data,
+            runtime,
             kind=OperationKind.TITLE,
             owner=owner or f"title:{threading.get_ident()}:{time.monotonic_ns()}",
             cancellation_token=cancellation_token,
@@ -537,6 +580,11 @@ _COMMANDS_HELP_MD = """
 * `/load [name|index]` — Load a session (lists if no arg)
 * `/profile [name]` — Show or set profile (`manual` · `auto` · `low-vram` · `balanced`)
 * `/set profile <name>` — Same as `/profile <name>` (default is Modelfile / manual)
+* `/model [id|number]` — Show or select a configured model
+* `/set model <id|number>` — Same as `/model <id|number>`
+* `/fast` — Switch this conversation to Fast mode
+* `/ultrathink` — Switch this conversation to Ultra Thinking mode
+* `/deepresearch` — Switch this conversation to Deep Research mode
 * `/set parameter <name> <val>` — Model option (e.g. `temperature 0.25`, `num_ctx 8192`)
 * `/set system "…"|default` — Override or reset system prompt
 * `/set history` / `/set nohistory` — Multi-turn context on/off
@@ -548,6 +596,65 @@ _COMMANDS_HELP_MD = """
 * `/vault list` · `/vault search <q>` · `/vault add <path>` · … — Local knowledge tools
 * `/quit` or `/exit` or `/q` — Exit
 """
+
+
+def _model_command_web(session: dict, requested: str = "") -> str:
+    """List or select one server-configured model for the current conversation."""
+    runtime = get_runtime_config(session)
+    models = available_models(runtime)
+    current_id = str(session.get("model_id") or LOCAL_MODEL_ID)
+    query = str(requested or "").strip()
+    if not query:
+        lines = ["### Configured Models"]
+        for index, model in enumerate(models, 1):
+            marker = " — active" if model["id"] == current_id else ""
+            lines.append(
+                f"{index}. `{model['id']}` — {model['display_name']} "
+                f"({model['provider']}){marker}"
+            )
+        lines.append("\nUse `/model <id|number>` to switch this conversation.")
+        return "\n".join(lines)
+
+    selected = None
+    if query.isdigit() and 0 < int(query) <= len(models):
+        selected = models[int(query) - 1]
+    folded = query.casefold()
+    if selected is None:
+        selected = next(
+            (
+                model for model in models
+                if folded in {
+                    str(model["id"]).casefold(),
+                    str(model["display_name"]).casefold(),
+                }
+            ),
+            None,
+        )
+    if selected is None:
+        matches = [
+            model for model in models
+            if folded in str(model["id"]).casefold()
+            or folded in str(model["display_name"]).casefold()
+        ]
+        if len(matches) == 1:
+            selected = matches[0]
+    if selected is None:
+        return f"Unknown or ambiguous model: `{query}`\n\n" + _model_command_web(session)
+
+    candidate = deepcopy(session)
+    candidate["model_id"] = selected["id"]
+    try:
+        normalized = _normalize_session_settings(candidate, fallback=session)
+    except RuntimeConfigurationError as exc:
+        return f"Model could not be selected: {exc}"
+    session.clear()
+    session.update(normalized)
+    context = selected.get("context_window")
+    detail = f" · maximum context {context:,}" if context else " · local profile context"
+    return (
+        f"✓ Model = **{selected['display_name']}**  \n"
+        f"`{selected['id']}` · {selected['provider']}{detail}"
+    )
 
 def execute_command_web(
     cmd: str,
@@ -680,11 +787,19 @@ def execute_command_web(
         lines.extend(f"⚠ {warning}" for warning in runtime.warnings)
         return "\n".join(lines)
 
+    elif base == "/model":
+        return _model_command_web(session, rest)
+
+    elif base in AGENT_MODE_SLASH_COMMANDS:
+        mode = AGENT_MODE_SLASH_COMMANDS[base]
+        session["agent_mode"] = mode
+        return f"✓ Mode = **{AGENT_MODE_LABELS[mode]}**"
+
     elif base == "/set":
         if not rest:
             return (
                 "Usage: `/set <subcommand> [args]`\n"
-                "Subcommands: `profile` · `parameter` · `system` · `history` · "
+                "Subcommands: `model` · `profile` · `parameter` · `system` · `history` · "
                 "`format` · `verbose` · `think` · …\n"
                 "Tip: type `/help` or try `/profile`"
             )
@@ -799,6 +914,8 @@ def execute_command_web(
             ]
             lines.extend(f"⚠ {warning}" for warning in runtime.warnings)
             return "\n".join(lines)
+        elif sub == "model":
+            return _model_command_web(session, args)
         else:
             return f"Unknown /set subcommand: `{sub}`"
             
@@ -808,11 +925,13 @@ def execute_command_web(
         sub = rest.lower()
         if sub == "parameters":
             runtime = get_runtime_config(session)
+            request_session = _session_for_selected_model(session, runtime)
+            _request_runtime, effective = effective_session_model_options(request_session)
             out = [
                 f"**Runtime profile:** `{runtime.profile.value}`",
                 "**Effective session parameters:**",
             ]
-            for k, v in runtime.ollama_options().items():
+            for k, v in effective.items():
                 out.append(f"- `{k}` = `{v}`")
             if session.get("options"):
                 out.append("\nExplicit session overrides are active.")
@@ -836,7 +955,12 @@ def execute_command_web(
             else:
                 return "No system prompt set (using Modelfile default)."
         elif sub == "model":
-            return f"**Model:** `{MODEL_NAME}`"
+            selected = resolve_model(session.get("model_id"), get_runtime_config(session))
+            return (
+                f"**Model:** {selected.display_name}\n\n"
+                f"- ID: `{selected.id}`\n"
+                f"- Provider: {selected.provider}"
+            )
         else:
             return f"Unknown /show subcommand: `{sub}` (try: parameters, system, model)"
             
@@ -1115,6 +1239,63 @@ def execute_command_web(
 
 # ── Chat Stream Generator ─────────────────────────────────────────────
 
+def _model_error_response(
+    exc: Exception,
+    *,
+    interrupted: bool = False,
+    fallback_attempted: bool = False,
+    fallback_unavailable: str = "",
+) -> str:
+    """Return a secret-safe provider failure formatted for an assistant bubble."""
+    if isinstance(exc, ModelProviderError):
+        detail = str(exc)
+    elif isinstance(exc, ContextWindowError):
+        detail = str(exc)
+    else:
+        detail = "The model response stopped unexpectedly. Try again or select another model."
+    if fallback_attempted:
+        detail = (
+            "Selene automatically switched to **Gemma 4 31B IT** and continued the "
+            f"request, but the fallback model also failed.\n\n{detail}"
+        )
+    elif fallback_unavailable:
+        detail = (
+            f"{detail}\n\nSelene tried to switch automatically to **Gemma 4 31B IT**, "
+            f"but the fallback could not start: {fallback_unavailable}"
+        )
+    heading = "Response interrupted" if interrupted else "Couldn’t complete this response"
+    return f"**{heading}.**\n\n{detail}"
+
+
+def _activate_error_fallback(
+    session_data: dict,
+    runtime: RuntimeConfig,
+) -> tuple[dict, RuntimeConfig, dict]:
+    """Persist and resolve the configured one-shot model-error fallback."""
+    fallback = resolve_error_fallback(session_data.get("model_id"), runtime)
+    if fallback is None:
+        raise ModelProviderError(
+            "Gemma 4 31B IT is already active.",
+            code="fallback_failed",
+        )
+    session_data["model_id"] = fallback.id
+    request_session = _session_for_selected_model(session_data, runtime)
+    request_runtime = get_runtime_config(request_session)
+    return request_session, request_runtime, fallback.public_dict()
+
+
+def _model_fallback_event(model: dict, failed_model: str) -> dict:
+    display_name = str(model.get("display_name") or "Gemma 4 31B IT")
+    return {
+        "type": "model_fallback",
+        "model": deepcopy(model),
+        "failed_model_id": failed_model,
+        "message": (
+            f"Model error on {failed_model}. Switched to {display_name} "
+            "and continuing automatically."
+        ),
+    }
+
 def _deep_research_plan_events(
     user_input: str,
     session_data: dict,
@@ -1139,7 +1320,9 @@ def _deep_research_plan_events(
             options,
             tools=None,
         )
-        stream = OllamaService(runtime).chat(
+        stream = _model_chat(
+            session_data,
+            runtime,
             kind=OperationKind.CHAT,
             owner=f"{operation_owner}:research-plan",
             cancellation_token=cancellation_token,
@@ -1157,7 +1340,16 @@ def _deep_research_plan_events(
             "message": f"Research planning used fallback queries: {exc}",
             "color": "yellow",
         }
-        return parse_research_queries("", user_input, query_count)
+        queries = parse_research_queries("", user_input, query_count)
+        yield {"type": "thinking_start"}
+        yield {
+            "type": "thinking_chunk",
+            "text": "Research plan:\n" + "\n".join(
+                f"{index}. {query}" for index, query in enumerate(queries, 1)
+            ),
+        }
+        yield {"type": "thinking_end"}
+        return queries
 
     content = ""
     thinking_open = False
@@ -1168,13 +1360,16 @@ def _deep_research_plan_events(
             msg = getattr(chunk, "message", None)
             if msg is None:
                 continue
-            thinking = getattr(msg, "thinking", None) or ""
-            if thinking:
+            reasoning = "\n\n".join(filter(None, (
+                normalize_provider_text(getattr(msg, "planning", None)),
+                normalize_provider_text(getattr(msg, "thinking", None)),
+            )))
+            if reasoning:
                 if not thinking_open:
                     thinking_open = True
                     yield {"type": "thinking_start"}
-                yield {"type": "thinking_chunk", "text": thinking}
-            content += getattr(msg, "content", None) or ""
+                yield {"type": "thinking_chunk", "text": reasoning}
+            content += normalize_provider_text(getattr(msg, "content", None))
     except OperationCancelled:
         raise
     except Exception as exc:
@@ -1185,16 +1380,27 @@ def _deep_research_plan_events(
                 stream.close()
             except Exception:
                 pass
-    if thinking_open:
-        yield {"type": "thinking_end"}
     if planning_error is not None:
         yield {
             "type": "status",
             "message": f"Research planning used fallback queries: {planning_error}",
             "color": "yellow",
         }
-        return parse_research_queries("", user_input, query_count)
-    return parse_research_queries(content, user_input, query_count)
+        queries = parse_research_queries("", user_input, query_count)
+    else:
+        queries = parse_research_queries(content, user_input, query_count)
+    if not thinking_open:
+        yield {"type": "thinking_start"}
+    else:
+        yield {"type": "thinking_chunk", "text": "\n\n"}
+    yield {
+        "type": "thinking_chunk",
+        "text": "Research plan:\n" + "\n".join(
+            f"{index}. {query}" for index, query in enumerate(queries, 1)
+        ),
+    }
+    yield {"type": "thinking_end"}
+    return queries
 
 
 def _deep_research_search_events(
@@ -1287,7 +1493,9 @@ def _ultra_review_events(
         }
         if session_data.get("format"):
             kwargs["format"] = session_data["format"]
-        stream = OllamaService(runtime).chat(
+        stream = _model_chat(
+            session_data,
+            runtime,
             kind=OperationKind.CHAT,
             owner=f"{operation_owner}:ultra-review",
             cancellation_token=cancellation_token,
@@ -1311,7 +1519,7 @@ def _ultra_review_events(
             msg = getattr(chunk, "message", None)
             if msg is None:
                 continue
-            thinking_chunk = getattr(msg, "thinking", None) or ""
+            thinking_chunk = normalize_provider_text(getattr(msg, "thinking", None))
             if thinking_chunk:
                 if not thinking_open:
                     thinking_open = True
@@ -1319,7 +1527,7 @@ def _ultra_review_events(
                 thinking += thinking_chunk
                 yield {"type": "thinking_chunk", "text": thinking_chunk}
                 continue
-            content_chunk = getattr(msg, "content", None) or ""
+            content_chunk = normalize_provider_text(getattr(msg, "content", None))
             if content_chunk:
                 if thinking_open:
                     thinking_open = False
@@ -1366,6 +1574,8 @@ def _generate_chat_events_impl(
     cancellation_token = cancellation_token or CancellationToken()
     cancellation_token.raise_if_cancelled()
     runtime = get_runtime_config(session_data)
+    request_session = _session_for_selected_model(session_data, runtime)
+    runtime = get_runtime_config(request_session)
     agent_mode = normalize_agent_mode(session_data.get("agent_mode"))
     generation_start_session = deepcopy(session_data)
     operation_owner = f"web:{generation_id or threading.get_ident()}"
@@ -1491,14 +1701,21 @@ def _generate_chat_events_impl(
                         GLOBAL_STATE["active_session_name"] = origin_name
                         GLOBAL_STATE["session"] = deepcopy(session_data)
                         GLOBAL_STATE["history"] = deepcopy(history_data)
-            yield {"type": "content_chunk", "content": output}
             yield {
+                "type": "content_chunk",
+                "content": output,
+                "error": routine_state == "failed",
+            }
+            terminal_event = {
                 "type": "done",
                 "state": routine_state,
                 "history": history_data,
                 "active_session_name": origin_name,
                 "saved_sessions": list_saved_sessions(),
             }
+            if routine_state == "failed":
+                terminal_event["error"] = output
+            yield terminal_event
             return
     # 1. Sync system prompt override
     default_system_prompt = load_default_system_prompt()
@@ -1584,7 +1801,9 @@ def _generate_chat_events_impl(
             history_data,
             generation_start_session=generation_start_session,
         )
-        messages_to_send = prepare_messages_for_model(history_data, session_data, tools=TOOL_SCHEMAS)
+        messages_to_send = prepare_messages_for_model(
+            history_data, request_session, tools=TOOL_SCHEMAS
+        )
     else:
         messages_to_send = []
         if history_data and history_data[0].get("role") == "system":
@@ -1592,7 +1811,9 @@ def _generate_chat_events_impl(
         if pre_tool_message:
             messages_to_send.append(pre_tool_message)
         messages_to_send.append({"role": "user", "content": user_input})
-        messages_to_send = prepare_messages_for_model(messages_to_send, session_data, tools=TOOL_SCHEMAS)
+        messages_to_send = prepare_messages_for_model(
+            messages_to_send, request_session, tools=TOOL_SCHEMAS
+        )
 
     initial_research_calls: list[dict] = []
     initial_research_results: list[dict] = []
@@ -1612,7 +1833,7 @@ def _generate_chat_events_impl(
                     "content": ULTRA_MODE_PROMPT.format(user_input=user_input),
                 },
             ],
-            session_data,
+            request_session,
             tools=TOOL_SCHEMAS,
         )
     elif agent_mode == AGENT_MODE_DEEP_RESEARCH:
@@ -1624,7 +1845,7 @@ def _generate_chat_events_impl(
         }
         queries = yield from _deep_research_plan_events(
             user_input,
-            session_data,
+            request_session,
             runtime,
             operation_owner,
             cancellation_token,
@@ -1687,7 +1908,7 @@ def _generate_chat_events_impl(
                     ),
                 },
             ],
-            session_data,
+            request_session,
             tools=TOOL_SCHEMAS,
             extra_reserved_tokens=CONTEXT_TOOL_LOOP_RESERVE,
         )
@@ -1707,29 +1928,29 @@ def _generate_chat_events_impl(
     accumulated_content = ""
     accumulated_thinking = ""
     continuing_output = False
+    fallback_attempted = False
     while True:
         cancellation_token.raise_if_cancelled()
         suppress_vault_completion_claim = bool(
             vault_index_loop_state.get("expected_arguments")
         )
         runtime_tools = None if continuing_output else tool_schemas_for_model(
-            messages_to_send, session_data, TOOL_SCHEMAS
+            messages_to_send, request_session, TOOL_SCHEMAS
         )
         if agent_mode in {AGENT_MODE_ULTRA, AGENT_MODE_DEEP_RESEARCH}:
             runtime_tools = force_hard_web_search_schema(runtime_tools)
         try:
             guarded_options = guarded_options_for_call(
                 messages_to_send,
-                effective_session_model_options(session_data)[1],
+                effective_session_model_options(request_session)[1],
                 runtime_tools,
                 extra_reserved_tokens=(
                     CONTEXT_TOOL_LOOP_RESERVE if tool_rounds and not continuing_output else 0
                 ),
             )
         except ContextWindowError as exc:
-            message = f"Context window guard stopped this response before generation: {exc}"
-            yield {"type": "status", "message": message, "color": "yellow"}
-            assistant_msg = {"role": "assistant", "content": message}
+            message = _model_error_response(exc)
+            assistant_msg = {"role": "assistant", "content": message, "error": True}
             if session_data.get("history", True):
                 history_data.append(assistant_msg)
                 save_session_snapshot(
@@ -1738,7 +1959,7 @@ def _generate_chat_events_impl(
                     history_data,
                     generation_start_session=generation_start_session,
                 )
-            yield {"type": "content_chunk", "content": message}
+            yield {"type": "content_chunk", "content": message, "error": True}
             yield {
                 "type": "done",
                 "state": "failed",
@@ -1771,16 +1992,47 @@ def _generate_chat_events_impl(
             kwargs["options"] = guarded_options
             
         try:
-            stream = OllamaService(runtime).chat(
+            stream = _model_chat(
+                request_session,
+                runtime,
                 kind=OperationKind.CHAT,
                 owner=operation_owner,
                 cancellation_token=cancellation_token,
                 operation_timeout=runtime.chat_timeout_seconds,
                 **kwargs,
             )
-        except Exception as e:
-            message = f"Ollama Chat error: {e}"
-            yield {"type": "status", "message": message, "color": "red"}
+        except OperationCancelled:
+            raise
+        except Exception as exc:
+            fallback_unavailable = ""
+            if not fallback_attempted:
+                failed_model = str(session_data.get("model_id") or LOCAL_MODEL_ID)
+                try:
+                    request_session, runtime, fallback_model = _activate_error_fallback(
+                        session_data,
+                        runtime,
+                    )
+                except (ModelProviderError, RuntimeConfigurationError) as fallback_exc:
+                    fallback_unavailable = str(fallback_exc)
+                else:
+                    fallback_attempted = True
+                    yield _model_fallback_event(fallback_model, failed_model)
+                    continue
+            message = _model_error_response(
+                exc,
+                fallback_attempted=fallback_attempted,
+                fallback_unavailable=fallback_unavailable,
+            )
+            assistant_msg = {"role": "assistant", "content": message, "error": True}
+            if session_data.get("history", True):
+                history_data.append(assistant_msg)
+                save_session_snapshot(
+                    origin_name,
+                    session_data,
+                    history_data,
+                    generation_start_session=generation_start_session,
+                )
+            yield {"type": "content_chunk", "text": message, "error": True}
             yield {
                 "type": "done",
                 "state": "failed",
@@ -1794,44 +2046,43 @@ def _generate_chat_events_impl(
         thinking_buf = ""
         content_buf = ""
         tool_calls = []
+        response_provider_metadata: dict = {}
         in_thinking = False
-        thinking_started = False
         prompt_tokens = 0
         eval_tokens = 0
         done_reason = ""
+        stream_error: Exception | None = None
         
         try:
             for chunk in stream:
                 cancellation_token.raise_if_cancelled()
                 done_reason = _chunk_done_reason(chunk) or done_reason
                 msg = chunk.message
+
+                chunk_provider_metadata = getattr(msg, "provider_metadata", None)
+                if isinstance(chunk_provider_metadata, dict) and chunk_provider_metadata:
+                    response_provider_metadata = deepcopy(chunk_provider_metadata)
             
                 if getattr(chunk, "prompt_eval_count", None):
                     prompt_tokens = chunk.prompt_eval_count
                 if getattr(chunk, "eval_count", None):
                     eval_tokens = chunk.eval_count
             
-                # Intercept tool calls
-                if getattr(msg, "tool_calls", None):
-                    tool_calls = [
-                        {"function": {"name": tc.function.name, "arguments": tc.function.arguments}}
-                        for tc in msg.tool_calls
-                    ]
-                    break
-                
-                # Stream thinking text
-                thinking_chunk = getattr(msg, "thinking", None) or ""
+                # Provider planning metadata is reasoning, so it shares the
+                # Thinking block. Only final content enters the response block.
+                thinking_chunk = "\n\n".join(filter(None, (
+                    normalize_provider_text(getattr(msg, "planning", None)),
+                    normalize_provider_text(getattr(msg, "thinking", None)),
+                )))
                 if thinking_chunk:
-                    if not thinking_started:
-                        thinking_started = True
+                    if not in_thinking:
                         in_thinking = True
                         yield {"type": "thinking_start"}
                     thinking_buf += thinking_chunk
                     yield {"type": "thinking_chunk", "text": thinking_chunk}
-                    continue
                 
                 # Stream final content text
-                content_chunk = getattr(msg, "content", None) or ""
+                content_chunk = normalize_provider_text(getattr(msg, "content", None))
                 if content_chunk:
                     if in_thinking:
                         in_thinking = False
@@ -1842,12 +2093,111 @@ def _generate_chat_events_impl(
                         and agent_mode != AGENT_MODE_ULTRA
                     ):
                         yield {"type": "content_chunk", "text": content_chunk}
+
+                # A provider may put thought, answer, and function-call parts in
+                # one candidate. Process every text channel above before ending
+                # this model round on the tool call.
+                if getattr(msg, "tool_calls", None):
+                    tool_calls = []
+                    for tool_call in msg.tool_calls:
+                        normalized_call = {
+                            "function": {
+                                "name": tool_call.function.name,
+                                "arguments": tool_call.function.arguments,
+                            },
+                        }
+                        if getattr(tool_call, "id", ""):
+                            normalized_call["id"] = tool_call.id
+                        if getattr(tool_call, "provider_metadata", None):
+                            normalized_call["provider_metadata"] = dict(
+                                tool_call.provider_metadata
+                            )
+                        tool_calls.append(normalized_call)
+                    break
+        except OperationCancelled:
+            raise
+        except Exception as exc:
+            stream_error = exc
         finally:
             if hasattr(stream, "close"):
                 try:
                     stream.close()
                 except Exception:
                     pass
+
+        if stream_error is not None:
+            if in_thinking:
+                yield {"type": "thinking_end"}
+            fallback_unavailable = ""
+            if not fallback_attempted:
+                failed_model = str(session_data.get("model_id") or LOCAL_MODEL_ID)
+                try:
+                    request_session, runtime, fallback_model = _activate_error_fallback(
+                        session_data,
+                        runtime,
+                    )
+                except (ModelProviderError, RuntimeConfigurationError) as fallback_exc:
+                    fallback_unavailable = str(fallback_exc)
+                else:
+                    fallback_attempted = True
+                    accumulated_content += content_buf
+                    accumulated_thinking += thinking_buf
+                    if content_buf:
+                        messages_to_send = prepare_messages_for_model(
+                            [
+                                *messages_to_send,
+                                {"role": "assistant", "content": content_buf},
+                                {
+                                    "role": "user",
+                                    "content": OUTPUT_CONTINUATION_PROMPT.format(
+                                        user_input=user_input
+                                    ),
+                                },
+                            ],
+                            request_session,
+                            tools=None,
+                        )
+                        continuing_output = True
+                    yield _model_fallback_event(fallback_model, failed_model)
+                    continue
+            existing_content = accumulated_content + content_buf
+            error_text = _model_error_response(
+                stream_error,
+                interrupted=bool(existing_content or thinking_buf),
+                fallback_attempted=fallback_attempted,
+                fallback_unavailable=fallback_unavailable,
+            )
+            separator = "\n\n---\n\n" if existing_content else ""
+            displayed_error = separator + error_text
+            yield {
+                "type": "content_chunk",
+                "text": displayed_error,
+                "error": True,
+            }
+            assistant_msg = {
+                "role": "assistant",
+                "content": existing_content + displayed_error,
+                "error": True,
+            }
+            if thinking_buf:
+                assistant_msg["thinking"] = accumulated_thinking + thinking_buf
+            if session_data.get("history", True):
+                history_data.append(assistant_msg)
+                save_session_snapshot(
+                    origin_name,
+                    session_data,
+                    history_data,
+                    generation_start_session=generation_start_session,
+                )
+            yield {
+                "type": "done",
+                "state": "failed",
+                "error": error_text,
+                "history": history_data,
+                "active_session_name": origin_name,
+                "saved_sessions": list_saved_sessions(),
+            }
+            break
                 
         if in_thinking:
             yield {"type": "thinking_end"}
@@ -1883,7 +2233,7 @@ def _generate_chat_events_impl(
                     {"role": "assistant", "content": accumulated_content},
                     reminder,
                 ],
-                session_data,
+                request_session,
                 tools=None,
             )
             continuing_output = True
@@ -1919,6 +2269,8 @@ def _generate_chat_events_impl(
         assistant_msg = {"role": "assistant", "content": content_buf}
         if thinking_buf:
             assistant_msg["thinking"] = thinking_buf
+        if response_provider_metadata:
+            assistant_msg["provider_metadata"] = response_provider_metadata
         if tool_calls:
             assistant_msg["tool_calls"] = tool_calls
             
@@ -1988,7 +2340,7 @@ def _generate_chat_events_impl(
                 user_input,
                 content_buf,
                 output_continuation_base or messages_to_send,
-                session_data,
+                request_session,
                 runtime,
                 operation_owner,
                 cancellation_token,
@@ -2210,9 +2562,8 @@ def _generate_chat_events_impl(
             deep_research_scrape_count += sum(
                 spec.name == "web_scrape" for spec in execution_specs
             )
-            research_compaction_due = (
+            search_compaction_due = (
                 deep_research_search_count >= deep_research_next_compaction
-                or deep_research_scrape_count >= deep_research_next_scrape_compaction
             )
             scrape_compaction_due = (
                 deep_research_scrape_count >= deep_research_next_scrape_compaction
@@ -2289,7 +2640,7 @@ def _generate_chat_events_impl(
                 ]
             messages_to_send = prepare_messages_for_model(
                 [*research_history, reminder],
-                session_data,
+                request_session,
                 tools=TOOL_SCHEMAS,
                 extra_reserved_tokens=CONTEXT_TOOL_LOOP_RESERVE,
             )
@@ -2300,13 +2651,13 @@ def _generate_chat_events_impl(
             })
             messages_to_send = prepare_messages_for_model(
                 messages_to_send,
-                session_data,
+                request_session,
                 tools=TOOL_SCHEMAS,
                 extra_reserved_tokens=CONTEXT_TOOL_LOOP_RESERVE,
             )
 
     if session_data.get("history", True):
-        _check_and_compact_history(history_data, session_data)
+        _check_and_compact_history(history_data, request_session)
 
 
 def generate_chat_events(
@@ -2365,8 +2716,20 @@ def generate_chat_events(
         raise
     except Exception as exc:
         terminal_state = TerminalState.FAILED
-        terminal_detail = f"Generation failed: {exc}"
-        yield {"type": "status", "message": terminal_detail, "color": "red"}
+        terminal_detail = _model_error_response(exc, interrupted=True)
+        if session_data.get("history", True) and (
+            not history_data or history_data[-1].get("content") != terminal_detail
+        ):
+            history_data.append({
+                "role": "assistant",
+                "content": terminal_detail,
+                "error": True,
+            })
+        yield {
+            "type": "content_chunk",
+            "text": terminal_detail,
+            "error": True,
+        }
     finally:
         try:
             implementation.close()
@@ -2536,8 +2899,10 @@ class AgentHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
                 return
             saved = list_saved_sessions()
             view = CLIENT_SESSIONS.snapshot(client_id)
-            probe = OllamaService(get_runtime_config(view.session)).probe(
-                model=MODEL_NAME,
+            runtime = get_runtime_config(view.session)
+            selected_model = resolve_model(view.session.get("model_id"), runtime)
+            probe = OllamaService(runtime).probe(
+                model=runtime.chat_model,
                 timeout=3,
             )
             response_data = {
@@ -2545,7 +2910,8 @@ class AgentHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
                 "history": view.history,
                 "saved_sessions": saved,
                 "active_session_name": view.active_session_name,
-                "model_name": MODEL_NAME,
+                "model_name": selected_model.display_name,
+                "models": available_models(runtime),
                 "ollama_status": "Online" if probe.api_available else "Offline",
                 "ollama_reason": probe.reason,
                 "runtime": _runtime_payload(view.session),
@@ -2729,9 +3095,11 @@ class AgentHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
                 self.send_header('Cache-Control', 'no-cache')
                 self.send_header('Connection', 'close')
                 self.send_header('X-Accel-Buffering', 'no')
+                self.send_header('X-Selene-Session-Name', active_name)
                 allowed_origin = os.environ.get('ALLOWED_ORIGIN')
                 if allowed_origin:
                     self.send_header('Access-Control-Allow-Origin', allowed_origin)
+                    self.send_header('Access-Control-Expose-Headers', 'X-Selene-Session-Name')
                 self.end_headers()
 
                 generator = generate_chat_events(

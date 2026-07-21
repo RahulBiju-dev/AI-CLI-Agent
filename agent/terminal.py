@@ -10,6 +10,7 @@ layer and must remain complete.
 """
 from __future__ import annotations
 
+import json
 import re
 import sys
 from dataclasses import dataclass, field
@@ -731,10 +732,9 @@ def _section_rule(label: str, *, style: str | None = None, glyph: str = GLYPH_SE
 def assistant_stream_panel(text: str):
     """Build the live assistant renderable — soft rounded response card."""
     from rich import box
-    from rich.markdown import Markdown
     from rich.panel import Panel
 
-    body = Markdown(_render_terminal_markdown(text or " "))
+    body = response_markdown(text)
     return Panel(
         body,
         box=box.ROUNDED,
@@ -1884,3 +1884,34 @@ def _render_terminal_markdown(text: str) -> str:
     # delimiters keeps fenced and inline code in the split result unchanged.
     parts = _RE_MARKDOWN_CODE.split(text)
     return "".join(part if index % 2 else render_prose(part) for index, part in enumerate(parts))
+
+
+def _display_text(value: object) -> str:
+    """Normalize saved/provider content parts for terminal presentation."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (int, float, bool)):
+        return str(value)
+    if isinstance(value, (list, tuple)):
+        parts = [_display_text(part) for part in value]
+        return "\n".join(part for part in parts if part)
+    if isinstance(value, Mapping):
+        for key in ("text", "content", "output_text", "value"):
+            if key in value:
+                return _display_text(value.get(key))
+        return json.dumps(value, ensure_ascii=False, default=str)
+    return str(value)
+
+
+def response_markdown(value: object):
+    """Build Rich Markdown, falling back to literal text on parser failure."""
+    from rich.markdown import Markdown
+    from rich.text import Text
+
+    text = _display_text(value)
+    try:
+        return Markdown(_render_terminal_markdown(text or " "))
+    except Exception:
+        return Text(text or " ")

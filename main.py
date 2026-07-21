@@ -3,7 +3,14 @@
 
 import sys
 
+from agent.environment import load_dotenv
+
+# Load repository-local development configuration before runtime modules read
+# environment variables. Exported process values always win.
+load_dotenv()
+
 from agent.model_lifecycle import ModelStartupResult, ensure_managed_model
+from agent.model_providers import LOCAL_MODEL_ID, available_models
 from agent.ollama_runtime import InvalidModelfileError, OllamaRuntimeError, OllamaService
 from agent.platform_runtime import get_runtime_paths, resource_path
 from agent.runtime_config import RuntimeConfig, RuntimeConfigurationError, get_runtime_config
@@ -57,13 +64,25 @@ def main() -> None:
             f"Verifying local model '{runtime.chat_model}'…",
             kind="run",
         )
-        model_result = _ensure_model(runtime, service)
-        if model_result.action in {"built", "rebuilt"}:
-            print_ok(
-                f"Model {model_result.action} through a verified staging alias"
+        try:
+            model_result = _ensure_model(runtime, service)
+        except (InvalidModelfileError, OllamaRuntimeError) as exc:
+            external_ready = any(
+                model["id"] != LOCAL_MODEL_ID for model in available_models(runtime)
+            )
+            if "--cli" in sys.argv or not external_ready:
+                raise
+            print_warn(
+                "Local Ollama model is unavailable; the Web UI will start with "
+                f"configured external models only ({exc})."
             )
         else:
-            print_ok(f"Model ready ({model_result.action})")
+            if model_result.action in {"built", "rebuilt"}:
+                print_ok(
+                    f"Model {model_result.action} through a verified staging alias"
+                )
+            else:
+                print_ok(f"Model ready ({model_result.action})")
         _console.print()
 
         if "--cli" in sys.argv:

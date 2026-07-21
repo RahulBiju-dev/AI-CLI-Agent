@@ -17,7 +17,6 @@ import time
 from typing import Callable, Sequence
 
 from rich.console import Console, Group
-from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.text import Text
 
@@ -31,7 +30,8 @@ from agent.terminal import (
     GLYPH_SECTION,
     GLYPH_TOOL,
     GLYPH_WARN,
-    _render_terminal_markdown,
+    _display_text,
+    response_markdown,
     set_display_sink,
 )
 
@@ -86,6 +86,9 @@ class TuiDisplaySink:
 
     def apply_theme(self, name: str) -> None:
         self._call("ui_apply_theme", name)
+
+    def refresh_runtime_meta(self) -> None:
+        self._call("ui_refresh_runtime_meta")
 
     def toggle_speech(self, action: str = "toggle") -> None:
         """Bridge ``/speech`` from the core command handler into the TUI."""
@@ -1226,30 +1229,57 @@ def build_app_class():
 
         def _format_meta(self) -> str:
             parts = []
-            for key in ("profile", "model", "ctx", "host"):
+            for key in ("mode", "profile", "model", "ctx", "host"):
                 value = self.status_meta.get(key)
                 if value:
                     parts.append(f"{key} {value}")
             return f" {GLYPH_DOT} ".join(parts) if parts else "local agent runtime"
 
         def _composer_meta(self) -> str:
-            """Short right-side chip inside the input shell (model · profile)."""
+            """Short right-side chip inside the input shell (mode · model · profile)."""
             bits = []
+            mode = self.status_meta.get("mode")
             model = self.status_meta.get("model")
             profile = self.status_meta.get("profile")
+            if mode:
+                bits.append(str(mode))
             if model:
                 bits.append(str(model))
             if profile:
                 bits.append(str(profile))
             return f" {GLYPH_DOT} ".join(bits)
 
+        def ui_refresh_runtime_meta(self) -> None:
+            """Refresh model/profile/context chrome after a slash-command change."""
+            try:
+                from agent.core import _boot_status_meta
+
+                self.status_meta = _boot_status_meta(self.session)
+            except Exception:
+                return
+            try:
+                self.query_one(StatusBar).update(
+                    f"{GLYPH_MARK}  selene  {GLYPH_DOT}  {self._format_meta()}"
+                )
+            except Exception:
+                pass
+            try:
+                self.query_one("#composer-meta", Static).update(self._composer_meta())
+            except Exception:
+                pass
+            self.refresh_context_usage()
+
         def _context_budget(self) -> int:
             """Effective num_ctx for the active session."""
             try:
                 from agent.core import effective_session_model_options
+                from agent.model_providers import session_for_model
+                from agent.runtime_config import get_runtime_config
 
-                runtime, _ = effective_session_model_options(self.session or {})
-                return max(1, int(runtime.num_ctx))
+                session = self.session or {}
+                request_session = session_for_model(session, get_runtime_config(session))
+                runtime, options = effective_session_model_options(request_session)
+                return max(1, int(options.get("num_ctx") or runtime.num_ctx))
             except Exception:
                 try:
                     return max(1, int(self.status_meta.get("ctx") or 8192))
@@ -1774,7 +1804,7 @@ def build_app_class():
 
         def ui_content_stream(self, text: str) -> None:
             self._clear_waiting_activity()
-            rendered = Markdown(_render_terminal_markdown(text or " "))
+            rendered = response_markdown(text)
             title = Text()
             title.append(f"{GLYPH_SECTION} ", style="bold #ffffff")
             title.append("response\n", style="bold #f2f2f2")
@@ -1790,7 +1820,7 @@ def build_app_class():
             # Ensure thinking row is collapsed if footer was skipped.
             if self._thinking_widget is not None:
                 self.ui_thinking_end()
-            rendered = Markdown(_render_terminal_markdown(text or " "))
+            rendered = response_markdown(text)
             title = Text()
             title.append(f"{GLYPH_SECTION} ", style="bold #ffffff")
             title.append("response\n", style="bold #f2f2f2")
@@ -2033,22 +2063,7 @@ def build_app_class():
             self._refresh_sessions_view()
 
         def _history_message_text(self, message: dict) -> str:
-            content = message.get("content")
-            if content is None:
-                return ""
-            if isinstance(content, str):
-                return content
-            if isinstance(content, list):
-                parts: list[str] = []
-                for part in content:
-                    if isinstance(part, dict):
-                        text = part.get("text")
-                        if text:
-                            parts.append(str(text))
-                    elif part:
-                        parts.append(str(part))
-                return "\n".join(parts)
-            return str(content)
+            return _display_text(message.get("content"))
 
         def _rebuild_transcript_from_history(self) -> None:
             """Replay loaded history into the chat view (user + assistant only)."""
@@ -2058,7 +2073,11 @@ def build_app_class():
                     continue
                 role = str(message.get("role") or "")
                 text = self._history_message_text(message).strip()
-                if not text:
+                thinking = "\n\n".join(filter(None, (
+                    str(message.get("planning") or "").strip(),
+                    str(message.get("thinking") or "").strip(),
+                )))
+                if not text and not (role == "assistant" and thinking):
                     continue
                 if role == "user":
                     header = Text()
@@ -2067,7 +2086,13 @@ def build_app_class():
                     header.append(text, style="#f2f2f2")
                     self._mount_block(header, "user")
                 elif role == "assistant":
-                    rendered = Markdown(_render_terminal_markdown(text or " "))
+                    if thinking:
+                        self._chat().mount(
+                            ThinkingFold(thinking, _estimate_tokens(thinking))
+                        )
+                    if not text:
+                        continue
+                    rendered = response_markdown(text)
                     title = Text()
                     title.append(f"{GLYPH_SECTION} ", style="bold #ffffff")
                     title.append("response\n", style="bold #f2f2f2")
@@ -2118,6 +2143,7 @@ def build_app_class():
                 self._apply_selene_theme(theme, announce=False)
             except Exception:
                 pass
+            self.ui_refresh_runtime_meta()
 
             self._rebuild_transcript_from_history()
             label = "message" if msg_count == 1 else "messages"

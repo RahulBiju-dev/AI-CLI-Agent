@@ -18,6 +18,16 @@ from agent.web_runtime import (
 
 
 class TestGenerationRegistry(unittest.TestCase):
+    def test_one_client_can_generate_in_different_saved_sessions_concurrently(self):
+        registry = GenerationRegistry()
+
+        first = registry.begin("first.json", "client-one", "generation-one")
+        second = registry.begin("second.json", "client-one", "generation-two")
+
+        self.assertIs(registry.active_for_session("first.json", "client-one"), first)
+        self.assertIs(registry.active_for_session("second.json", "client-one"), second)
+        self.assertEqual(len(registry.active_operations()), 2)
+
     def test_saved_session_rejects_a_second_generation_across_clients(self):
         registry = GenerationRegistry()
         lease = registry.begin("conversation.json", "client-one", "generation-one")
@@ -255,6 +265,474 @@ class TestChatEventTerminalState(unittest.TestCase):
         self.assertEqual(len(terminal), 1)
         self.assertEqual(terminal[0]["state"], "failed")
         self.assertIn("without a completion result", terminal[0]["error"])
+
+    def test_unexpected_generation_failure_becomes_safe_response_text(self):
+        def implementation(*args, **kwargs):
+            del args, kwargs
+            yield {"type": "status", "message": "working"}
+            raise RuntimeError("internal-secret-detail")
+
+        events = self._run_with_implementation(implementation)
+        response = next(
+            event for event in events
+            if event.get("type") == "content_chunk" and event.get("error") is True
+        )
+        terminal = next(event for event in events if event.get("type") == "done")
+
+        self.assertIn("Response interrupted", response["text"])
+        self.assertNotIn("internal-secret-detail", response["text"])
+        self.assertEqual(terminal["state"], "failed")
+
+    def test_provider_failure_is_persisted_as_an_error_response(self):
+        from agent import web
+        from agent.model_providers import MalformedProviderResponse
+        from agent.runtime_config import get_runtime_config
+
+        session = web._session_from_runtime(get_runtime_config())
+        history = []
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            patch.object(web, "_SESSIONS_DIR", temporary),
+            patch.object(
+                web,
+                "_model_chat",
+                side_effect=MalformedProviderResponse(
+                    "Google Gemini returned an unreadable response stream. Try again.",
+                    code="malformed_response",
+                ),
+            ),
+        ):
+            events = list(web._generate_chat_events_impl(
+                "hello",
+                session,
+                history,
+                "Active Session",
+                cancellation_token=CancellationToken(),
+                publish_global=False,
+                client_id="client-one",
+            ))
+
+        response = next(event for event in events if event.get("error") is True)
+        terminal = next(event for event in events if event.get("type") == "done")
+        self.assertIn("Couldn’t complete this response", response["text"])
+        self.assertTrue(history[-1]["error"])
+        self.assertEqual(terminal["state"], "failed")
+
+    def test_openrouter_reasoning_state_is_saved_with_the_assistant_turn(self):
+        from agent import web
+        from agent.runtime_config import get_runtime_config
+
+        reasoning_details = [{
+            "type": "reasoning.encrypted",
+            "data": "opaque-provider-state",
+            "id": "reasoning-1",
+        }]
+        content = SimpleNamespace(
+            message=SimpleNamespace(
+                content="First answer.",
+                thinking="",
+                planning="",
+                tool_calls=[],
+                provider_metadata={},
+            ),
+            prompt_eval_count=0,
+            eval_count=0,
+            done_reason="",
+        )
+        terminal_chunk = SimpleNamespace(
+            message=SimpleNamespace(
+                content="",
+                thinking="",
+                planning="",
+                tool_calls=[],
+                provider_metadata={"reasoning_details": reasoning_details},
+            ),
+            prompt_eval_count=5,
+            eval_count=3,
+            done_reason="stop",
+        )
+        environment = {
+            "OPENROUTER_API_KEY": "secret",
+            "OPENROUTER_MODEL": "nvidia/nemotron-3-ultra-550b-a55b:free",
+        }
+        history = []
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            patch.dict("os.environ", environment, clear=True),
+            patch.object(web, "_SESSIONS_DIR", temporary),
+            patch.object(web, "_model_chat", return_value=iter([content, terminal_chunk])),
+        ):
+            runtime = get_runtime_config()
+            session = {
+                **web._session_from_runtime(runtime),
+                "model_id": "openrouter:default",
+            }
+            events = list(web._generate_chat_events_impl(
+                "hello",
+                session,
+                history,
+                "Active Session",
+                cancellation_token=CancellationToken(),
+                publish_global=False,
+                client_id="client-one",
+            ))
+
+        terminal = next(event for event in events if event.get("type") == "done")
+        self.assertEqual(terminal["state"], "completed")
+        self.assertEqual(
+            history[-1]["provider_metadata"]["reasoning_details"],
+            reasoning_details,
+        )
+
+    def test_external_reasoning_remains_thinking_before_tool_use(self):
+        from agent import web
+        from agent.runtime_config import get_runtime_config
+
+        reasoning = SimpleNamespace(
+            message=SimpleNamespace(
+                content="",
+                thinking="Inspect the repository, then edit the matching files.",
+                planning="",
+                tool_calls=[],
+            ),
+            prompt_eval_count=0,
+            eval_count=0,
+            done_reason="",
+        )
+        tool_call = SimpleNamespace(
+            function=SimpleNamespace(name="get_current_datetime", arguments={}),
+            id="provider-call-1",
+            provider_metadata={},
+        )
+        tool_chunk = SimpleNamespace(
+            message=SimpleNamespace(
+                content="", thinking="", planning="", tool_calls=[tool_call]
+            ),
+            prompt_eval_count=0,
+            eval_count=0,
+            done_reason="tool_calls",
+        )
+        environment = {
+            "GEMINI_API_KEY": "google-secret",
+            "GEMINI_MODELS": "gemini-3.1-flash-lite",
+        }
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            patch.dict("os.environ", environment, clear=True),
+            patch.object(web, "_SESSIONS_DIR", temporary),
+            patch.object(web, "_model_chat", return_value=iter([reasoning, tool_chunk])),
+        ):
+            runtime = get_runtime_config()
+            session = {
+                **web._session_from_runtime(runtime),
+                "model_id": "gemini:gemini-3.1-flash-lite",
+            }
+            generator = web._generate_chat_events_impl(
+                "what time is it?",
+                session,
+                [],
+                "Active Session",
+                cancellation_token=CancellationToken(),
+                publish_global=False,
+                client_id="client-one",
+            )
+            events = []
+            try:
+                for event in generator:
+                    events.append(event)
+                    if event.get("type") == "thinking_end":
+                        break
+            finally:
+                generator.close()
+
+        event_types = [event.get("type") for event in events]
+        self.assertIn("thinking_start", event_types)
+        thinking = "".join(
+            event.get("text", "")
+            for event in events
+            if event.get("type") == "thinking_chunk"
+        )
+        self.assertIn("Inspect the repository", thinking)
+        self.assertFalse(any(
+            str(event_type).startswith("planning") for event_type in event_types
+        ))
+
+    def test_provider_chunk_keeps_thinking_separate_from_response_content(self):
+        from agent import web
+        from agent.runtime_config import get_runtime_config
+
+        combined = SimpleNamespace(
+            message=SimpleNamespace(
+                content="The final answer.",
+                thinking="Check the evidence first.",
+                planning="",
+                tool_calls=[],
+                provider_metadata={},
+            ),
+            prompt_eval_count=4,
+            eval_count=3,
+            done_reason="stop",
+        )
+        environment = {
+            "GEMINI_API_KEY": "google-secret",
+            "GEMINI_MODELS": "gemini-3.5-flash",
+        }
+        history = []
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            patch.dict("os.environ", environment, clear=True),
+            patch.object(web, "_SESSIONS_DIR", temporary),
+            patch.object(web, "_model_chat", return_value=iter([combined])),
+        ):
+            runtime = get_runtime_config()
+            session = {
+                **web._session_from_runtime(runtime),
+                "model_id": "gemini:gemini-3.5-flash",
+            }
+            events = list(web._generate_chat_events_impl(
+                "answer carefully",
+                session,
+                history,
+                "Active Session",
+                cancellation_token=CancellationToken(),
+                publish_global=False,
+                client_id="client-one",
+            ))
+
+        thought_text = "".join(
+            event.get("text", "")
+            for event in events
+            if event.get("type") == "thinking_chunk"
+        )
+        response_text = "".join(
+            event.get("text", "")
+            for event in events
+            if event.get("type") == "content_chunk"
+        )
+        self.assertEqual(thought_text, "Check the evidence first.")
+        self.assertEqual(response_text, "The final answer.")
+        self.assertEqual(history[-1]["thinking"], "Check the evidence first.")
+        self.assertEqual(history[-1]["content"], "The final answer.")
+
+    def test_model_error_switches_to_gemma_fallback_and_continues(self):
+        from agent import web
+        from agent.model_providers import ProviderNetworkError
+        from agent.runtime_config import get_runtime_config
+
+        completed = SimpleNamespace(
+            message=SimpleNamespace(
+                content="Recovered answer.",
+                thinking="",
+                tool_calls=[],
+                provider_metadata={},
+            ),
+            prompt_eval_count=4,
+            eval_count=3,
+            done_reason="stop",
+        )
+        environment = {
+            "GEMINI_API_KEY": "google-secret",
+            "GEMINI_MODELS": "gemini-3.5-flash,gemma-4-31b-it",
+        }
+        history = []
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            patch.dict("os.environ", environment, clear=True),
+            patch.object(web, "_SESSIONS_DIR", temporary),
+            patch.object(
+                web,
+                "_model_chat",
+                side_effect=[
+                    ProviderNetworkError("Primary provider failed.", code="network_failure"),
+                    iter([completed]),
+                ],
+            ) as model_chat,
+        ):
+            runtime = get_runtime_config()
+            session = {
+                **web._session_from_runtime(runtime),
+                "model_id": "gemini:gemini-3.5-flash",
+            }
+            events = list(web._generate_chat_events_impl(
+                "answer carefully",
+                session,
+                history,
+                "Active Session",
+                cancellation_token=CancellationToken(),
+                publish_global=False,
+                client_id="client-one",
+            ))
+
+        fallback = next(event for event in events if event.get("type") == "model_fallback")
+        terminal = next(event for event in events if event.get("type") == "done")
+        self.assertEqual(fallback["model"]["id"], "gemini:gemma-4-31b-it")
+        self.assertIn("continuing automatically", fallback["message"])
+        self.assertEqual(session["model_id"], "gemini:gemma-4-31b-it")
+        self.assertEqual(history[-1]["content"], "Recovered answer.")
+        self.assertEqual(terminal["state"], "completed")
+        chat_calls = [
+            call for call in model_chat.call_args_list
+            if call.kwargs.get("kind") == web.OperationKind.CHAT
+        ]
+        self.assertEqual(len(chat_calls), 2)
+
+    def test_failed_fallback_error_explains_automatic_retry(self):
+        from agent import web
+        from agent.model_providers import ProviderNetworkError
+        from agent.runtime_config import get_runtime_config
+
+        environment = {
+            "GEMINI_API_KEY": "google-secret",
+            "GEMINI_MODELS": "gemini-3.5-flash,gemma-4-31b-it",
+        }
+        history = []
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            patch.dict("os.environ", environment, clear=True),
+            patch.object(web, "_SESSIONS_DIR", temporary),
+            patch.object(
+                web,
+                "_model_chat",
+                side_effect=[
+                    ProviderNetworkError("Primary failed.", code="network_failure"),
+                    ProviderNetworkError("Fallback failed.", code="network_failure"),
+                ],
+            ),
+        ):
+            runtime = get_runtime_config()
+            session = {
+                **web._session_from_runtime(runtime),
+                "model_id": "gemini:gemini-3.5-flash",
+            }
+            events = list(web._generate_chat_events_impl(
+                "answer carefully",
+                session,
+                history,
+                "Active Session",
+                cancellation_token=CancellationToken(),
+                publish_global=False,
+                client_id="client-one",
+            ))
+
+        terminal = next(event for event in events if event.get("type") == "done")
+        self.assertEqual(terminal["state"], "failed")
+        self.assertIn("automatically switched", terminal["error"])
+        self.assertIn("fallback model also failed", terminal["error"])
+        self.assertEqual(session["model_id"], "gemini:gemma-4-31b-it")
+
+    def test_midstream_model_error_preserves_partial_text_and_continues(self):
+        from agent import web
+        from agent.model_providers import ProviderNetworkError
+        from agent.runtime_config import get_runtime_config
+
+        partial = SimpleNamespace(
+            message=SimpleNamespace(
+                content="Partial answer. ", thinking="", tool_calls=[], provider_metadata={}
+            ),
+            prompt_eval_count=2,
+            eval_count=2,
+            done_reason="",
+        )
+        completed = SimpleNamespace(
+            message=SimpleNamespace(
+                content="Recovered continuation.",
+                thinking="",
+                tool_calls=[],
+                provider_metadata={},
+            ),
+            prompt_eval_count=3,
+            eval_count=3,
+            done_reason="stop",
+        )
+
+        def failing_stream():
+            yield partial
+            raise ProviderNetworkError("Stream disconnected.", code="network_failure")
+
+        environment = {
+            "GEMINI_API_KEY": "google-secret",
+            "GEMINI_MODELS": "gemini-3.5-flash,gemma-4-31b-it",
+        }
+        history = []
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            patch.dict("os.environ", environment, clear=True),
+            patch.object(web, "_SESSIONS_DIR", temporary),
+            patch.object(
+                web,
+                "_model_chat",
+                side_effect=[failing_stream(), iter([completed])],
+            ),
+        ):
+            runtime = get_runtime_config()
+            session = {
+                **web._session_from_runtime(runtime),
+                "model_id": "gemini:gemini-3.5-flash",
+            }
+            events = list(web._generate_chat_events_impl(
+                "answer carefully",
+                session,
+                history,
+                "Active Session",
+                cancellation_token=CancellationToken(),
+                publish_global=False,
+                client_id="client-one",
+            ))
+
+        visible = "".join(
+            event.get("text", "")
+            for event in events
+            if event.get("type") == "content_chunk"
+        )
+        self.assertEqual(visible, "Partial answer. Recovered continuation.")
+        self.assertEqual(history[-1]["content"], visible)
+        self.assertEqual(session["model_id"], "gemini:gemma-4-31b-it")
+        self.assertEqual(
+            sum(event.get("type") == "model_fallback" for event in events), 1
+        )
+
+    def test_unconfigured_fallback_is_reported_without_retry_loop(self):
+        from agent import web
+        from agent.model_providers import ProviderNetworkError
+        from agent.runtime_config import get_runtime_config
+
+        environment = {
+            "GEMINI_API_KEY": "google-secret",
+            "GEMINI_MODELS": "gemini-3.5-flash",
+        }
+        history = []
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            patch.dict("os.environ", environment, clear=True),
+            patch.object(web, "_SESSIONS_DIR", temporary),
+            patch.object(
+                web,
+                "_model_chat",
+                side_effect=ProviderNetworkError(
+                    "Primary failed.", code="network_failure"
+                ),
+            ) as model_chat,
+        ):
+            runtime = get_runtime_config()
+            session = {
+                **web._session_from_runtime(runtime),
+                "model_id": "gemini:gemini-3.5-flash",
+            }
+            events = list(web._generate_chat_events_impl(
+                "answer carefully",
+                session,
+                history,
+                "Active Session",
+                cancellation_token=CancellationToken(),
+                publish_global=False,
+                client_id="client-one",
+            ))
+
+        terminal = next(event for event in events if event.get("type") == "done")
+        self.assertEqual(terminal["state"], "failed")
+        self.assertIn("tried to switch automatically", terminal["error"])
+        self.assertIn("fallback could not start", terminal["error"])
+        self.assertEqual(model_chat.call_count, 1)
 
     def test_cancelled_implementation_becomes_cancelled_terminal(self):
         token = CancellationToken()

@@ -49,6 +49,29 @@ except ImportError:
 from rich.live import Live
 
 from agent.ollama_runtime import OllamaRuntimeError, OllamaService, OperationKind
+from agent.model_providers import (
+    LOCAL_MODEL_ID,
+    ModelProviderError,
+    available_models,
+    chat_with_model,
+    normalize_provider_text,
+    resolve_model,
+    resolve_error_fallback,
+    session_for_model,
+)
+from agent.modes import (
+    AGENT_MODE_DEEP_RESEARCH,
+    AGENT_MODE_LABELS,
+    AGENT_MODE_NORMAL,
+    AGENT_MODE_SLASH_COMMANDS,
+    AGENT_MODE_ULTRA,
+    DEEP_RESEARCH_TERMINAL_PROMPT,
+    ULTRA_TERMINAL_PROMPT,
+    force_hard_web_search_schema,
+    force_high_tool_difficulty,
+    normalize_agent_mode,
+    tool_call_round_signature,
+)
 from agent.persistence import atomic_write_json, atomic_write_text
 from agent.platform_runtime import get_runtime_paths, resource_path
 from agent.runtime_config import RuntimeConfigurationError, RuntimeConfig, get_runtime_config
@@ -699,13 +722,18 @@ def _compact_tool_continuation_tail(messages: list[dict]) -> list[dict]:
     compacted: list[dict] = []
     for message in messages:
         if message.get("role") == "assistant" and message.get("tool_calls"):
-            compacted.append({
+            assistant = {
                 "role": "assistant",
                 # Thinking/content from the pre-tool response is no longer useful
                 # once the structured call and its result are present.
                 "content": "",
                 "tool_calls": message.get("tool_calls", []),
-            })
+            }
+            # Provider continuation blocks are protocol state, not display-only
+            # thinking, and reasoning models require them after tool calls.
+            if message.get("provider_metadata"):
+                assistant["provider_metadata"] = message["provider_metadata"]
+            compacted.append(assistant)
         else:
             item = dict(message)
             if (
@@ -1169,15 +1197,64 @@ def _check_and_compact_history(history: list[dict], session: dict) -> None:
     session["_is_compacting"] = True
     _compact_history_bg(history, session, start_idx, end_idx)
 
+
+def _activate_terminal_error_fallback(
+    request_session: dict,
+    persistent_session: dict | None,
+) -> str:
+    """Switch CLI/TUI state to the configured one-shot fallback model."""
+    runtime = get_runtime_config(request_session)
+    fallback = resolve_error_fallback(request_session.get("model_id"), runtime)
+    if fallback is None:
+        raise ModelProviderError(
+            "Gemma 4 31B IT is already active.",
+            code="fallback_failed",
+        )
+    request_session["model_id"] = fallback.id
+    refreshed = session_for_model(request_session, runtime)
+    request_session.clear()
+    request_session.update(refreshed)
+    if persistent_session is not None:
+        persistent_session["model_id"] = fallback.id
+    print_warn(
+        "Model error · switched to Gemma 4 31B IT and continuing automatically"
+    )
+    _refresh_tui_runtime_meta()
+    if not display_is_tui():
+        _console.print()
+    return fallback.display_name
+
+
+def _terminal_model_error(
+    exc: Exception,
+    *,
+    fallback_attempted: bool,
+    fallback_unavailable: str = "",
+) -> str:
+    if fallback_attempted:
+        return (
+            "Model request failed. Selene automatically switched to Gemma 4 31B IT "
+            f"and continued, but the fallback model also failed: {exc}"
+        )
+    if fallback_unavailable:
+        return (
+            f"Model request failed: {exc}. Selene tried to switch automatically to "
+            f"Gemma 4 31B IT, but the fallback could not start: {fallback_unavailable}"
+        )
+    return f"Model request failed: {exc}"
+
 def _stream_thinking_response(
     model: str,
     messages: list[dict],
+    session: dict | None = None,
     tools: list[dict] | None = None,
     options: dict | None = None,
     verbose: bool = False,
     think: bool = True,
     fmt: str | None = None,
     extra_reserved_tokens: int = 0,
+    persistent_session: dict | None = None,
+    _fallback_attempted: bool = False,
 ) -> dict:
     """Stream a response from the Ollama model, displaying thinking progress and final answer.
     
@@ -1199,17 +1276,24 @@ def _stream_thinking_response(
     """
     spinner = _Spinner("Thinking").start()
     t_start = time.monotonic()
-    runtime_tools = tool_schemas_for_model(messages, {"options": options or {}}, tools)
+    session_data = dict(session or {})
+    session_data.setdefault("model_id", LOCAL_MODEL_ID)
+    if options is not None:
+        session_data["options"] = dict(options)
+    runtime_tools = tool_schemas_for_model(messages, session_data, tools)
 
     thinking_buf = ""
     content_buf = ""
+    response_provider_metadata: dict = {}
     done_reason = ""
     eval_tokens = 0
     in_thinking = False
     thinking_displayed = False
 
     try:
-        runtime_config, effective_options = effective_model_options(options)
+        base_runtime = get_runtime_config(session_data)
+        request_session = session_for_model(session_data, base_runtime)
+        runtime_config, effective_options = effective_session_model_options(request_session)
         guarded_options = guarded_options_for_call(
             messages,
             effective_options,
@@ -1239,15 +1323,45 @@ def _stream_thinking_response(
 
     owner = f"cli:{threading.get_ident()}:{time.monotonic_ns()}"
     try:
-        stream = _OLLAMA_SERVICE.chat(
+        stream = chat_with_model(
+            request_session,
+            runtime_config,
+            ollama_service_factory=lambda config: OllamaService(config),
             kind=OperationKind.CHAT,
             owner=owner,
             operation_timeout=runtime_config.chat_timeout_seconds,
             **kwargs,
         )
-    except OllamaRuntimeError as exc:
+    except (OllamaRuntimeError, ModelProviderError) as exc:
         spinner.stop()
-        message = f"Ollama chat failed before streaming: {exc}"
+        fallback_unavailable = ""
+        if not _fallback_attempted:
+            try:
+                _activate_terminal_error_fallback(request_session, persistent_session)
+            except (ModelProviderError, RuntimeConfigurationError) as fallback_exc:
+                fallback_unavailable = str(fallback_exc)
+            else:
+                if isinstance(session, dict):
+                    session["model_id"] = request_session["model_id"]
+                    session["options"] = dict(request_session.get("options") or {})
+                return _stream_thinking_response(
+                    model=model,
+                    messages=messages,
+                    session=request_session,
+                    tools=tools,
+                    options=None,
+                    verbose=verbose,
+                    think=think,
+                    fmt=fmt,
+                    extra_reserved_tokens=extra_reserved_tokens,
+                    persistent_session=persistent_session,
+                    _fallback_attempted=True,
+                )
+        message = _terminal_model_error(
+            exc,
+            fallback_attempted=_fallback_attempted,
+            fallback_unavailable=fallback_unavailable,
+        )
         print_error(message)
         _console.print()
         return {"role": "assistant", "content": message}
@@ -1295,48 +1409,31 @@ def _stream_thinking_response(
                     continue
                 if isinstance(msg, dict):
                     class _MsgView:
-                        __slots__ = ("content", "thinking", "tool_calls")
+                        __slots__ = (
+                            "content",
+                            "thinking",
+                            "tool_calls",
+                            "provider_metadata",
+                        )
 
                         def __init__(self, payload: dict) -> None:
                             self.content = payload.get("content") or ""
                             self.thinking = payload.get("thinking") or ""
                             raw_calls = payload.get("tool_calls") or []
                             self.tool_calls = raw_calls
+                            self.provider_metadata = payload.get("provider_metadata") or {}
 
                     msg = _MsgView(msg)
 
-                tool_calls = getattr(msg, "tool_calls", None) or None
-                # ── Tool calls come through as non-streamed chunks ────────
-                if tool_calls:
-                    spinner.stop()
-                    assistant_msg = {"role": "assistant", "content": content_buf}
-                    if thinking_buf:
-                        assistant_msg["thinking"] = thinking_buf
-                    normalized_calls = []
-                    for tc in tool_calls:
-                        try:
-                            if isinstance(tc, dict):
-                                function = tc.get("function") or {}
-                                name = function.get("name") if isinstance(function, dict) else None
-                                arguments = function.get("arguments") if isinstance(function, dict) else {}
-                            else:
-                                function = getattr(tc, "function", None)
-                                name = getattr(function, "name", None)
-                                arguments = getattr(function, "arguments", {})
-                            if not name:
-                                continue
-                            normalized_calls.append(
-                                {"function": {"name": name, "arguments": arguments or {}}}
-                            )
-                        except Exception:
-                            continue
-                    if normalized_calls:
-                        assistant_msg["tool_calls"] = normalized_calls
-                        return assistant_msg
-                    continue
+                chunk_provider_metadata = getattr(msg, "provider_metadata", None)
+                if isinstance(chunk_provider_metadata, dict) and chunk_provider_metadata:
+                    response_provider_metadata = dict(chunk_provider_metadata)
 
                 # ── Thinking tokens ───────────────────────────────────────
-                thinking_chunk = getattr(msg, "thinking", None) or ""
+                thinking_chunk = "\n\n".join(filter(None, (
+                    normalize_provider_text(getattr(msg, "planning", None)),
+                    normalize_provider_text(getattr(msg, "thinking", None)),
+                )))
                 if thinking_chunk:
                     if not in_thinking:
                         in_thinking = True
@@ -1346,10 +1443,9 @@ def _stream_thinking_response(
 
                     thinking_buf += str(thinking_chunk)
                     print_thinking_delta(str(thinking_chunk))
-                    continue
 
                 # ── Content tokens ────────────────────────────────────────
-                content_chunk = getattr(msg, "content", None) or ""
+                content_chunk = normalize_provider_text(getattr(msg, "content", None))
                 if content_chunk:
                     if in_thinking:
                         in_thinking = False
@@ -1383,32 +1479,104 @@ def _stream_thinking_response(
                         if now - _last_render >= _RENDER_INTERVAL:
                             live.update(assistant_stream_panel(content_buf), refresh=True)
                             _last_render = now
-            except Exception as exc:
-                spinner.stop()
-                message = (
-                    "Ollama returned an unexpected stream chunk shape; "
-                    f"generation stopped safely: {exc}"
-                )
-                print_error(message)
-                _console.print()
-                if not content_buf:
-                    content_buf = message
-                break
 
-    except OllamaRuntimeError as exc:
-        spinner.stop()
-        message = f"Ollama chat failed while streaming: {exc}"
-        print_error(message)
-        _console.print()
-        if not content_buf:
-            content_buf = message
+                tool_calls = getattr(msg, "tool_calls", None) or None
+                # Providers such as Gemini can combine thought, answer, and
+                # function-call parts in one candidate. Render and retain every
+                # text channel before returning the tool-call message.
+                if tool_calls:
+                    spinner.stop()
+                    assistant_msg = {"role": "assistant", "content": content_buf}
+                    if thinking_buf:
+                        assistant_msg["thinking"] = thinking_buf
+                    if response_provider_metadata:
+                        assistant_msg["provider_metadata"] = response_provider_metadata
+                    normalized_calls = []
+                    for tc in tool_calls:
+                        try:
+                            if isinstance(tc, dict):
+                                function = tc.get("function") or {}
+                                name = function.get("name") if isinstance(function, dict) else None
+                                arguments = function.get("arguments") if isinstance(function, dict) else {}
+                            else:
+                                function = getattr(tc, "function", None)
+                                name = getattr(function, "name", None)
+                                arguments = getattr(function, "arguments", {})
+                            if not name:
+                                continue
+                            normalized_call = {
+                                "function": {"name": name, "arguments": arguments or {}}
+                            }
+                            call_id = (
+                                tc.get("id") if isinstance(tc, dict)
+                                else getattr(tc, "id", "")
+                            )
+                            provider_metadata = (
+                                tc.get("provider_metadata") if isinstance(tc, dict)
+                                else getattr(tc, "provider_metadata", None)
+                            )
+                            if call_id:
+                                normalized_call["id"] = call_id
+                            if provider_metadata:
+                                normalized_call["provider_metadata"] = dict(provider_metadata)
+                            normalized_calls.append(normalized_call)
+                        except Exception:
+                            continue
+                    if normalized_calls:
+                        assistant_msg["tool_calls"] = normalized_calls
+                        return assistant_msg
+            except Exception as exc:
+                raise ModelProviderError(
+                    "The model returned an unexpected stream chunk shape; "
+                    f"generation stopped safely: {exc}",
+                    code="malformed_response",
+                ) from exc
+
     except Exception as exc:
         spinner.stop()
-        message = f"Ollama stream ended with an unexpected error: {exc}"
+        if in_thinking:
+            in_thinking = False
+            print_thinking_footer("interrupted")
+        if live:
+            live.stop()
+            live = None
+        close = getattr(stream, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                pass
+        fallback_unavailable = ""
+        if not _fallback_attempted:
+            try:
+                _activate_terminal_error_fallback(request_session, persistent_session)
+            except (ModelProviderError, RuntimeConfigurationError) as fallback_exc:
+                fallback_unavailable = str(fallback_exc)
+            else:
+                if isinstance(session, dict):
+                    session["model_id"] = request_session["model_id"]
+                    session["options"] = dict(request_session.get("options") or {})
+                return _stream_thinking_response(
+                    model=model,
+                    messages=messages,
+                    session=request_session,
+                    tools=tools,
+                    options=None,
+                    verbose=verbose,
+                    think=think,
+                    fmt=fmt,
+                    extra_reserved_tokens=extra_reserved_tokens,
+                    persistent_session=persistent_session,
+                    _fallback_attempted=True,
+                )
+        message = _terminal_model_error(
+            exc,
+            fallback_attempted=_fallback_attempted,
+            fallback_unavailable=fallback_unavailable,
+        )
         print_error(message)
         _console.print()
-        if not content_buf:
-            content_buf = message
+        content_buf = f"{content_buf}\n\n---\n\n{message}" if content_buf else message
     finally:
         close = getattr(stream, "close", None)
         if callable(close):
@@ -1455,6 +1623,8 @@ def _stream_thinking_response(
     assistant_msg = {"role": "assistant", "content": content_buf}
     if thinking_buf:
         assistant_msg["thinking"] = thinking_buf
+    if response_provider_metadata:
+        assistant_msg["provider_metadata"] = response_provider_metadata
     assistant_msg["_done_reason"] = done_reason
     assistant_msg["_eval_count"] = eval_tokens
     assistant_msg["_num_predict"] = int(guarded_options.get("num_predict", 0))
@@ -1469,17 +1639,20 @@ def _stream_complete_response(
     user_input: str,
     tools: list[dict] | None = None,
     extra_reserved_tokens: int = 0,
+    persistent_session: dict | None = None,
 ) -> dict:
     """Stream one logical answer across bounded Ollama output-limit stops."""
     response = _stream_thinking_response(
         model=model,
         messages=messages,
+        session=session,
         tools=tools,
         options=effective_session_model_options(session)[1],
         verbose=session.get("verbose", True),
         think=session.get("think", True),
         fmt=session.get("format") or None,
         extra_reserved_tokens=extra_reserved_tokens,
+        persistent_session=persistent_session,
     )
     combined_content = str(response.get("content") or "")
     combined_thinking = str(response.get("thinking") or "")
@@ -1512,11 +1685,13 @@ def _stream_complete_response(
         response = _stream_thinking_response(
             model=model,
             messages=continuation_messages,
+            session=session,
             tools=None,
             options=effective_session_model_options(session)[1],
             verbose=session.get("verbose", True),
             think=False,
             fmt=session.get("format") or None,
+            persistent_session=persistent_session,
         )
         next_content = str(response.get("content") or "")
         if not next_content:
@@ -1541,6 +1716,8 @@ def _stream_complete_response(
     combined = {"role": "assistant", "content": combined_content}
     if combined_thinking:
         combined["thinking"] = combined_thinking
+    if response.get("provider_metadata"):
+        combined["provider_metadata"] = response["provider_metadata"]
     if response.get("tool_calls"):
         combined["tool_calls"] = response["tool_calls"]
     return combined
@@ -1904,6 +2081,12 @@ _PROFILE_SPECS: tuple[tuple[str, str], ...] = (
 )
 _PROFILE_NAMES = frozenset(name for name, _ in _PROFILE_SPECS)
 
+
+def _configured_model_rows(session: dict | None = None) -> list[dict]:
+    """Return client-safe metadata for models configured in this process."""
+    runtime = get_runtime_config(session or {})
+    return available_models(runtime)
+
 # Common model knobs surfaced in Tab autocomplete (full list still via /set parameter).
 _PARAMETER_SPECS: tuple[tuple[str, str], ...] = (
     ("temperature", "Sampling randomness  ·  e.g. 0.25"),
@@ -1930,10 +2113,25 @@ def _build_cli_slash_specs() -> tuple[tuple[str, str], ...]:
         # Profiles — first-class + /set form for discoverability.
         ("/profile", "Show or set profile  ·  /profile <name>"),
         ("/set profile", "Set profile  ·  manual|auto|low-vram|balanced"),
+        ("/model", "Show or select model  ·  /model <id|number>"),
+        ("/set model", "Select configured model  ·  /set model <id|number>"),
+        ("/fast", "Mode · Fast response"),
+        ("/ultrathink", "Mode · Ultra Thinking"),
+        ("/deepresearch", "Mode · Deep Research"),
     ]
     for name, desc in _PROFILE_SPECS:
         specs.append((f"/profile {name}", desc))
         specs.append((f"/set profile {name}", desc))
+    try:
+        for model in _configured_model_rows():
+            model_id = str(model.get("id") or "")
+            if not model_id:
+                continue
+            description = f"{model.get('display_name')} · {model.get('provider')}"
+            specs.append((f"/model {model_id}", description))
+            specs.append((f"/set model {model_id}", description))
+    except Exception:
+        pass
 
     # TUI themes (default first via tui_themes.theme_specs_for_slash).
     try:
@@ -2000,6 +2198,11 @@ _COMMAND_HELP_ENTRIES: tuple[tuple[str, str], ...] = (
     ("/load [name|index]", "Load a session (lists if no arg)"),
     ("/profile [name]", "Show or set profile (manual · auto · low-vram · balanced)"),
     ("/set profile <name>", "Same as /profile <name>"),
+    ("/model [id|number]", "Show or select a configured model"),
+    ("/set model <id|number>", "Same as /model <id|number>"),
+    ("/fast", "Switch this conversation to Fast mode"),
+    ("/ultrathink", "Switch this conversation to Ultra Thinking mode"),
+    ("/deepresearch", "Switch this conversation to Deep Research mode"),
     ("/theme [place]", "TUI colors (oslo · tokyo · rome · amazon · …)"),
     ("/set parameter <name> <val>", "Model option (temperature, num_ctx, …)"),
     ("/set system \"…\"|default", "Override or reset system prompt"),
@@ -2039,6 +2242,103 @@ def _print_profile_catalog() -> None:
     for name, description in _PROFILE_SPECS:
         _console.print(f"    [bold]{name:<10}[/]  [dim]{description}[/]")
     print_info("Usage · /profile <name>  or  /set profile <name>")
+    _console.print()
+
+
+def _refresh_tui_runtime_meta() -> None:
+    """Ask the active TUI to refresh model/profile/context status chips."""
+    try:
+        from agent.terminal import get_display_sink
+
+        sink = get_display_sink()
+        if sink is not None and hasattr(sink, "refresh_runtime_meta"):
+            sink.refresh_runtime_meta()
+    except Exception:
+        pass
+
+
+def _apply_agent_mode(session: dict, mode: str) -> None:
+    """Persist a known conversation mode and refresh terminal mode chrome."""
+    normalized = normalize_agent_mode(mode)
+    session["agent_mode"] = normalized
+    print_ok(f"Mode = {AGENT_MODE_LABELS[normalized]}")
+    _refresh_tui_runtime_meta()
+    _console.print()
+
+
+def _print_model_catalog(session: dict) -> None:
+    rows = _configured_model_rows(session)
+    current_id = str(session.get("model_id") or LOCAL_MODEL_ID)
+    print_info("Configured models")
+    for index, model in enumerate(rows, 1):
+        model_id = str(model.get("id") or "")
+        marker = "  ← active" if model_id == current_id else ""
+        _console.print(
+            f"    [bold]{index:<2}[/] [cyan]{model_id}[/]  "
+            f"[dim]{model.get('display_name')} · {model.get('provider')}{marker}[/]"
+        )
+    print_info("Usage · /model <id|number>  or  /set model <id|number>")
+    _console.print()
+
+
+def _apply_model(session: dict, requested: str) -> None:
+    """Resolve and persist one configured provider model for CLI/TUI chat."""
+    query = str(requested or "").strip()
+    rows = _configured_model_rows(session)
+    if not query:
+        _print_model_catalog(session)
+        return
+
+    selected: dict | None = None
+    if query.isdigit():
+        index = int(query) - 1
+        if 0 <= index < len(rows):
+            selected = rows[index]
+    folded = query.casefold()
+    if selected is None:
+        selected = next(
+            (
+                model for model in rows
+                if folded in {
+                    str(model.get("id") or "").casefold(),
+                    str(model.get("display_name") or "").casefold(),
+                }
+            ),
+            None,
+        )
+    if selected is None:
+        matches = [
+            model for model in rows
+            if folded in str(model.get("id") or "").casefold()
+            or folded in str(model.get("display_name") or "").casefold()
+        ]
+        if len(matches) == 1:
+            selected = matches[0]
+
+    if selected is None:
+        print_error(f"Unknown or ambiguous model · {query}")
+        _print_model_catalog(session)
+        return
+
+    model_id = str(selected.get("id") or "")
+    try:
+        runtime = get_runtime_config(session)
+        definition = resolve_model(model_id, runtime)
+    except (RuntimeConfigurationError, ModelProviderError) as exc:
+        print_error(f"Model could not be selected · {exc}")
+        _console.print()
+        return
+
+    session["model_id"] = definition.id
+    print_ok(
+        f"Model · {definition.display_name}",
+        detail=f"{definition.provider} · {definition.id}",
+    )
+    if definition.id == LOCAL_MODEL_ID:
+        print_info("Local runtime profile settings are active")
+    elif definition.context_window:
+        print_info(f"API context maximum · {definition.context_window:,} tokens")
+    _refresh_tui_runtime_meta()
     _console.print()
 
 
@@ -2200,6 +2500,7 @@ def _apply_runtime_profile(session: dict, profile: str) -> None:
     )
     for warning in runtime.warnings:
         print_warn(warning)
+    _refresh_tui_runtime_meta()
     _console.print()
 
 
@@ -2218,7 +2519,7 @@ def _handle_set(args: str, session: dict, history: list[dict]) -> None:
     if not parts:
         print_info("Usage · /set <subcommand> [args]")
         print_info(
-            "Subcommands · profile · parameter · system · history · nohistory · "
+            "Subcommands · model · profile · parameter · system · history · nohistory · "
             "wordwrap · nowordwrap · format · noformat · verbose · quiet · think · nothink"
         )
         print_info("Tip · type /help or start with /set and Tab")
@@ -2320,6 +2621,10 @@ def _handle_set(args: str, session: dict, history: list[dict]) -> None:
         _apply_runtime_profile(session, rest)
         return
 
+    if sub == "model":
+        _apply_model(session, rest)
+        return
+
     # ── /set parameter <name> <value> ─────────────────────────────────
     if sub == "parameter":
         param_parts = rest.strip().split(None, 1)
@@ -2363,7 +2668,7 @@ def _handle_set(args: str, session: dict, history: list[dict]) -> None:
 
     print_error(
         f"Unknown /set subcommand · {sub}",
-        detail="profile · parameter · system · history · format · verbose · think · …",
+        detail="model · profile · parameter · system · history · format · verbose · think · …",
     )
     print_info("Tip · /set  or  /help  for the full list")
     _console.print()
@@ -2385,8 +2690,9 @@ def _handle_show(args: str, session: dict, history: list[dict]) -> None:
     if sub == "parameters":
         opts = session.get("options", {})
         try:
-            runtime, effective = effective_session_model_options(session)
-        except RuntimeConfigurationError as exc:
+            request_session = session_for_model(session, get_runtime_config(session))
+            runtime, effective = effective_session_model_options(request_session)
+        except (RuntimeConfigurationError, ModelProviderError) as exc:
             _console.print(f"[red]Invalid session configuration: {exc}[/]\n")
             return
         _console.print()
@@ -2432,8 +2738,23 @@ def _handle_show(args: str, session: dict, history: list[dict]) -> None:
         return
 
     if sub in ("model", "info"):
+        runtime = get_runtime_config(session)
         try:
-            info = _OLLAMA_SERVICE.show_model(MODEL_NAME, timeout=10)
+            selected = resolve_model(session.get("model_id"), runtime)
+        except ModelProviderError as exc:
+            print_error(f"Model unavailable · {exc}")
+            _console.print()
+            return
+        if selected.id != LOCAL_MODEL_ID:
+            print_info(f"Model · {selected.display_name}")
+            print_info(f"Provider · {selected.provider}")
+            print_info(f"ID · {selected.id}")
+            if selected.context_window:
+                print_info(f"Context maximum · {selected.context_window:,}")
+            _console.print()
+            return
+        try:
+            info = _OLLAMA_SERVICE.show_model(selected.model, timeout=10)
             if hasattr(info, "model_dump"):
                 info = info.model_dump()
             model_info = (
@@ -2443,13 +2764,13 @@ def _handle_show(args: str, session: dict, history: list[dict]) -> None:
             family = model_info.get("general.architecture", "unknown")
             params = model_info.get("general.parameter_count", "unknown")
             _console.print()
-            print_info(f"Model · {MODEL_NAME}")
+            print_info(f"Model · {selected.display_name}")
             print_info(f"Family · {family}")
             print_info(f"Params · {params}")
             _console.print()
         except OllamaRuntimeError:
             _console.print()
-            print_info(f"Model · {MODEL_NAME}")
+            print_info(f"Model · {selected.display_name}")
             _console.print()
         return
 
@@ -2582,6 +2903,14 @@ def apply_saved_session_file(
         }
     )
     warnings = tuple(dict.fromkeys((*warnings, *restored_runtime.warnings)))
+    restored_model_id = resolve_model(
+        saved_session.get("model_id") or LOCAL_MODEL_ID,
+        restored_runtime,
+    ).id
+    try:
+        restored_agent_mode = normalize_agent_mode(saved_session.get("agent_mode"))
+    except ValueError as exc:
+        raise RuntimeConfigurationError(str(exc)) from exc
 
     # Validate before replacing live state so a malformed restore cannot erase
     # the current conversation.
@@ -2595,6 +2924,8 @@ def apply_saved_session_file(
     session["format"] = saved_session.get("format", "")
     session["think"] = saved_session.get("think", True)
     session["runtime_profile"] = runtime_profile
+    session["model_id"] = restored_model_id
+    session["agent_mode"] = restored_agent_mode
     session["tui_theme"] = saved_session.get("tui_theme", "oslo")
 
     display_name = os.path.basename(path).replace(".json", "")
@@ -2641,6 +2972,8 @@ def _handle_save(args: str, session: dict, history: list[dict]) -> None:
             "format": session.get("format", ""),
             "think": session.get("think", True),
             "runtime_profile": session.get("runtime_profile", "manual"),
+            "model_id": session.get("model_id", LOCAL_MODEL_ID),
+            "agent_mode": session.get("agent_mode", AGENT_MODE_NORMAL),
             "tui_theme": session.get("tui_theme", "oslo"),
         },
         "history": history,
@@ -3146,6 +3479,10 @@ def _handle_command(cmd: str, session: dict, history: list[dict]) -> bool | None
         _handle_theme(rest, session)
         return True
 
+    if base in AGENT_MODE_SLASH_COMMANDS:
+        _apply_agent_mode(session, AGENT_MODE_SLASH_COMMANDS[base])
+        return True
+
     if base == "/set":
         _handle_set(rest, session, history)
         return True
@@ -3169,6 +3506,10 @@ def _handle_command(cmd: str, session: dict, history: list[dict]) -> bool | None
             _print_profile_catalog()
         else:
             _apply_runtime_profile(session, rest)
+        return True
+
+    if base == "/model":
+        _apply_model(session, rest)
         return True
 
     if base == "/show":
@@ -3206,23 +3547,32 @@ def _new_session_state() -> dict:
         "format": "",
         "think": True,
         "runtime_profile": "manual",
+        "model_id": LOCAL_MODEL_ID,
+        "agent_mode": AGENT_MODE_NORMAL,
         "tui_theme": "oslo",
     }
 
 
-def _boot_status_meta() -> dict[str, str]:
+def _boot_status_meta(session: dict | None = None) -> dict[str, str]:
     """Runtime chips for the TUI status bar / classic splash."""
     meta: dict[str, str] = {}
     try:
         from agent.runtime_config import get_runtime_config
         from agent.platform_runtime import platform_family
 
-        runtime = get_runtime_config()
+        session_data = session or {}
+        runtime = get_runtime_config(session_data)
+        selected = resolve_model(session_data.get("model_id"), runtime)
+        request_session = session_for_model(session_data, runtime)
+        _request_runtime, options = effective_session_model_options(request_session)
         meta = {
             "profile": runtime.profile.value,
-            "model": runtime.chat_model,
-            "ctx": str(runtime.num_ctx),
-            "out": str(runtime.num_predict),
+            "model": selected.display_name,
+            "mode": AGENT_MODE_LABELS[
+                normalize_agent_mode(session_data.get("agent_mode"))
+            ],
+            "ctx": str(options.get("num_ctx") or runtime.num_ctx),
+            "out": str(options.get("num_predict") or runtime.num_predict),
             "host": platform_family(),
         }
     except Exception:
@@ -3243,6 +3593,30 @@ def process_user_turn(
     """
     if default_system_prompt is None:
         default_system_prompt = load_default_system_prompt()
+    try:
+        request_session = session_for_model(session, get_runtime_config(session))
+    except (RuntimeConfigurationError, ModelProviderError) as exc:
+        print_error(f"Selected model is unavailable · {exc}")
+        _console.print()
+        return
+    try:
+        agent_mode = normalize_agent_mode(session.get("agent_mode"))
+    except ValueError as exc:
+        print_error(f"Invalid conversation mode · {exc}")
+        _console.print()
+        return
+    enhanced_mode = agent_mode in {AGENT_MODE_ULTRA, AGENT_MODE_DEEP_RESEARCH}
+    runtime_tools = (
+        force_hard_web_search_schema(TOOL_SCHEMAS)
+        if enhanced_mode
+        else TOOL_SCHEMAS
+    )
+    if agent_mode == AGENT_MODE_ULTRA:
+        model_user_input = ULTRA_TERMINAL_PROMPT.format(user_input=user_input)
+    elif agent_mode == AGENT_MODE_DEEP_RESEARCH:
+        model_user_input = DEEP_RESEARCH_TERMINAL_PROMPT.format(user_input=user_input)
+    else:
+        model_user_input = user_input
 
     # ── Sync system prompt ────────────────────────────────────────
     active_system = session.get("system") or default_system_prompt
@@ -3319,25 +3693,34 @@ def process_user_turn(
     # ── Build messages to send ────────────────────────────────────
     if session["history"]:
         history.append({"role": "user", "content": user_input})
-        messages_to_send = prepare_messages_for_model(history, session, tools=TOOL_SCHEMAS)
+        model_history = [
+            *history[:-1],
+            {"role": "user", "content": model_user_input},
+        ]
+        messages_to_send = prepare_messages_for_model(
+            model_history,
+            request_session,
+            tools=runtime_tools,
+        )
     else:
         messages_to_send = []
         if history and history[0].get("role") == "system":
             messages_to_send.append(history[0])
         if pre_tool_message:
             messages_to_send.append(pre_tool_message)
-        messages_to_send.append({"role": "user", "content": user_input})
+        messages_to_send.append({"role": "user", "content": model_user_input})
         messages_to_send = prepare_messages_for_model(
-            messages_to_send, session, tools=TOOL_SCHEMAS
+            messages_to_send, request_session, tools=runtime_tools
         )
 
     # ── LLM call with streaming + thinking ────────────────────────
     assistant_msg = _stream_complete_response(
         model=MODEL_NAME,
         messages=messages_to_send,
-        session=session,
+        session=request_session,
         user_input=user_input,
-        tools=TOOL_SCHEMAS,
+        tools=runtime_tools,
+        persistent_session=session,
     )
 
     if session["history"]:
@@ -3347,6 +3730,8 @@ def process_user_turn(
     executed_tool_calls: dict[str, dict] = {}
     vault_index_loop_state = _new_vault_index_loop_state()
     tool_rounds = 0
+    unbounded_last_tool_signature = ""
+    unbounded_repeated_tool_rounds = 0
     while (
         assistant_msg.get("tool_calls")
         or vault_index_loop_state.get("expected_arguments")
@@ -3374,11 +3759,35 @@ def process_user_turn(
             }
             if session["history"]:
                 history.append(assistant_msg)
-        message = _tool_loop_stop_message(
-            tool_rounds,
-            assistant_msg["tool_calls"],
-            vault_index_loop_state,
-        )
+        if enhanced_mode:
+            assistant_msg["tool_calls"] = force_high_tool_difficulty(
+                assistant_msg["tool_calls"]
+            )
+            if vault_index_loop_state.get("blocked_reason"):
+                message = str(vault_index_loop_state["blocked_reason"])
+            else:
+                signature = tool_call_round_signature(assistant_msg["tool_calls"])
+                progressing_vault = _is_progressing_vault_index_round(
+                    assistant_msg["tool_calls"],
+                    vault_index_loop_state,
+                )
+                if signature == unbounded_last_tool_signature and not progressing_vault:
+                    unbounded_repeated_tool_rounds += 1
+                else:
+                    unbounded_repeated_tool_rounds = 0
+                unbounded_last_tool_signature = signature
+                message = (
+                    f"{AGENT_MODE_LABELS[agent_mode]} stopped a repeated no-progress "
+                    "tool loop after the same tool batch was requested three times."
+                    if unbounded_repeated_tool_rounds >= 2
+                    else None
+                )
+        else:
+            message = _tool_loop_stop_message(
+                tool_rounds,
+                assistant_msg["tool_calls"],
+                vault_index_loop_state,
+            )
         if message:
             print_warn(message)
             if not display_is_tui():
@@ -3433,10 +3842,19 @@ def process_user_turn(
                     vault_index_loop_state,
                 ),
             }
+            continuation_history = list(history)
+            if enhanced_mode:
+                for index in range(len(continuation_history) - 1, -1, -1):
+                    if continuation_history[index].get("role") == "user":
+                        continuation_history[index] = {
+                            **continuation_history[index],
+                            "content": model_user_input,
+                        }
+                        break
             messages_to_send = prepare_messages_for_model(
-                [*history, reminder],
-                session,
-                tools=TOOL_SCHEMAS,
+                [*continuation_history, reminder],
+                request_session,
+                tools=runtime_tools,
                 extra_reserved_tokens=CONTEXT_TOOL_LOOP_RESERVE,
             )
         else:
@@ -3449,24 +3867,25 @@ def process_user_turn(
             })
             messages_to_send = prepare_messages_for_model(
                 messages_to_send,
-                session,
-                tools=TOOL_SCHEMAS,
+                request_session,
+                tools=runtime_tools,
                 extra_reserved_tokens=CONTEXT_TOOL_LOOP_RESERVE,
             )
 
         assistant_msg = _stream_complete_response(
             model=MODEL_NAME,
             messages=messages_to_send,
-            session=session,
+            session=request_session,
             user_input=user_input,
-            tools=TOOL_SCHEMAS,
+            tools=runtime_tools,
             extra_reserved_tokens=CONTEXT_TOOL_LOOP_RESERVE,
+            persistent_session=session,
         )
         if session["history"]:
             history.append(assistant_msg)
 
     if session["history"]:
-        _check_and_compact_history(history, session)
+        _check_and_compact_history(history, request_session)
 
 
 def _should_use_tui() -> bool:
@@ -3488,7 +3907,7 @@ def run_classic() -> None:
     history: list[dict] = []
     session = _new_session_state()
 
-    meta = _boot_status_meta()
+    meta = _boot_status_meta(session)
     try:
         print_welcome_header(
             {
@@ -3533,7 +3952,7 @@ def run() -> None:
     default_system_prompt = load_default_system_prompt()
     history: list[dict] = []
     session = _new_session_state()
-    meta = _boot_status_meta()
+    meta = _boot_status_meta(session)
 
     if _should_use_tui():
         from agent.tui import run_tui

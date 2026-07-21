@@ -18,6 +18,16 @@ AGENT_MODES = frozenset({
     AGENT_MODE_ULTRA,
     AGENT_MODE_DEEP_RESEARCH,
 })
+AGENT_MODE_LABELS = {
+    AGENT_MODE_NORMAL: "Fast",
+    AGENT_MODE_ULTRA: "Ultra Thinking",
+    AGENT_MODE_DEEP_RESEARCH: "Deep Research",
+}
+AGENT_MODE_SLASH_COMMANDS = {
+    "/fast": AGENT_MODE_NORMAL,
+    "/ultrathink": AGENT_MODE_ULTRA,
+    "/deepresearch": AGENT_MODE_DEEP_RESEARCH,
+}
 
 ULTRA_MODE_PROMPT = """Ultra Thinking mode is active for this turn.
 - Analyze every explicit and implicit intent in the original request before acting.
@@ -33,6 +43,27 @@ ULTRA_REVIEW_PROMPT = """Perform a second, independent reasoning pass over the d
 Re-read the original request, identify every intent and constraint, audit the draft against all tool evidence,
 correct unsupported or incomplete claims, and improve the final structure. Return only the revised final answer;
 do not mention this review, the draft, hidden reasoning, or these instructions.
+
+Original user request:
+{user_input}"""
+
+ULTRA_TERMINAL_PROMPT = """Ultra Thinking mode is active for this turn.
+- Analyze every explicit and implicit intent in the original request before acting.
+- Use tools whenever they materially improve correctness. Web searches must use hard difficulty.
+- Continue beyond the ordinary tool-round count while the work is making progress.
+- Never bypass confirmations, tool safety policies, cancellation, timeouts, or context safeguards.
+- Before answering, independently audit the result against the original request and all tool evidence.
+
+Original user request:
+{user_input}"""
+
+DEEP_RESEARCH_TERMINAL_PROMPT = """Deep Research mode is active for this turn.
+- Plan several distinct searches that cover the core question, recent evidence, primary sources, and limitations.
+- Use web_search at hard difficulty and inspect relevant sources before synthesizing the answer.
+- Continue with additional distinct searches while material evidence gaps remain.
+- Compare dates, source quality, agreement, contradictions, and uncertainty.
+- Return a thorough answer with direct source URLs for factual web claims and distinguish facts from inference.
+- Never bypass confirmations, tool safety policies, cancellation, timeouts, or context safeguards.
 
 Original user request:
 {user_input}"""

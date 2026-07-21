@@ -11,7 +11,8 @@ const DEFAULT_SETTINGS = {
   history: true,
   format: "",
   think: true,
-  agent_mode: "normal"
+  agent_mode: "normal",
+  model_id: "local:default"
 };
 
 const AGENT_MODES = {
@@ -55,6 +56,15 @@ function apiHeaders(json = false) {
   return headers;
 }
 
+async function apiError(response, fallback) {
+  try {
+    const payload = await response.json();
+    return new Error(String(payload.error || fallback));
+  } catch {
+    return new Error(fallback);
+  }
+}
+
 const SLASH_COMMANDS = [
   { command: "/help", description: "Show available commands" },
   { command: "/theme", description: "Choose a place color theme" },
@@ -63,6 +73,11 @@ const SLASH_COMMANDS = [
   { command: "/load ", description: "Load a saved session by name or index" },
   { command: "/set parameter ", description: "Set a model parameter, e.g. temperature 0.7" },
   { command: "/set profile ", description: "Select auto, low-vram, balanced, or manual" },
+  { command: "/model ", description: "List or select a configured model" },
+  { command: "/set model ", description: "Select a configured model" },
+  { command: "/fast", description: "Switch this conversation to Fast mode" },
+  { command: "/ultrathink", description: "Switch this conversation to Ultra Thinking mode" },
+  { command: "/deepresearch", description: "Switch this conversation to Deep Research mode" },
   { command: "/set system \"\"", description: "Set the system prompt for this session" },
   { command: "/set history", description: "Enable conversation history" },
   { command: "/set nohistory", description: "Disable conversation history" },
@@ -128,11 +143,16 @@ const state = {
   savedSessions: [],
   activeSessionName: "New conversation",
   modelName: "selene",
+  models: [
+    { id: "local:default", display_name: "Gemma 4 E4B", provider: "Ollama (local)", capabilities: [] }
+  ],
   theme: INITIAL_THEME,
   isGenerating: false,
   followOutput: true,
   controller: null,
   generation: null,
+  generations: new Map(),
+  viewVersion: 0,
   clientId: CLIENT_ID,
   stream: {
     assistantStack: null,
@@ -141,6 +161,7 @@ const state = {
     thinkingBlock: null,
     thinkingContent: null,
     thinkingText: "",
+    renderFrame: null,
     modeStatusLine: null,
     activeToolBlocks: new Map()
   },
@@ -167,6 +188,60 @@ let lastRuntimeWarning = "";
 let themeCloseTimer = null;
 let themeTriggerElement = null;
 let startupProfilePromptShown = false;
+
+const NEW_CONVERSATION_NAMES = new Set(["", "Active Session", "New conversation"]);
+
+function isNewConversationName(name) {
+  return NEW_CONVERSATION_NAMES.has(String(name || ""));
+}
+
+function generationForSession(name = state.activeSessionName) {
+  const requested = String(name || "");
+  for (const generation of state.generations.values()) {
+    if (generation.sessionName === requested) return generation;
+    if (
+      isNewConversationName(requested)
+      && isNewConversationName(generation.sessionName)
+      && generation.viewVersion === state.viewVersion
+    ) {
+      return generation;
+    }
+  }
+  return null;
+}
+
+function isGenerationVisible(generation) {
+  return Boolean(generation && generationForSession(state.activeSessionName) === generation);
+}
+
+function syncActiveGeneration() {
+  const generation = generationForSession();
+  state.generation = generation;
+  state.controller = generation?.controller || null;
+  state.isGenerating = Boolean(generation);
+  return generation;
+}
+
+function markCurrentGenerationBackgrounded() {
+  const generation = generationForSession();
+  if (generation) generation.wasBackgrounded = true;
+}
+
+function selectConversationView(name) {
+  if (String(name || "") !== state.activeSessionName) {
+    markCurrentGenerationBackgrounded();
+    state.viewVersion += 1;
+  }
+  state.activeSessionName = name || "New conversation";
+  syncActiveGeneration();
+}
+
+async function waitForPendingConversationIdentity() {
+  const generation = generationForSession();
+  if (generation && isNewConversationName(generation.sessionName)) {
+    await generation.identityReady;
+  }
+}
 
 function reportRuntimeWarnings(runtime) {
   const warnings = Array.isArray(runtime?.warnings) ? runtime.warnings : [];
@@ -216,6 +291,7 @@ function bindElements() {
   el.modeLabel = document.getElementById("mode-label");
   el.modeIcon = document.getElementById("mode-icon");
   el.modeClear = document.getElementById("mode-clear");
+  el.modelSelect = document.getElementById("model-select");
 }
 
 function bindEvents() {
@@ -339,6 +415,18 @@ function bindEvents() {
     persistSettings();
   });
 
+  el.modelSelect?.addEventListener("change", async () => {
+    if (state.isGenerating) return;
+    const previousModel = state.settings.model_id || "local:default";
+    const selectedModel = el.modelSelect.value;
+    state.settings.model_id = selectedModel;
+    updateModelUI();
+    await persistSettings();
+    if (previousModel !== "local:default" && selectedModel === "local:default") {
+      showStartupProfileDialog();
+    }
+  });
+
   const persistSystemPrompt = debounce(persistSettings, 350);
   el.system?.addEventListener("input", () => {
     state.settings.system = el.system.value;
@@ -452,19 +540,21 @@ async function loadState() {
     state.settings = mergeSettings(data.settings || {});
     state.runtime = data.runtime || state.runtime;
     reportRuntimeWarnings(state.runtime);
-    state.activeSessionName = data.active_session_name || "New conversation";
+    selectConversationView(data.active_session_name || "New conversation");
     state.modelName = data.model_name || "selene";
+    state.models = Array.isArray(data.models) && data.models.length
+      ? data.models
+      : state.models;
 
     document.title = titleForSession(state.activeSessionName);
     el.title.textContent = cleanSessionName(state.activeSessionName);
 
     syncSettingsUI();
     renderSessions();
-    renderMessages();
+    renderActiveConversation();
     updateComposerState();
-    showStartupProfileDialog();
   } catch (error) {
-    toast("Could not reach Selene. Make sure the backend and Ollama are running.");
+    toast("Could not reach the Selene backend. Start it and try again.");
     renderWelcome();
   }
 }
@@ -551,6 +641,7 @@ function syncSettingsUI() {
   if (el.history) el.history.checked = state.settings.history !== false;
   if (el.think) el.think.checked = state.settings.think !== false;
   if (el.system) el.system.value = state.settings.system || "";
+  updateModelUI();
   updateModeUI();
 
   const temp = Number(
@@ -570,10 +661,35 @@ function syncSettingsUI() {
     if (!hasOption) {
       const option = document.createElement("option");
       option.value = ctx;
-      option.textContent = `${Math.round(Number(ctx) / 1024)}k`;
+      option.textContent = Number(ctx) >= 1_048_576
+        ? `${Number(ctx) / 1_048_576}M`
+        : `${Math.round(Number(ctx) / 1024)}k`;
       el.context.appendChild(option);
     }
     el.context.value = ctx;
+  }
+}
+
+function updateModelUI() {
+  if (!el.modelSelect) return;
+  const selected = state.settings.model_id || "local:default";
+  el.modelSelect.replaceChildren();
+  state.models.forEach((model) => {
+    const option = document.createElement("option");
+    option.value = model.id;
+    option.textContent = model.display_name;
+    option.title = `${model.provider} · ${(model.capabilities || []).join(", ")}`;
+    el.modelSelect.appendChild(option);
+  });
+  if ([...el.modelSelect.options].some((option) => option.value === selected)) {
+    el.modelSelect.value = selected;
+  } else if (el.modelSelect.options.length) {
+    el.modelSelect.value = el.modelSelect.options[0].value;
+  }
+  const active = state.models.find((model) => model.id === el.modelSelect.value);
+  if (active) {
+    el.modelSelect.title = `${active.provider} · ${active.display_name}`;
+    state.modelName = active.display_name;
   }
 }
 
@@ -586,7 +702,7 @@ function persistSettings() {
         headers: apiHeaders(true),
         body: JSON.stringify(snapshot)
       });
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      if (!response.ok) throw await apiError(response, "Settings could not be saved.");
       const data = await response.json();
       state.settings = mergeSettings(data.settings || state.settings);
       state.runtime = data.runtime || state.runtime;
@@ -595,8 +711,8 @@ function persistSettings() {
       // Refresh after the server resolves profile defaults and session overrides.
       updateContextMeter();
       return true;
-    } catch {
-      toast("Settings could not be saved.");
+    } catch (error) {
+      toast(error.message || "Settings could not be saved.");
       return false;
     }
   });
@@ -690,13 +806,25 @@ function renderSessions() {
   if (!state.savedSessions.length) return;
 
   state.savedSessions.forEach((name) => {
+    const generation = generationForSession(name);
     const item = document.createElement("div");
-    item.className = `session-item${name === state.activeSessionName ? " active" : ""}`;
+    item.className = [
+      "session-item",
+      name === state.activeSessionName ? "active" : "",
+      generation ? "running" : ""
+    ].filter(Boolean).join(" ");
     const button = document.createElement("button");
     button.type = "button";
     button.className = "session-open";
     button.textContent = cleanSessionName(name);
-    button.title = name;
+    button.title = generation ? `${name} · response running` : name;
+    if (generation) {
+      const running = document.createElement("span");
+      running.className = "session-running";
+      running.setAttribute("aria-label", "Response running");
+      running.title = "Response running";
+      button.appendChild(running);
+    }
     button.addEventListener("click", () => loadSession(name));
 
     const remove = document.createElement("button");
@@ -712,6 +840,21 @@ function renderSessions() {
     item.append(button, remove);
     el.sessionList.appendChild(item);
   });
+}
+
+function renderActiveConversation() {
+  const generation = syncActiveGeneration();
+  if (!generation) {
+    resetStream();
+    renderMessages();
+    return;
+  }
+  state.history = JSON.parse(JSON.stringify(generation.baseHistory || state.history));
+  resetStream();
+  renderMessages();
+  for (const event of generation.events) {
+    handleStreamEvent(event, generation, { record: false, forceVisible: true });
+  }
 }
 
 function renderMessages() {
@@ -740,7 +883,7 @@ function toDisplayMessages(history) {
     const message = history[i];
     if (message.role === "system") continue;
     if (message.role === "user") {
-      display.push({ role: "user", content: message.content || "" });
+      display.push({ role: "user", content: displayText(message.content) });
       continue;
     }
     if (message.role === "assistant") {
@@ -750,9 +893,11 @@ function toDisplayMessages(history) {
       }
       const entry = {
         role: "assistant",
-        content: message.content || "",
+        content: displayText(message.content),
+        error: Boolean(message.error),
         thoughtItems: [
-          ...(message.thinking ? [{ type: "thinking", text: message.thinking }] : []),
+          ...(message.planning ? [{ type: "thinking", text: displayText(message.planning) }] : []),
+          ...(message.thinking ? [{ type: "thinking", text: displayText(message.thinking) }] : []),
           ...(message.tool_calls || []).map((call) => ({
             type: "tool",
             name: call.function?.name || "tool"
@@ -762,6 +907,7 @@ function toDisplayMessages(history) {
       const previous = display[display.length - 1];
       if (previous?.role === "assistant" && !previous.content) {
         previous.content = entry.content;
+        previous.error ||= entry.error;
         previous.thoughtItems.push(...entry.thoughtItems);
       } else {
         display.push(entry);
@@ -1021,7 +1167,11 @@ function appendAssistantMessage(message, scroll = true) {
     row.stack.appendChild(thinkingBlock);
   }
 
-  if (message.content) row.stack.appendChild(bubble(message.content, true));
+  if (message.content) {
+    const responseBubble = bubble(message.content, true);
+    if (message.error) responseBubble.classList.add("error");
+    row.stack.appendChild(responseBubble);
+  }
   el.messages.appendChild(row.root);
   if (scroll) scrollToBottom(true);
 }
@@ -1051,7 +1201,11 @@ function messageShell(role, avatarText) {
 function bubble(content, markdown) {
   const node = document.createElement("div");
   node.className = "bubble";
-  node.innerHTML = markdown ? renderMarkdown(content) : escapeHTML(content).replace(/\n/g, "<br>");
+  if (markdown) {
+    renderResponseInto(node, content);
+  } else {
+    node.innerHTML = escapeHTML(displayText(content)).replace(/\n/g, "<br>");
+  }
   return node;
 }
 
@@ -1084,7 +1238,7 @@ function detailBlock(title, label, content, running) {
 function thinkingContent(text = "") {
   const content = document.createElement("div");
   content.className = "block-content";
-  content.textContent = text;
+  content.textContent = displayText(text);
   return content;
 }
 
@@ -1118,7 +1272,7 @@ function humanizeToolName(name) {
 }
 
 async function sendMessage() {
-  if (state.isGenerating) return;
+  if (generationForSession()) return;
   const text = el.input.value.trim();
   if (!text) return;
 
@@ -1131,16 +1285,24 @@ async function sendMessage() {
   resizeComposer();
   updateComposerState();
 
-  state.isGenerating = true;
-  state.controller = new AbortController();
+  const controller = new AbortController();
+  let resolveIdentity;
+  const identityReady = new Promise((resolve) => { resolveIdentity = resolve; });
   const generation = {
-    controller: state.controller,
+    controller,
     id: createRuntimeId("generation"),
     sessionName: state.activeSessionName,
-    detached: false
+    viewVersion: state.viewVersion,
+    baseHistory: JSON.parse(JSON.stringify(state.history)),
+    events: [],
+    wasBackgrounded: false,
+    identityReady,
+    resolveIdentity
   };
-  state.generation = generation;
+  state.generations.set(generation.id, generation);
+  syncActiveGeneration();
   resetStream();
+  renderSessions();
   updateComposerState();
 
   try {
@@ -1156,53 +1318,130 @@ async function sendMessage() {
         generation_id: generation.id,
         client_id: state.clientId
       }),
-      signal: state.controller.signal
+      signal: controller.signal
     });
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    if (!response.ok) throw await apiError(response, "The model request could not be started.");
+    bindGenerationSession(
+      generation,
+      response.headers.get("X-Selene-Session-Name")
+    );
+    generation.resolveIdentity();
     await readEventStream(response, generation);
-    if (state.generation === generation) finishGeneration(generation);
   } catch (error) {
+    generation.resolveIdentity();
     if (error.name !== "AbortError") {
-      toast("Selene lost the response stream. Check Ollama and try again.");
+      const detail = error.message
+        || "The response stream was interrupted. Try again or select another model.";
+      const errorEvent = { type: "content_chunk", text: detail, error: true };
+      const visible = isGenerationVisible(generation);
+      handleStreamEvent(errorEvent, generation);
+      if (!visible) {
+        toast(`Response failed in “${cleanSessionName(generation.sessionName)}”.`);
+      }
       finishGeneration(generation);
     }
   }
+}
+
+function bindGenerationSession(generation, sessionName) {
+  const normalized = String(sessionName || "").trim();
+  if (!normalized || isNewConversationName(normalized)) return;
+  const previousName = generation.sessionName;
+  generation.sessionName = normalized;
+  if (!state.savedSessions.includes(normalized)) {
+    state.savedSessions = [normalized, ...state.savedSessions];
+  }
+  if (
+    state.viewVersion === generation.viewVersion
+    && state.activeSessionName === previousName
+  ) {
+    state.activeSessionName = normalized;
+    el.title.textContent = cleanSessionName(normalized);
+    document.title = titleForSession(normalized);
+  }
+  syncActiveGeneration();
+  renderSessions();
+  updateComposerState();
+}
+
+function recordGenerationEvent(generation, event) {
+  if (!generation || ["conversation_started", "done"].includes(event.type)) return;
+  const events = generation.events;
+  const previous = events[events.length - 1];
+  if (previous?.type === "token_usage" && event.type === "token_usage") {
+    events[events.length - 1] = JSON.parse(JSON.stringify(event));
+    return;
+  }
+  const chunkTypes = new Set(["thinking_chunk", "planning_chunk", "content_chunk"]);
+  const previousKey = previous?.text !== undefined ? "text" : "content";
+  const eventKey = event.text !== undefined ? "text" : "content";
+  if (
+    previous
+    && previous.type === event.type
+    && chunkTypes.has(event.type)
+    && Boolean(previous.error) === Boolean(event.error)
+    && previousKey === eventKey
+  ) {
+    previous[eventKey] = displayText(previous[eventKey]) + displayText(event[eventKey]);
+    return;
+  }
+  events.push(JSON.parse(JSON.stringify(event)));
 }
 
 async function readEventStream(response, generation) {
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
+  let sawDone = false;
 
   while (true) {
     const { value, done } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
+    buffer += done ? decoder.decode() : decoder.decode(value, { stream: true });
     const lines = buffer.split("\n");
-    buffer = lines.pop() || "";
+    buffer = done ? "" : (lines.pop() || "");
 
     for (const line of lines) {
-      if (!line.startsWith("data: ")) continue;
+      if (!line.startsWith("data:")) continue;
+      let event;
       try {
-        handleStreamEvent(JSON.parse(line.slice(6)), generation);
+        event = JSON.parse(line.slice(5).trimStart());
       } catch {
-        // Ignore malformed SSE chunks.
+        // A partial proxy frame should not discard later valid SSE events.
+        continue;
       }
+      if (event.type === "done") sawDone = true;
+      // Keep JSON framing errors separate from display errors. Previously a
+      // renderer exception was treated like malformed SSE and silently dropped
+      // an otherwise valid provider chunk.
+      handleStreamEvent(event, generation);
     }
+    if (done) break;
   }
+  if (!sawDone) throw new Error("The response stream ended before the model completed its reply.");
 }
 
-function handleStreamEvent(event, generation) {
-  const visible = state.generation === generation && !generation.detached;
+function handleStreamEvent(event, generation, { record = true, forceVisible = false } = {}) {
+  if (record) recordGenerationEvent(generation, event);
+  const visible = forceVisible || isGenerationVisible(generation);
   switch (event.type) {
     case "conversation_started":
-      generation.sessionName = event.session_name || generation.sessionName;
-      if (visible) {
-        state.activeSessionName = generation.sessionName;
-        el.title.textContent = cleanSessionName(state.activeSessionName);
-        document.title = titleForSession(state.activeSessionName);
-      }
+      bindGenerationSession(generation, event.session_name);
+      generation.resolveIdentity();
       break;
+    case "model_fallback": {
+      const fallbackModel = event.model || {};
+      if (fallbackModel.id) {
+        state.settings.model_id = fallbackModel.id;
+        const existing = state.models.findIndex((model) => model.id === fallbackModel.id);
+        if (existing >= 0) state.models[existing] = { ...state.models[existing], ...fallbackModel };
+        else state.models.push(fallbackModel);
+        updateModelUI();
+      }
+      if (visible) appendStatus(
+        event.message || "Model error. Switched to Gemma 4 31B IT and continuing automatically."
+      );
+      break;
+    }
     case "status":
       if (!visible) break;
       appendStatus(event.message || "", event.activity_mode || "");
@@ -1211,6 +1450,7 @@ function handleStreamEvent(event, generation) {
       if (!visible) break;
       ensureAssistantStack();
       if (state.stream.assistantBubble) {
+        scheduleStreamRender({ immediate: true });
         state.stream.assistantBubble = null;
         state.stream.assistantText = "";
         state.stream.thinkingBlock = null;
@@ -1231,14 +1471,45 @@ function handleStreamEvent(event, generation) {
       break;
     case "thinking_chunk":
       if (!visible) break;
-      state.stream.thinkingText += event.text || "";
-      if (state.stream.thinkingContent) state.stream.thinkingContent.textContent = state.stream.thinkingText;
-      scrollThinkingToBottom(state.stream.thinkingBlock);
+      state.stream.thinkingText += displayText(event.text);
+      scheduleStreamRender();
       break;
     case "thinking_end":
       if (!visible) break;
+      scheduleStreamRender({ immediate: true });
       state.stream.thinkingBlock?.classList.remove("running");
       state.stream.thinkingBlock?.classList.remove("open");
+      break;
+    case "planning_start":
+      handleStreamEvent(
+        { ...event, type: "thinking_start" }, generation,
+        { record: false, forceVisible: visible }
+      );
+      break;
+    case "planning_chunk":
+      handleStreamEvent(
+        { ...event, type: "thinking_chunk" }, generation,
+        { record: false, forceVisible: visible }
+      );
+      break;
+    case "planning_promote":
+      if (!visible) break;
+      if (!state.stream.thinkingBlock && event.text) {
+        handleStreamEvent(
+          { ...event, type: "thinking_start" }, generation,
+          { record: false, forceVisible: true }
+        );
+        handleStreamEvent(
+          { ...event, type: "thinking_chunk" }, generation,
+          { record: false, forceVisible: true }
+        );
+      }
+      break;
+    case "planning_end":
+      handleStreamEvent(
+        { ...event, type: "thinking_end" }, generation,
+        { record: false, forceVisible: visible }
+      );
       break;
     case "tool_start":
       if (!visible) break;
@@ -1281,6 +1552,7 @@ function handleStreamEvent(event, generation) {
       settleModeStatus();
       ensureAssistantStack();
       if (!state.stream.assistantBubble) {
+        scheduleStreamRender({ immediate: true });
         state.stream.thinkingBlock?.classList.remove("open", "running");
         state.stream.assistantBubble = document.createElement("div");
         state.stream.assistantBubble.className = "bubble";
@@ -1290,9 +1562,9 @@ function handleStreamEvent(event, generation) {
         state.stream.thinkingText = "";
         state.stream.activeToolBlocks.clear();
       }
-      state.stream.assistantText += event.text || event.content || "";
-      state.stream.assistantBubble.innerHTML = renderMarkdown(state.stream.assistantText);
-      scrollToBottom();
+      state.stream.assistantText += displayText(event.text ?? event.content);
+      scheduleStreamRender();
+      if (event.error) state.stream.assistantBubble.classList.add("error");
       break;
     case "token_usage":
       if (!visible) break;
@@ -1302,7 +1574,17 @@ function handleStreamEvent(event, generation) {
       const viewedGeneratingConversation = state.activeSessionName === generation.sessionName;
       const finishedName = event.active_session_name || generation.sessionName;
       if (event.saved_sessions) state.savedSessions = event.saved_sessions;
+      bindGenerationSession(generation, finishedName);
       if (visible) {
+        scheduleStreamRender({ immediate: true });
+        const previousModel = state.settings.model_id || "local:default";
+        if (event.state === "failed" && event.error) {
+          if (state.stream.assistantBubble) {
+            state.stream.assistantBubble.classList.add("error");
+          } else {
+            appendStreamError(event.error);
+          }
+        }
         if (event.history) state.history = event.history;
         if (event.settings) state.settings = mergeSettings(event.settings);
         if (event.runtime) {
@@ -1313,6 +1595,16 @@ function handleStreamEvent(event, generation) {
         el.title.textContent = cleanSessionName(state.activeSessionName);
         document.title = titleForSession(state.activeSessionName);
         syncSettingsUI();
+        if (
+          previousModel !== "local:default"
+          && state.settings.model_id === "local:default"
+        ) {
+          showStartupProfileDialog();
+        }
+        if (generation.wasBackgrounded) {
+          resetStream();
+          renderMessages();
+        }
         renderSessions();
         updateContextMeter();
         finishGeneration(generation);
@@ -1337,13 +1629,59 @@ function ensureAssistantStack() {
   state.stream.assistantStack = row.stack;
 }
 
+function appendStreamError(detail) {
+  settleModeStatus();
+  ensureAssistantStack();
+  state.stream.thinkingBlock?.classList.remove("open", "running");
+  const normalized = String(detail || "The model response stopped unexpectedly.");
+  if (!state.stream.assistantBubble) {
+    state.stream.assistantBubble = document.createElement("div");
+    state.stream.assistantBubble.className = "bubble error";
+    state.stream.assistantStack.appendChild(state.stream.assistantBubble);
+  } else {
+    state.stream.assistantBubble.classList.add("error");
+  }
+  if (!state.stream.assistantText.includes(normalized)) {
+    const heading = state.stream.assistantText
+      ? "\n\n---\n\n**Response interrupted.**\n\n"
+      : "**Couldn’t complete this response.**\n\n";
+    state.stream.assistantText += heading + normalized;
+  }
+  scheduleStreamRender({ immediate: true });
+}
+
+function scheduleStreamRender({ immediate = false } = {}) {
+  const render = () => {
+    state.stream.renderFrame = null;
+    if (state.stream.thinkingContent) {
+      state.stream.thinkingContent.textContent = state.stream.thinkingText;
+      scrollThinkingToBottom(state.stream.thinkingBlock);
+    }
+    if (state.stream.assistantBubble) {
+      renderResponseInto(state.stream.assistantBubble, state.stream.assistantText);
+    }
+    scrollToBottom();
+  };
+
+  if (immediate) {
+    if (state.stream.renderFrame !== null) cancelAnimationFrame(state.stream.renderFrame);
+    render();
+    return;
+  }
+  if (state.stream.renderFrame === null) {
+    state.stream.renderFrame = requestAnimationFrame(render);
+  }
+}
+
 function resetStream() {
+  if (state.stream.renderFrame !== null) cancelAnimationFrame(state.stream.renderFrame);
   state.stream.assistantStack = null;
   state.stream.assistantBubble = null;
   state.stream.assistantText = "";
   state.stream.thinkingBlock = null;
   state.stream.thinkingContent = null;
   state.stream.thinkingText = "";
+  state.stream.renderFrame = null;
   state.stream.modeStatusLine = null;
   state.stream.activeToolBlocks.clear();
 }
@@ -1368,13 +1706,17 @@ function settleStreamActivity(interrupted = false) {
   }
 }
 
-function finishGeneration(generation = state.generation, { interrupted = false } = {}) {
-  if (generation && state.generation !== generation) return;
-  settleStreamActivity(interrupted);
-  state.isGenerating = false;
-  state.controller = null;
-  state.generation = null;
-  resetStream();
+function finishGeneration(generation = generationForSession(), { interrupted = false } = {}) {
+  if (!generation || !state.generations.has(generation.id)) return;
+  const visible = isGenerationVisible(generation);
+  if (visible) {
+    scheduleStreamRender({ immediate: true });
+    settleStreamActivity(interrupted);
+  }
+  state.generations.delete(generation.id);
+  if (visible) resetStream();
+  syncActiveGeneration();
+  renderSessions();
   updateComposerState();
 }
 
@@ -1390,8 +1732,8 @@ function resetComposer({ clear = true } = {}) {
   requestAnimationFrame(() => el.input?.focus({ preventScroll: true }));
 }
 
-function stopGeneration({ refresh = true } = {}) {
-  const generation = state.generation;
+function stopGeneration({ generation = generationForSession(), refresh = true } = {}) {
+  if (!generation) return;
   if (generation?.id) {
     void fetch("/api/cancel-generation", {
       method: "POST",
@@ -1400,9 +1742,9 @@ function stopGeneration({ refresh = true } = {}) {
       keepalive: true
     }).catch(() => {});
   }
-  state.controller?.abort();
+  generation.controller?.abort();
   toast("Generation stopped.");
-  finishGeneration(state.generation, { interrupted: true });
+  finishGeneration(generation, { interrupted: true });
   if (refresh) refreshSessions().catch(() => {});
 }
 
@@ -1439,11 +1781,12 @@ function appendModeActivity(text, activityMode) {
 }
 
 async function clearConversation() {
-  if (state.isGenerating) stopGeneration({ refresh: false });
+  const generation = generationForSession();
+  if (generation) stopGeneration({ generation, refresh: false });
   try {
     await fetch("/api/clear-session", { method: "POST", headers: apiHeaders() });
     state.history = [];
-    state.activeSessionName = "New conversation";
+    selectConversationView("New conversation");
     el.title.textContent = "New conversation";
     document.title = "Selene";
     renderWelcome();
@@ -1456,19 +1799,21 @@ async function clearConversation() {
 }
 
 async function newConversation() {
-  // There is one composer and one stream controller. Leaving the old stream
-  // detached keeps isGenerating=true and makes the fresh tab act locked.
-  if (state.isGenerating || state.generation) stopGeneration({ refresh: false });
+  await waitForPendingConversationIdentity();
+  markCurrentGenerationBackgrounded();
+  const requestedView = ++state.viewVersion;
   try {
     const response = await fetch("/api/new-session", { method: "POST", headers: apiHeaders() });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const data = await response.json();
+    if (requestedView !== state.viewVersion) return;
     state.history = [];
     state.activeSessionName = "New conversation";
     state.savedSessions = data.saved_sessions || state.savedSessions;
     el.title.textContent = "New conversation";
     document.title = "Selene";
     state.followOutput = true;
+    syncActiveGeneration();
     resetStream();
     renderWelcome();
     updateContextMeter();
@@ -1483,9 +1828,8 @@ async function newConversation() {
 async function deleteSession(name) {
   if (!window.confirm(`Delete “${cleanSessionName(name)}”? This cannot be undone.`)) return;
   const deletingActiveSession = name === state.activeSessionName;
-  if (deletingActiveSession && (state.isGenerating || state.generation)) {
-    stopGeneration({ refresh: false });
-  }
+  const generation = generationForSession(name);
+  if (generation) stopGeneration({ generation, refresh: false });
   try {
     const response = await fetch("/api/delete-session", {
       method: "POST",
@@ -1497,9 +1841,8 @@ async function deleteSession(name) {
     state.savedSessions = data.saved_sessions || state.savedSessions.filter((session) => session !== name);
     const backendStartedNewSession = ["Active Session", "New conversation"].includes(data.active_session_name);
     if (deletingActiveSession || backendStartedNewSession) {
-      if (state.isGenerating || state.generation) stopGeneration({ refresh: false });
       state.history = [];
-      state.activeSessionName = "New conversation";
+      selectConversationView("New conversation");
       el.title.textContent = "New conversation";
       document.title = "Selene";
       state.followOutput = true;
@@ -1525,7 +1868,11 @@ async function refreshSessions() {
   if (!response.ok) return;
   const data = await response.json();
   state.savedSessions = data.saved_sessions || [];
-  state.activeSessionName = data.active_session_name || state.activeSessionName;
+  const backendName = data.active_session_name || state.activeSessionName;
+  if (!generationForSession() || backendName === state.activeSessionName) {
+    state.activeSessionName = backendName;
+  }
+  syncActiveGeneration();
   renderSessions();
 }
 
@@ -1740,7 +2087,14 @@ async function saveSession() {
 }
 
 async function loadSession(name) {
-  if (state.isGenerating || state.generation) stopGeneration({ refresh: false });
+  if (name === state.activeSessionName) {
+    renderActiveConversation();
+    updateComposerState();
+    return;
+  }
+  await waitForPendingConversationIdentity();
+  markCurrentGenerationBackgrounded();
+  const requestedView = ++state.viewVersion;
   try {
     const response = await fetch("/api/load-session", {
       method: "POST",
@@ -1748,6 +2102,7 @@ async function loadSession(name) {
       body: JSON.stringify({ name })
     });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    if (requestedView !== state.viewVersion) return;
     await loadState();
     toast("Session loaded.");
   } catch {
@@ -1760,6 +2115,7 @@ function updateComposerState() {
   if (el.mic) el.mic.disabled = !state.voice.recognition || state.isGenerating;
   if (el.modeTrigger) el.modeTrigger.disabled = state.isGenerating;
   if (el.modeClear) el.modeClear.disabled = state.isGenerating;
+  if (el.modelSelect) el.modelSelect.disabled = state.isGenerating;
   if (el.modePicker) {
     el.modePicker.classList.toggle(
       "running",
@@ -1954,8 +2310,9 @@ function estimatedContextTokens() {
     .filter((message) => message.role !== "system")
     .map((message) => [
       message.role || "",
-      message.content || "",
-      message.thinking || "",
+      displayText(message.content),
+      displayText(message.planning),
+      displayText(message.thinking),
       JSON.stringify(message.tool_calls || "")
     ].join("\n"))
     .join("\n");
@@ -2240,6 +2597,46 @@ function renderMarkdown(text) {
   if (inCode) output.push(renderCodeBlock(code.join("\n"), language));
   flushParagraph(); closeList();
   return output.join("");
+}
+
+function displayText(value) {
+  if (value == null) return "";
+  if (typeof value === "string") return value;
+  if (["number", "boolean", "bigint"].includes(typeof value)) return String(value);
+  if (Array.isArray(value)) {
+    return value.map(displayText).filter(Boolean).join("\n");
+  }
+  if (typeof value === "object") {
+    for (const key of ["text", "content", "output_text", "value"]) {
+      if (Object.prototype.hasOwnProperty.call(value, key)) return displayText(value[key]);
+    }
+    try {
+      return JSON.stringify(value);
+    } catch {
+      return "[Unsupported response content]";
+    }
+  }
+  return String(value);
+}
+
+function renderResponseHTML(value) {
+  const text = displayText(value);
+  try {
+    return renderMarkdown(text);
+  } catch {
+    // A malformed or incomplete markdown fragment must never hide model text.
+    return escapeHTML(text).replace(/\n/g, "<br>");
+  }
+}
+
+function renderResponseInto(node, value) {
+  const text = displayText(value);
+  try {
+    node.innerHTML = renderResponseHTML(text);
+  } catch {
+    // DOM/CSP failures are display failures, not failed model responses.
+    node.textContent = text;
+  }
 }
 
 function inlineMarkdown(text) {

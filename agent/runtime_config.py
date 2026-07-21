@@ -214,7 +214,10 @@ _ENV_SETTINGS = {
 }
 
 _INT_RANGES = {
-    "num_ctx": (1024, 131072),
+    # Hosted models can expose a 1M-token context window. Local defaults remain
+    # hardware-aware; this wider validation ceiling is only used automatically
+    # by the provider registry for API-backed models.
+    "num_ctx": (1024, 1048576),
     "num_predict": (64, 32768),
     "num_batch": (1, 4096),
     "top_k": (0, 200),

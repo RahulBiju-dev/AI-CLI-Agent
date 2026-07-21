@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from agent import terminal
@@ -81,6 +82,151 @@ class DisplaySinkRoutingTests(unittest.TestCase):
         self.assertIn("content_stream", kinds)
         self.assertIn("content_final", kinds)
         self.assertIn("help", kinds)
+
+    def test_combined_api_chunk_routes_thinking_and_response_to_distinct_tui_blocks(self):
+        from agent import core
+
+        calls: list[tuple] = []
+
+        class FakeSink:
+            is_tui = True
+
+            def activity_start(self, label="Thinking"):
+                calls.append(("activity_start", label))
+
+            def activity_update(self, label):
+                calls.append(("activity_update", label))
+
+            def activity_stop(self):
+                calls.append(("activity_stop",))
+
+            def thinking_header(self):
+                calls.append(("thinking_header",))
+
+            def thinking_delta(self, text):
+                calls.append(("thinking_delta", text))
+
+            def thinking_footer(self, label=None):
+                calls.append(("thinking_footer", label))
+
+            def content_stream(self, text):
+                calls.append(("content_stream", text))
+
+            def content_final(self, text):
+                calls.append(("content_final", text))
+
+        chunk = SimpleNamespace(
+            message=SimpleNamespace(
+                content="The final answer.",
+                thinking="Check the evidence first.",
+                planning="",
+                tool_calls=[],
+                provider_metadata={},
+            ),
+            prompt_eval_count=4,
+            eval_count=3,
+            done_reason="stop",
+        )
+        terminal.set_display_sink(FakeSink())
+        with patch.object(core, "chat_with_model", return_value=iter([chunk])):
+            response = core._stream_thinking_response(
+                "selene",
+                [{"role": "user", "content": "answer carefully"}],
+                session={"model_id": "local:default", "options": {}},
+            )
+
+        self.assertEqual(response["thinking"], "Check the evidence first.")
+        self.assertEqual(response["content"], "The final answer.")
+        self.assertIn(("thinking_delta", "Check the evidence first."), calls)
+        self.assertIn(("content_final", "The final answer."), calls)
+
+    def test_model_error_updates_tui_model_and_continues_with_fallback(self):
+        from agent import core
+        from agent.model_providers import ProviderNetworkError
+
+        calls: list[tuple] = []
+
+        class FakeSink:
+            is_tui = True
+
+            def lab_status(self, message, *, kind="info", detail=None):
+                calls.append(("status", message, kind, detail))
+
+            def refresh_runtime_meta(self):
+                calls.append(("refresh_runtime_meta",))
+
+            def activity_start(self, label="Thinking"):
+                calls.append(("activity_start", label))
+
+            def activity_update(self, label):
+                calls.append(("activity_update", label))
+
+            def activity_stop(self):
+                calls.append(("activity_stop",))
+
+            def thinking_header(self):
+                calls.append(("thinking_header",))
+
+            def thinking_delta(self, text):
+                calls.append(("thinking_delta", text))
+
+            def thinking_footer(self, label=None):
+                calls.append(("thinking_footer", label))
+
+            def content_stream(self, text):
+                calls.append(("content_stream", text))
+
+            def content_final(self, text):
+                calls.append(("content_final", text))
+
+        completed = SimpleNamespace(
+            message=SimpleNamespace(
+                content="Recovered answer.",
+                thinking="",
+                tool_calls=[],
+                provider_metadata={},
+            ),
+            prompt_eval_count=4,
+            eval_count=3,
+            done_reason="stop",
+        )
+        environment = {
+            "GEMINI_API_KEY": "google-secret",
+            "GEMINI_MODELS": "gemini-3.5-flash,gemma-4-31b-it",
+        }
+        persistent = core._new_session_state()
+        persistent["model_id"] = "gemini:gemini-3.5-flash"
+        terminal.set_display_sink(FakeSink())
+        with (
+            patch.dict("os.environ", environment, clear=True),
+            patch.object(
+                core,
+                "chat_with_model",
+                side_effect=[
+                    ProviderNetworkError("Primary failed.", code="network_failure"),
+                    iter([completed]),
+                ],
+            ) as model_chat,
+        ):
+            request = core.session_for_model(
+                persistent, core.get_runtime_config(persistent)
+            )
+            response = core._stream_thinking_response(
+                "selene",
+                [{"role": "user", "content": "answer carefully"}],
+                session=request,
+                persistent_session=persistent,
+            )
+
+        self.assertEqual(response["content"], "Recovered answer.")
+        self.assertEqual(persistent["model_id"], "gemini:gemma-4-31b-it")
+        self.assertEqual(request["model_id"], "gemini:gemma-4-31b-it")
+        self.assertEqual(model_chat.call_count, 2)
+        self.assertIn(("refresh_runtime_meta",), calls)
+        self.assertTrue(any(
+            call[0] == "status" and "continuing automatically" in call[1]
+            for call in calls
+        ))
 
 
 class TuiSelectionTests(unittest.TestCase):
@@ -403,6 +549,88 @@ class TuiAppSmokeTests(unittest.TestCase):
                 self.assertTrue(fold.has_class("-expanded"))
                 fold.action_toggle()
                 self.assertFalse(fold._expanded)
+
+        asyncio.run(_run())
+
+    def test_loaded_api_thinking_stays_in_a_thinking_fold(self):
+        try:
+            import textual  # noqa: F401
+        except ImportError:
+            self.skipTest("textual not installed")
+
+        import asyncio
+
+        from agent.tui import build_app_class
+
+        AppCls = build_app_class()
+        history = [{
+            "role": "assistant",
+            "thinking": "Check the evidence before answering.",
+            "content": "The final answer.",
+        }]
+        app = AppCls(
+            session={"history": True, "system": "", "options": {}, "verbose": False,
+                     "wordwrap": True, "format": "", "think": True,
+                     "runtime_profile": "manual"},
+            history=history,
+            default_system_prompt="sys",
+            process_turn=lambda *a, **k: None,
+            handle_command=lambda *a, **k: True,
+            slash_completions=("/help",),
+            slash_descriptions={"/help": "Show help"},
+            status_meta={"profile": "manual", "model": "gemini-3.5-flash"},
+        )
+
+        async def _run():
+            async with app.run_test() as pilot:
+                app._rebuild_transcript_from_history()
+                await pilot.pause()
+                folds = list(app.query("ThinkingFold"))
+                self.assertEqual(len(folds), 1)
+                self.assertIn("evidence", folds[0]._full_text)
+                self.assertNotIn("final answer", folds[0]._full_text.casefold())
+
+        asyncio.run(_run())
+
+    def test_legacy_planning_history_is_restored_as_thinking(self):
+        try:
+            import textual  # noqa: F401
+        except ImportError:
+            self.skipTest("textual not installed")
+
+        import asyncio
+
+        from agent.tui import build_app_class
+
+        AppCls = build_app_class()
+        history = [{
+            "role": "assistant",
+            "planning": "Inspect the repository, implement, then validate.",
+            "content": "Done.",
+        }]
+        app = AppCls(
+            session={"history": True, "system": "", "options": {}, "verbose": False,
+                     "wordwrap": True, "format": "", "think": True, "runtime_profile": "manual"},
+            history=history,
+            default_system_prompt="sys",
+            process_turn=lambda *a, **k: None,
+            handle_command=lambda *a, **k: True,
+            slash_completions=("/help",),
+            slash_descriptions={"/help": "Show help"},
+            status_meta={"profile": "manual", "model": "selene"},
+        )
+
+        async def _run():
+            async with app.run_test() as pilot:
+                app._rebuild_transcript_from_history()
+                await pilot.pause()
+                folds = list(app.query("ThinkingFold"))
+                self.assertEqual(len(folds), 1)
+                fold = folds[0]
+                self.assertIn("implement", fold._full_text)
+                self.assertFalse(fold._expanded)
+                fold.action_toggle()
+                self.assertTrue(fold._expanded)
 
         asyncio.run(_run())
 

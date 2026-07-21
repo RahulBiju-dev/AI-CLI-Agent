@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import unittest
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 from agent.runtime_config import RuntimeConfigurationError
 from agent.modes import (
+    AGENT_MODE_SLASH_COMMANDS,
     DEEP_RESEARCH_COMPACT_MARKER,
     compact_deep_research_messages,
     force_hard_web_search_schema,
@@ -27,6 +29,102 @@ class AgentModePolicyTests(unittest.TestCase):
         self.assertEqual(normalize_agent_mode("Deep_Research"), "deep-research")
         with self.assertRaises(ValueError):
             normalize_agent_mode("unbounded-magic")
+
+    def test_direct_slash_commands_map_to_the_three_modes(self):
+        self.assertEqual(
+            AGENT_MODE_SLASH_COMMANDS,
+            {
+                "/fast": "normal",
+                "/ultrathink": "ultra",
+                "/deepresearch": "deep-research",
+            },
+        )
+
+    def test_web_slash_commands_update_conversation_mode(self):
+        from agent import web
+
+        session = web._session_from_runtime(web.get_runtime_config())
+        for command, expected in AGENT_MODE_SLASH_COMMANDS.items():
+            result = web.execute_command_web(command, session, [])
+            self.assertEqual(session["agent_mode"], expected)
+            self.assertIn("Mode", result)
+
+    def test_terminal_slash_commands_update_conversation_mode(self):
+        from agent import core
+
+        session = core._new_session_state()
+        for command in AGENT_MODE_SLASH_COMMANDS:
+            self.assertIn(command, core.CLI_SLASH_COMPLETIONS)
+        with patch.object(core, "_refresh_tui_runtime_meta"):
+            for command, expected in AGENT_MODE_SLASH_COMMANDS.items():
+                self.assertTrue(core._handle_command(command, session, []))
+                self.assertEqual(session["agent_mode"], expected)
+
+    def test_terminal_deep_research_uses_mode_prompt_and_hard_search_schema(self):
+        from agent import core
+
+        session = core._new_session_state()
+        session["agent_mode"] = "deep-research"
+        history = []
+        response = {"role": "assistant", "content": "done"}
+        with (
+            patch.object(core, "_stream_complete_response", return_value=response) as stream,
+            patch.object(core, "_check_and_compact_history"),
+        ):
+            core.process_user_turn("compare the evidence", session, history, "system")
+
+        request = stream.call_args.kwargs
+        self.assertIn("Deep Research mode is active", request["messages"][-1]["content"])
+        self.assertIn("compare the evidence", request["messages"][-1]["content"])
+        web_search = next(
+            tool for tool in request["tools"]
+            if tool["function"]["name"] == "web_search"
+        )
+        difficulty = web_search["function"]["parameters"]["properties"]["difficulty"]
+        self.assertEqual(difficulty["enum"], ["hard"])
+        self.assertEqual(history[1]["content"], "compare the evidence")
+
+    def test_terminal_enhanced_mode_forces_easy_search_call_to_hard(self):
+        from agent import core
+
+        session = core._new_session_state()
+        session["agent_mode"] = "ultra"
+        first = {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "function": {
+                    "name": "web_search",
+                    "arguments": {"query": "topic", "difficulty": "easy"},
+                },
+            }],
+        }
+        final = {"role": "assistant", "content": "done"}
+        process_tools = MagicMock(return_value=[{
+            "role": "tool",
+            "tool_name": "web_search",
+            "name": "web_search",
+            "content": "[]",
+        }])
+        with (
+            patch.object(
+                core,
+                "_stream_complete_response",
+                side_effect=[first, final],
+            ) as stream,
+            patch.object(core, "_process_tool_calls_with_turn_guard", process_tools),
+            patch.object(core, "_check_and_compact_history"),
+        ):
+            core.process_user_turn("research topic", session, [], "system")
+
+        calls = process_tools.call_args.args[0]
+        self.assertEqual(calls[0]["function"]["arguments"]["difficulty"], "hard")
+        continuation = stream.call_args_list[1].kwargs["messages"]
+        self.assertTrue(any(
+            message.get("role") == "user"
+            and "Ultra Thinking mode is active" in message.get("content", "")
+            for message in continuation
+        ))
 
     def test_research_breadth_scales_with_context(self):
         self.assertEqual(research_query_count(4096), 3)
@@ -176,6 +274,9 @@ class AgentModeFrontendTests(unittest.TestCase):
         self.assertIn("function setAgentMode(mode)", APP)
         self.assertIn('agent_mode: "normal"', APP)
         self.assertIn('normal: { label: "Fast"', APP)
+        self.assertIn('{ command: "/fast"', APP)
+        self.assertIn('{ command: "/ultrathink"', APP)
+        self.assertIn('{ command: "/deepresearch"', APP)
         self.assertIn("await settingsWriteChain;", APP)
         self.assertIn('appendStatus(event.message || "", event.activity_mode || "")', APP)
         self.assertIn("function appendModeActivity(text, activityMode)", APP)
