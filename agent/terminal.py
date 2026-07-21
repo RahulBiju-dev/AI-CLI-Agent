@@ -1891,7 +1891,9 @@ def _display_text(value: object) -> str:
     if value is None:
         return ""
     if isinstance(value, str):
-        return value
+        from agent.model_providers import repair_text_encoding
+
+        return repair_text_encoding(value)
     if isinstance(value, (int, float, bool)):
         return str(value)
     if isinstance(value, (list, tuple)):

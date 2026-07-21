@@ -113,6 +113,15 @@ class WebThemeTests(unittest.TestCase):
         self.assertIn('class="theme-backdrop"', HTML)
         self.assertRegex(STYLE, r"\.theme-backdrop\[hidden\]\s*\{\s*display:\s*none;")
         self.assertRegex(STYLE, r"\.theme-backdrop\.open\s*\{[^}]*pointer-events:\s*auto;")
+        for binding in (
+            'el.themeButton = document.getElementById("theme-btn")',
+            'el.themeBackdrop = document.getElementById("theme-backdrop")',
+            'el.themeDialog = document.getElementById("theme-dialog")',
+            'el.themeOptions = document.getElementById("theme-options")',
+        ):
+            with self.subTest(binding=binding):
+                self.assertIn(binding, APP)
+        self.assertIn("if (handleThemeCommand(text))", APP)
 
     def test_theme_picker_has_grid_navigation_and_focus_trapping(self) -> None:
         self.assertIn("function themeGridColumns()", APP)

@@ -140,7 +140,7 @@ class DisplaySinkRoutingTests(unittest.TestCase):
         self.assertIn(("thinking_delta", "Check the evidence first."), calls)
         self.assertIn(("content_final", "The final answer."), calls)
 
-    def test_model_error_updates_tui_model_and_continues_with_fallback(self):
+    def test_model_errors_update_tui_through_flash_lite_then_local(self):
         from agent import core
         from agent.model_providers import ProviderNetworkError
 
@@ -192,7 +192,7 @@ class DisplaySinkRoutingTests(unittest.TestCase):
         )
         environment = {
             "GEMINI_API_KEY": "google-secret",
-            "GEMINI_MODELS": "gemini-3.5-flash,gemma-4-31b-it",
+            "GEMINI_MODELS": "gemini-3.5-flash,gemini-3.1-flash-lite",
         }
         persistent = core._new_session_state()
         persistent["model_id"] = "gemini:gemini-3.5-flash"
@@ -204,6 +204,7 @@ class DisplaySinkRoutingTests(unittest.TestCase):
                 "chat_with_model",
                 side_effect=[
                     ProviderNetworkError("Primary failed.", code="network_failure"),
+                    ProviderNetworkError("Flash Lite failed.", code="network_failure"),
                     iter([completed]),
                 ],
             ) as model_chat,
@@ -219,14 +220,13 @@ class DisplaySinkRoutingTests(unittest.TestCase):
             )
 
         self.assertEqual(response["content"], "Recovered answer.")
-        self.assertEqual(persistent["model_id"], "gemini:gemma-4-31b-it")
-        self.assertEqual(request["model_id"], "gemini:gemma-4-31b-it")
-        self.assertEqual(model_chat.call_count, 2)
+        self.assertEqual(persistent["model_id"], "local:default")
+        self.assertEqual(model_chat.call_count, 3)
         self.assertIn(("refresh_runtime_meta",), calls)
-        self.assertTrue(any(
-            call[0] == "status" and "continuing automatically" in call[1]
-            for call in calls
-        ))
+        status_text = "\n".join(call[1] for call in calls if call[0] == "status")
+        self.assertIn("gemini-3.1-flash-lite", status_text)
+        self.assertIn("Gemma 4 E4B", status_text)
+        self.assertIn("continuing automatically", status_text)
 
 
 class TuiSelectionTests(unittest.TestCase):

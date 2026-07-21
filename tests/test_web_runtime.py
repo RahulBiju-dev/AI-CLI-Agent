@@ -514,7 +514,7 @@ class TestChatEventTerminalState(unittest.TestCase):
         self.assertEqual(history[-1]["thinking"], "Check the evidence first.")
         self.assertEqual(history[-1]["content"], "The final answer.")
 
-    def test_model_error_switches_to_gemma_fallback_and_continues(self):
+    def test_model_error_switches_to_flash_lite_fallback_and_continues(self):
         from agent import web
         from agent.model_providers import ProviderNetworkError
         from agent.runtime_config import get_runtime_config
@@ -532,7 +532,7 @@ class TestChatEventTerminalState(unittest.TestCase):
         )
         environment = {
             "GEMINI_API_KEY": "google-secret",
-            "GEMINI_MODELS": "gemini-3.5-flash,gemma-4-31b-it",
+            "GEMINI_MODELS": "gemini-3.5-flash,gemini-3.1-flash-lite",
         }
         history = []
         with (
@@ -565,9 +565,9 @@ class TestChatEventTerminalState(unittest.TestCase):
 
         fallback = next(event for event in events if event.get("type") == "model_fallback")
         terminal = next(event for event in events if event.get("type") == "done")
-        self.assertEqual(fallback["model"]["id"], "gemini:gemma-4-31b-it")
+        self.assertEqual(fallback["model"]["id"], "gemini:gemini-3.1-flash-lite")
         self.assertIn("continuing automatically", fallback["message"])
-        self.assertEqual(session["model_id"], "gemini:gemma-4-31b-it")
+        self.assertEqual(session["model_id"], "gemini:gemini-3.1-flash-lite")
         self.assertEqual(history[-1]["content"], "Recovered answer.")
         self.assertEqual(terminal["state"], "completed")
         chat_calls = [
@@ -576,15 +576,26 @@ class TestChatEventTerminalState(unittest.TestCase):
         ]
         self.assertEqual(len(chat_calls), 2)
 
-    def test_failed_fallback_error_explains_automatic_retry(self):
+    def test_failed_flash_lite_fallback_switches_to_local_and_continues(self):
         from agent import web
         from agent.model_providers import ProviderNetworkError
         from agent.runtime_config import get_runtime_config
 
         environment = {
             "GEMINI_API_KEY": "google-secret",
-            "GEMINI_MODELS": "gemini-3.5-flash,gemma-4-31b-it",
+            "GEMINI_MODELS": "gemini-3.5-flash,gemini-3.1-flash-lite",
         }
+        completed = SimpleNamespace(
+            message=SimpleNamespace(
+                content="Recovered locally.",
+                thinking="",
+                tool_calls=[],
+                provider_metadata={},
+            ),
+            prompt_eval_count=4,
+            eval_count=3,
+            done_reason="stop",
+        )
         history = []
         with (
             tempfile.TemporaryDirectory() as temporary,
@@ -595,9 +606,10 @@ class TestChatEventTerminalState(unittest.TestCase):
                 "_model_chat",
                 side_effect=[
                     ProviderNetworkError("Primary failed.", code="network_failure"),
-                    ProviderNetworkError("Fallback failed.", code="network_failure"),
+                    ProviderNetworkError("Flash Lite failed.", code="network_failure"),
+                    iter([completed]),
                 ],
-            ),
+            ) as model_chat,
         ):
             runtime = get_runtime_config()
             session = {
@@ -614,11 +626,22 @@ class TestChatEventTerminalState(unittest.TestCase):
                 client_id="client-one",
             ))
 
+        fallbacks = [
+            event for event in events if event.get("type") == "model_fallback"
+        ]
         terminal = next(event for event in events if event.get("type") == "done")
-        self.assertEqual(terminal["state"], "failed")
-        self.assertIn("automatically switched", terminal["error"])
-        self.assertIn("fallback model also failed", terminal["error"])
-        self.assertEqual(session["model_id"], "gemini:gemma-4-31b-it")
+        self.assertEqual(
+            [event["model"]["id"] for event in fallbacks],
+            ["gemini:gemini-3.1-flash-lite", "local:default"],
+        )
+        self.assertEqual(terminal["state"], "completed")
+        self.assertEqual(session["model_id"], "local:default")
+        self.assertEqual(history[-1]["content"], "Recovered locally.")
+        chat_calls = [
+            call for call in model_chat.call_args_list
+            if call.kwargs.get("kind") == web.OperationKind.CHAT
+        ]
+        self.assertEqual(len(chat_calls), 3)
 
     def test_midstream_model_error_preserves_partial_text_and_continues(self):
         from agent import web
@@ -651,7 +674,7 @@ class TestChatEventTerminalState(unittest.TestCase):
 
         environment = {
             "GEMINI_API_KEY": "google-secret",
-            "GEMINI_MODELS": "gemini-3.5-flash,gemma-4-31b-it",
+            "GEMINI_MODELS": "gemini-3.5-flash,gemini-3.1-flash-lite",
         }
         history = []
         with (
@@ -686,12 +709,12 @@ class TestChatEventTerminalState(unittest.TestCase):
         )
         self.assertEqual(visible, "Partial answer. Recovered continuation.")
         self.assertEqual(history[-1]["content"], visible)
-        self.assertEqual(session["model_id"], "gemini:gemma-4-31b-it")
+        self.assertEqual(session["model_id"], "gemini:gemini-3.1-flash-lite")
         self.assertEqual(
             sum(event.get("type") == "model_fallback" for event in events), 1
         )
 
-    def test_unconfigured_fallback_is_reported_without_retry_loop(self):
+    def test_unconfigured_flash_lite_fallback_skips_to_local_without_loop(self):
         from agent import web
         from agent.model_providers import ProviderNetworkError
         from agent.runtime_config import get_runtime_config
@@ -730,9 +753,16 @@ class TestChatEventTerminalState(unittest.TestCase):
 
         terminal = next(event for event in events if event.get("type") == "done")
         self.assertEqual(terminal["state"], "failed")
-        self.assertIn("tried to switch automatically", terminal["error"])
-        self.assertIn("fallback could not start", terminal["error"])
-        self.assertEqual(model_chat.call_count, 1)
+        self.assertIn("automatically continued through", terminal["error"])
+        self.assertIn("final fallback also failed", terminal["error"])
+        fallbacks = [
+            event for event in events if event.get("type") == "model_fallback"
+        ]
+        self.assertEqual(
+            [event["model"]["id"] for event in fallbacks], ["local:default"]
+        )
+        self.assertEqual(session["model_id"], "local:default")
+        self.assertEqual(model_chat.call_count, 2)
 
     def test_cancelled_implementation_becomes_cancelled_terminal(self):
         token = CancellationToken()
@@ -1492,6 +1522,40 @@ class TestHTTPGenerationLifecycle(unittest.TestCase):
         second.send_json_response.assert_called_once()
         self.assertEqual(second.send_json_response.call_args.args[0], 409)
         self.assertEqual(registry.active_operations(), [])
+
+    def test_cancel_generation_releases_ownership_immediately(self):
+        from agent import web
+
+        registry = GenerationRegistry()
+        store = ClientSessionStore({"options": {}, "history": True})
+        lease = registry.begin("conversation.json", "client-one", "generation-one")
+        handler = object.__new__(web.AgentHTTPRequestHandler)
+        handler.path = "/api/cancel-generation"
+        handler.headers = {
+            "Host": "127.0.0.1:5005",
+            "X-Selene-Client-ID": "client-one",
+        }
+        handler.read_json_body = MagicMock(return_value={
+            "client_id": "client-one",
+            "generation_id": "generation-one",
+        })
+        handler.send_json_response = MagicMock()
+        handler.end_headers = MagicMock()
+        handler.wfile = MagicMock()
+
+        with (
+            patch.object(web, "ACTIVE_GENERATIONS", registry),
+            patch.object(web, "CLIENT_SESSIONS", store),
+            patch.object(web, "get_ollama_coordinator", return_value=MagicMock()),
+        ):
+            handler.do_POST()
+
+        handler.send_json_response.assert_called_once_with(
+            202,
+            {"status": "cancelling", "generation_id": "generation-one"},
+        )
+        self.assertEqual(registry.active_operations(), [])
+        self.assertEqual(registry.get_terminal("generation-one").state, TerminalState.CANCELLED)
 
 
 class TestBackendShutdownOwnership(unittest.TestCase):

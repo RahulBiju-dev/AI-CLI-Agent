@@ -1243,7 +1243,7 @@ def _model_error_response(
     exc: Exception,
     *,
     interrupted: bool = False,
-    fallback_attempted: bool = False,
+    fallback_models: tuple[str, ...] = (),
     fallback_unavailable: str = "",
 ) -> str:
     """Return a secret-safe provider failure formatted for an assistant bubble."""
@@ -1253,15 +1253,16 @@ def _model_error_response(
         detail = str(exc)
     else:
         detail = "The model response stopped unexpectedly. Try again or select another model."
-    if fallback_attempted:
+    if fallback_models:
+        chain = " → ".join(f"**{name}**" for name in fallback_models)
         detail = (
-            "Selene automatically switched to **Gemma 4 31B IT** and continued the "
-            f"request, but the fallback model also failed.\n\n{detail}"
+            f"Selene automatically continued through {chain}, but the final fallback "
+            f"also failed.\n\n{detail}"
         )
     elif fallback_unavailable:
         detail = (
-            f"{detail}\n\nSelene tried to switch automatically to **Gemma 4 31B IT**, "
-            f"but the fallback could not start: {fallback_unavailable}"
+            f"{detail}\n\nSelene tried to switch automatically, but no remaining "
+            f"fallback could start: {fallback_unavailable}"
         )
     heading = "Response interrupted" if interrupted else "Couldn’t complete this response"
     return f"**{heading}.**\n\n{detail}"
@@ -1270,14 +1271,20 @@ def _model_error_response(
 def _activate_error_fallback(
     session_data: dict,
     runtime: RuntimeConfig,
+    attempted_model_ids: set[str],
 ) -> tuple[dict, RuntimeConfig, dict]:
-    """Persist and resolve the configured one-shot model-error fallback."""
-    fallback = resolve_error_fallback(session_data.get("model_id"), runtime)
+    """Persist and resolve the next model in the bounded fallback chain."""
+    fallback = resolve_error_fallback(
+        session_data.get("model_id"),
+        runtime,
+        attempted_model_ids=attempted_model_ids,
+    )
     if fallback is None:
         raise ModelProviderError(
-            "Gemma 4 31B IT is already active.",
+            "No automatic fallback models remain.",
             code="fallback_failed",
         )
+    attempted_model_ids.add(fallback.id)
     session_data["model_id"] = fallback.id
     request_session = _session_for_selected_model(session_data, runtime)
     request_runtime = get_runtime_config(request_session)
@@ -1285,7 +1292,7 @@ def _activate_error_fallback(
 
 
 def _model_fallback_event(model: dict, failed_model: str) -> dict:
-    display_name = str(model.get("display_name") or "Gemma 4 31B IT")
+    display_name = str(model.get("display_name") or "fallback model")
     return {
         "type": "model_fallback",
         "model": deepcopy(model),
@@ -1928,7 +1935,8 @@ def _generate_chat_events_impl(
     accumulated_content = ""
     accumulated_thinking = ""
     continuing_output = False
-    fallback_attempted = False
+    fallback_models: list[str] = []
+    attempted_model_ids = {str(session_data.get("model_id") or LOCAL_MODEL_ID)}
     while True:
         cancellation_token.raise_if_cancelled()
         suppress_vault_completion_claim = bool(
@@ -2005,22 +2013,22 @@ def _generate_chat_events_impl(
             raise
         except Exception as exc:
             fallback_unavailable = ""
-            if not fallback_attempted:
-                failed_model = str(session_data.get("model_id") or LOCAL_MODEL_ID)
-                try:
-                    request_session, runtime, fallback_model = _activate_error_fallback(
-                        session_data,
-                        runtime,
-                    )
-                except (ModelProviderError, RuntimeConfigurationError) as fallback_exc:
-                    fallback_unavailable = str(fallback_exc)
-                else:
-                    fallback_attempted = True
-                    yield _model_fallback_event(fallback_model, failed_model)
-                    continue
+            failed_model = str(session_data.get("model_id") or LOCAL_MODEL_ID)
+            try:
+                request_session, runtime, fallback_model = _activate_error_fallback(
+                    session_data,
+                    runtime,
+                    attempted_model_ids,
+                )
+            except (ModelProviderError, RuntimeConfigurationError) as fallback_exc:
+                fallback_unavailable = str(fallback_exc)
+            else:
+                fallback_models.append(str(fallback_model.get("display_name") or fallback_model["id"]))
+                yield _model_fallback_event(fallback_model, failed_model)
+                continue
             message = _model_error_response(
                 exc,
-                fallback_attempted=fallback_attempted,
+                fallback_models=tuple(fallback_models),
                 fallback_unavailable=fallback_unavailable,
             )
             assistant_msg = {"role": "assistant", "content": message, "error": True}
@@ -2129,42 +2137,42 @@ def _generate_chat_events_impl(
             if in_thinking:
                 yield {"type": "thinking_end"}
             fallback_unavailable = ""
-            if not fallback_attempted:
-                failed_model = str(session_data.get("model_id") or LOCAL_MODEL_ID)
-                try:
-                    request_session, runtime, fallback_model = _activate_error_fallback(
-                        session_data,
-                        runtime,
+            failed_model = str(session_data.get("model_id") or LOCAL_MODEL_ID)
+            try:
+                request_session, runtime, fallback_model = _activate_error_fallback(
+                    session_data,
+                    runtime,
+                    attempted_model_ids,
+                )
+            except (ModelProviderError, RuntimeConfigurationError) as fallback_exc:
+                fallback_unavailable = str(fallback_exc)
+            else:
+                fallback_models.append(str(fallback_model.get("display_name") or fallback_model["id"]))
+                accumulated_content += content_buf
+                accumulated_thinking += thinking_buf
+                if content_buf:
+                    messages_to_send = prepare_messages_for_model(
+                        [
+                            *messages_to_send,
+                            {"role": "assistant", "content": content_buf},
+                            {
+                                "role": "user",
+                                "content": OUTPUT_CONTINUATION_PROMPT.format(
+                                    user_input=user_input
+                                ),
+                            },
+                        ],
+                        request_session,
+                        tools=None,
                     )
-                except (ModelProviderError, RuntimeConfigurationError) as fallback_exc:
-                    fallback_unavailable = str(fallback_exc)
-                else:
-                    fallback_attempted = True
-                    accumulated_content += content_buf
-                    accumulated_thinking += thinking_buf
-                    if content_buf:
-                        messages_to_send = prepare_messages_for_model(
-                            [
-                                *messages_to_send,
-                                {"role": "assistant", "content": content_buf},
-                                {
-                                    "role": "user",
-                                    "content": OUTPUT_CONTINUATION_PROMPT.format(
-                                        user_input=user_input
-                                    ),
-                                },
-                            ],
-                            request_session,
-                            tools=None,
-                        )
-                        continuing_output = True
-                    yield _model_fallback_event(fallback_model, failed_model)
-                    continue
+                    continuing_output = True
+                yield _model_fallback_event(fallback_model, failed_model)
+                continue
             existing_content = accumulated_content + content_buf
             error_text = _model_error_response(
                 stream_error,
                 interrupted=bool(existing_content or thinking_buf),
-                fallback_attempted=fallback_attempted,
+                fallback_models=tuple(fallback_models),
                 fallback_unavailable=fallback_unavailable,
             )
             separator = "\n\n---\n\n" if existing_content else ""
@@ -3015,6 +3023,11 @@ class AgentHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
                 get_ollama_coordinator().cancel_owner(
                     f"web:{lease.generation_id}",
                     reason="Cancelled by the requesting browser tab",
+                )
+                ACTIVE_GENERATIONS.finish(
+                    lease,
+                    TerminalState.CANCELLED,
+                    "Cancelled by the requesting browser tab",
                 )
                 self.send_json_response(202, {
                     "status": "cancelling",

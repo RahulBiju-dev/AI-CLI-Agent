@@ -25,6 +25,7 @@ from agent.model_providers import (
     build_model_registry,
     chat_with_model,
     normalize_provider_text,
+    repair_text_encoding,
     resolve_model,
     resolve_error_fallback,
 )
@@ -85,28 +86,38 @@ class EnvironmentTests(unittest.TestCase):
             GEMINI_FREE_CHAT_MODELS,
         )
 
+    def test_env_example_exposes_nvidia_multi_model_configuration(self):
+        example = (ROOT / ".env.example").read_text(encoding="utf-8")
+        self.assertIn("NVIDIA_API_KEY=", example)
+        self.assertIn("NVIDIA_MODELS=", example)
+        self.assertIn("NVIDIA_BASE_URL=", example)
+        self.assertIn("NVIDIA_CONTEXT_WINDOW=", example)
+
 
 class RegistryTests(unittest.TestCase):
-    def test_error_fallback_resolves_only_when_configured_and_not_active(self):
+    def test_error_fallback_chain_prefers_flash_lite_then_local(self):
         environment = {
             "GEMINI_API_KEY": "google-secret",
-            "GEMINI_MODELS": "gemini-3.5-flash,gemma-4-31b-it",
+            "GEMINI_MODELS": "gemini-3.5-flash,gemini-3.1-flash-lite",
         }
         fallback = resolve_error_fallback(
             "gemini:gemini-3.5-flash", runtime(), environment
         )
         self.assertEqual(fallback.id, ERROR_FALLBACK_MODEL_ID)
-        self.assertIsNone(resolve_error_fallback(ERROR_FALLBACK_MODEL_ID, runtime(), environment))
-
-        with self.assertRaises(UnsupportedModelError):
-            resolve_error_fallback(
-                "gemini:gemini-3.5-flash",
-                runtime(),
-                {
-                    "GEMINI_API_KEY": "google-secret",
-                    "GEMINI_MODELS": "gemini-3.5-flash",
-                },
-            )
+        local = resolve_error_fallback(ERROR_FALLBACK_MODEL_ID, runtime(), environment)
+        self.assertEqual(local.id, "local:default")
+        self.assertIsNone(resolve_error_fallback(
+            "local:default",
+            runtime(),
+            environment,
+            attempted_model_ids=(ERROR_FALLBACK_MODEL_ID,),
+        ))
+        without_gemini = resolve_error_fallback(
+            "gemini:gemini-3.5-flash",
+            runtime(),
+            {"GEMINI_API_KEY": "google-secret", "GEMINI_MODELS": "gemini-3.5-flash"},
+        )
+        self.assertEqual(without_gemini.id, "local:default")
 
     def test_only_configured_remote_models_are_available(self):
         environment = {
@@ -123,7 +134,7 @@ class RegistryTests(unittest.TestCase):
             ids,
             [
                 "local:default",
-                "openrouter:default",
+                "openrouter:openrouter/free",
                 "gemini:gemini-2.5-flash",
                 "custom:default",
             ],
@@ -165,6 +176,76 @@ class RegistryTests(unittest.TestCase):
                 "gemini:gemini-2.5-flash-lite",
             ],
         )
+
+    def test_one_openrouter_key_exposes_each_configured_free_model(self):
+        models = available_models(
+            runtime(),
+            {
+                "OPENROUTER_API_KEY": "secret",
+                "OPENROUTER_MODELS": (
+                    "openrouter/free,nvidia/nemotron-3-ultra-550b-a55b:free,openrouter/free"
+                ),
+            },
+        )
+        self.assertEqual(
+            [model["id"] for model in models],
+            [
+                "local:default",
+                "openrouter:openrouter/free",
+                "openrouter:nvidia/nemotron-3-ultra-550b-a55b:free",
+            ],
+        )
+        self.assertTrue(all(
+            model["provider"] == "OpenRouter" for model in models[1:]
+        ))
+
+    def test_one_nvidia_key_exposes_each_configured_model(self):
+        models = available_models(
+            runtime(),
+            {
+                "NVIDIA_API_KEY": "secret",
+                "NVIDIA_MODELS": (
+                    "nvidia/llama-3.1-nemotron-ultra-253b-v1,"
+                    "meta/llama-3.3-70b-instruct,"
+                    "nvidia/llama-3.1-nemotron-ultra-253b-v1"
+                ),
+            },
+        )
+        self.assertEqual(
+            [model["id"] for model in models],
+            [
+                "local:default",
+                "nvidia:nvidia/llama-3.1-nemotron-ultra-253b-v1",
+                "nvidia:meta/llama-3.3-70b-instruct",
+            ],
+        )
+        self.assertTrue(all(model["provider"] == "NVIDIA" for model in models[1:]))
+        self.assertNotIn("secret", json.dumps(models))
+
+    def test_nvidia_models_are_hidden_until_key_and_model_list_are_set(self):
+        environment = {
+            "NVIDIA_MODELS": "meta/llama-3.3-70b-instruct",
+        }
+        self.assertEqual(
+            [model["id"] for model in available_models(runtime(), environment)],
+            ["local:default"],
+        )
+        with self.assertRaises(MissingProviderConfiguration) as error:
+            resolve_model(
+                "nvidia:meta/llama-3.3-70b-instruct", runtime(), environment
+            )
+        self.assertIn("NVIDIA_API_KEY", str(error.exception))
+
+    def test_legacy_openrouter_selection_uses_first_available_configured_model(self):
+        model = resolve_model(
+            "openrouter:default",
+            runtime(),
+            {
+                "OPENROUTER_API_KEY": "secret",
+                "OPENROUTER_MODELS": "vendor/paid,nvidia/nemotron:free",
+            },
+        )
+        self.assertEqual(model.id, "openrouter:nvidia/nemotron:free")
 
     def test_gemini_registry_uses_each_models_native_context_maximum(self):
         models = available_models(
@@ -221,6 +302,7 @@ class RegistryTests(unittest.TestCase):
     def test_registry_keeps_configuration_metadata_centralized(self):
         registry = build_model_registry(runtime(), {})
         self.assertEqual(registry["openrouter:default"].api_key_env, "OPENROUTER_API_KEY")
+        self.assertEqual(registry["nvidia:default"].api_key_env, "NVIDIA_API_KEY")
         self.assertEqual(registry["gemini:default"].api_key_env, "GEMINI_API_KEY")
         self.assertEqual(registry["custom:default"].provider, "OpenAI-compatible / self-hosted")
         self.assertNotIn("openai:default", registry)
@@ -244,9 +326,10 @@ class RegistryTests(unittest.TestCase):
         with patch.dict(
             "os.environ",
             {"OPENROUTER_API_KEY": "secret", "OPENROUTER_MODEL": "openrouter/free"},
+            clear=True,
         ):
             normalized = web._normalize_session_settings({"model_id": "openrouter:default"})
-        self.assertEqual(normalized["model_id"], "openrouter:default")
+        self.assertEqual(normalized["model_id"], "openrouter:openrouter/free")
 
     def test_web_session_validation_uses_standard_error_for_stale_model(self):
         from agent import web
@@ -260,6 +343,67 @@ class RegistryTests(unittest.TestCase):
 
 
 class AdapterTests(unittest.TestCase):
+    def test_nvidia_uses_openai_compatible_endpoint_with_selected_model(self):
+        response = FakeResponse({
+            "choices": [{"message": {"content": "NVIDIA answer."}}],
+            "usage": {"prompt_tokens": 8, "completion_tokens": 3},
+        })
+        with patch("agent.model_providers.requests.post", return_value=response) as post:
+            result = chat_with_model(
+                {"model_id": "nvidia:meta/llama-3.3-70b-instruct"},
+                runtime(),
+                ollama_service_factory=MagicMock(),
+                environ={
+                    "NVIDIA_API_KEY": "nvidia-secret",
+                    "NVIDIA_MODELS": "meta/llama-3.3-70b-instruct",
+                },
+                messages=[{"role": "user", "content": "hello"}],
+                stream=False,
+            )
+
+        self.assertEqual(result.message.content, "NVIDIA answer.")
+        self.assertEqual(
+            post.call_args.args[0],
+            "https://integrate.api.nvidia.com/v1/chat/completions",
+        )
+        self.assertEqual(
+            post.call_args.kwargs["headers"]["Authorization"],
+            "Bearer nvidia-secret",
+        )
+        self.assertEqual(
+            post.call_args.kwargs["json"]["model"],
+            "meta/llama-3.3-70b-instruct",
+        )
+        self.assertIn(
+            "You are Selene",
+            post.call_args.kwargs["json"]["messages"][0]["content"],
+        )
+
+    def test_mojibake_is_repaired_without_changing_valid_unicode(self):
+        self.assertEqual(repair_text_encoding("High (â‚¹1,00,000+)"), "High (₹1,00,000+)")
+        self.assertEqual(repair_text_encoding("FranÃ§ais â€” résumé"), "Français — résumé")
+        self.assertEqual(repair_text_encoding("₹ déjà correct"), "₹ déjà correct")
+
+    def test_provider_sse_bytes_are_always_decoded_as_utf8(self):
+        event = json.dumps(
+            {"choices": [{"delta": {"content": "High (₹1,00,000+)"}}]},
+            ensure_ascii=False,
+        ).encode("utf-8")
+        response = FakeResponse(lines=[b"data: " + event, b"data: [DONE]"])
+        with patch("agent.model_providers.requests.post", return_value=response):
+            chunks = list(chat_with_model(
+                {"model_id": "openrouter:default"},
+                runtime(),
+                ollama_service_factory=MagicMock(),
+                environ={
+                    "OPENROUTER_API_KEY": "secret",
+                    "OPENROUTER_MODEL": "openrouter/free",
+                },
+                messages=[{"role": "user", "content": "salary"}],
+                stream=True,
+            ))
+        self.assertEqual(chunks[0].message.content, "High (₹1,00,000+)")
+
     def test_structured_provider_content_is_normalized_to_display_text(self):
         content = [
             {"type": "text", "text": "Hello **world**"},
@@ -857,8 +1001,32 @@ class AdapterTests(unittest.TestCase):
 
 
 class ModelSelectorFrontendTests(unittest.TestCase):
+    def test_web_composer_up_arrow_recalls_previous_user_prompts(self):
+        self.assertIn("promptRecall: {", APP)
+        self.assertIn("if (handlePromptHistoryKeydown(event)) return", APP)
+        self.assertIn("function promptHistory()", APP)
+        self.assertIn("message?.role === \"user\"", APP)
+        self.assertIn("function handlePromptHistoryKeydown(event)", APP)
+        self.assertIn('event.key === "ArrowUp"', APP)
+        self.assertIn('event.key === "ArrowDown"', APP)
+        self.assertIn("if (el.input.value) return false", APP)
+        self.assertIn("el.input.setSelectionRange(cursor, cursor)", APP)
+
+    def test_prompt_edit_and_response_copy_actions_cover_saved_and_live_messages(self):
+        self.assertIn('appendMessageActions(row.stack, "edit")', APP)
+        self.assertIn('appendMessageActions(row.stack, "copy")', APP)
+        self.assertIn('appendMessageActions(state.stream.assistantStack, "copy")', APP)
+        self.assertIn("function editPromptMessage(button)", APP)
+        self.assertIn("function copyResponseMessage(button)", APP)
+        self.assertIn("function writeClipboardText(text)", APP)
+        self.assertIn("node.dataset.messageText = text", APP)
+        self.assertIn(".message-actions", STYLE)
+        self.assertIn(".message-action", STYLE)
+
     def test_api_response_rendering_normalizes_parts_and_falls_back_to_plain_text(self):
         self.assertIn("function displayText(value)", APP)
+        self.assertIn("function repairTextEncoding(value)", APP)
+        self.assertIn("WINDOWS_1252_BYTES", APP)
         self.assertIn("function renderResponseHTML(value)", APP)
         self.assertIn("function renderResponseInto(node, value)", APP)
         self.assertIn("return escapeHTML(text).replace", APP)

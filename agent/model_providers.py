@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
@@ -22,8 +23,9 @@ from agent.runtime_config import RuntimeConfig
 
 
 LOCAL_MODEL_ID = "local:default"
-ERROR_FALLBACK_MODEL = "gemma-4-31b-it"
+ERROR_FALLBACK_MODEL = "gemini-3.1-flash-lite"
 ERROR_FALLBACK_MODEL_ID = f"gemini:{ERROR_FALLBACK_MODEL}"
+ERROR_FALLBACK_MODEL_IDS = (ERROR_FALLBACK_MODEL_ID, LOCAL_MODEL_ID)
 DEFAULT_CAPABILITIES = frozenset({"chat", "streaming", "tools", "thinking", "json"})
 REMOTE_CAPABILITIES = frozenset({"chat", "streaming", "tools", "json"})
 GEMINI_FREE_CHAT_MODELS = (
@@ -145,6 +147,37 @@ def _clean(value: object) -> str:
     return str(value or "").strip()
 
 
+_MOJIBAKE_RUN = re.compile(r"(?:Ã.|Â.|â..|ð...|ï..)", re.DOTALL)
+
+
+def repair_text_encoding(value: str) -> str:
+    """Repair common UTF-8 bytes that were decoded as Windows-1252/Latin-1.
+
+    The replacement is deliberately limited to recognizable mojibake byte
+    runs. Correct Unicode and ordinary provider text are returned unchanged.
+    """
+    text = str(value or "")
+    if not any(marker in text for marker in ("Ã", "Â", "â", "ð", "ï")):
+        return text
+
+    def repair_run(match: re.Match[str]) -> str:
+        fragment = match.group(0)
+        for encoding in ("cp1252", "latin-1"):
+            try:
+                return fragment.encode(encoding).decode("utf-8")
+            except (UnicodeEncodeError, UnicodeDecodeError):
+                continue
+        return fragment
+
+    # Two passes also recover text that was accidentally transcoded twice.
+    for _ in range(2):
+        repaired = _MOJIBAKE_RUN.sub(repair_run, text)
+        if repaired == text:
+            break
+        text = repaired
+    return text
+
+
 def normalize_provider_text(value: object) -> str:
     """Return displayable text from provider string or content-part payloads.
 
@@ -156,7 +189,7 @@ def normalize_provider_text(value: object) -> str:
     if value is None:
         return ""
     if isinstance(value, str):
-        return value
+        return repair_text_encoding(value)
     if isinstance(value, (int, float, bool)):
         return str(value)
     if isinstance(value, (list, tuple)):
@@ -296,6 +329,88 @@ def _configured_gemini_models(environ: Mapping[str, str]) -> list[ModelDefinitio
     ]
 
 
+def _configured_openrouter_models(environ: Mapping[str, str]) -> list[ModelDefinition]:
+    configured = _clean(environ.get("OPENROUTER_MODELS"))
+    source_env = "OPENROUTER_MODELS"
+    if not configured:
+        configured = _clean(environ.get("OPENROUTER_MODEL"))
+        source_env = "OPENROUTER_MODEL"
+    models = list(dict.fromkeys(
+        model.strip() for model in configured.split(",") if model.strip()
+    ))
+    if not models:
+        return [_configured_model(
+            environ,
+            id="openrouter:default",
+            display_name=None,
+            provider="OpenRouter",
+            model_env="OPENROUTER_MODELS",
+            default_model="",
+            endpoint_env="OPENROUTER_BASE_URL",
+            default_endpoint="https://openrouter.ai/api/v1/chat/completions",
+            api_key_env="OPENROUTER_API_KEY",
+            required_env=("OPENROUTER_API_KEY", "OPENROUTER_MODELS"),
+            require_free_model=True,
+            context_window_env="OPENROUTER_CONTEXT_WINDOW",
+        )]
+    return [
+        _configured_model(
+            environ,
+            id=f"openrouter:{model}",
+            display_name=None,
+            provider="OpenRouter",
+            model_env=source_env,
+            model_value=model,
+            default_model="",
+            endpoint_env="OPENROUTER_BASE_URL",
+            default_endpoint="https://openrouter.ai/api/v1/chat/completions",
+            api_key_env="OPENROUTER_API_KEY",
+            required_env=("OPENROUTER_API_KEY",),
+            require_free_model=True,
+            context_window_env="OPENROUTER_CONTEXT_WINDOW",
+        )
+        for model in models
+    ]
+
+
+def _configured_nvidia_models(environ: Mapping[str, str]) -> list[ModelDefinition]:
+    configured = _clean(environ.get("NVIDIA_MODELS"))
+    models = list(dict.fromkeys(
+        model.strip() for model in configured.split(",") if model.strip()
+    ))
+    if not models:
+        return [_configured_model(
+            environ,
+            id="nvidia:default",
+            display_name=None,
+            provider="NVIDIA",
+            model_env="NVIDIA_MODELS",
+            default_model="",
+            endpoint_env="NVIDIA_BASE_URL",
+            default_endpoint="https://integrate.api.nvidia.com/v1/chat/completions",
+            api_key_env="NVIDIA_API_KEY",
+            required_env=("NVIDIA_API_KEY", "NVIDIA_MODELS"),
+            context_window_env="NVIDIA_CONTEXT_WINDOW",
+        )]
+    return [
+        _configured_model(
+            environ,
+            id=f"nvidia:{model}",
+            display_name=None,
+            provider="NVIDIA",
+            model_env="NVIDIA_MODELS",
+            model_value=model,
+            default_model="",
+            endpoint_env="NVIDIA_BASE_URL",
+            default_endpoint="https://integrate.api.nvidia.com/v1/chat/completions",
+            api_key_env="NVIDIA_API_KEY",
+            required_env=("NVIDIA_API_KEY",),
+            context_window_env="NVIDIA_CONTEXT_WINDOW",
+        )
+        for model in models
+    ]
+
+
 def build_model_registry(
     runtime: RuntimeConfig,
     environ: Mapping[str, str] | None = None,
@@ -316,20 +431,8 @@ def build_model_registry(
     )
     entries = [
         local,
-        _configured_model(
-            environment,
-            id="openrouter:default",
-            display_name=None,
-            provider="OpenRouter (free)",
-            model_env="OPENROUTER_MODEL",
-            default_model="",
-            endpoint_env="OPENROUTER_BASE_URL",
-            default_endpoint="https://openrouter.ai/api/v1/chat/completions",
-            api_key_env="OPENROUTER_API_KEY",
-            required_env=("OPENROUTER_API_KEY", "OPENROUTER_MODEL"),
-            require_free_model=True,
-            context_window_env="OPENROUTER_CONTEXT_WINDOW",
-        ),
+        *_configured_openrouter_models(environment),
+        *_configured_nvidia_models(environment),
         *_configured_gemini_models(environment),
         _configured_model(
             environment,
@@ -368,6 +471,15 @@ def resolve_model(
             (model.id for model in registry.values() if model.id.startswith("gemini:") and model.available),
             requested,
         )
+    if requested == "openrouter:default" and requested not in registry:
+        openrouter_models = [
+            model for model in registry.values()
+            if model.id.startswith("openrouter:")
+        ]
+        requested = next(
+            (model.id for model in openrouter_models if model.available),
+            openrouter_models[0].id if openrouter_models else requested,
+        )
     model = registry.get(requested)
     if model is None:
         raise UnsupportedModelError(
@@ -391,11 +503,19 @@ def resolve_error_fallback(
     current_model_id: object,
     runtime: RuntimeConfig,
     environ: Mapping[str, str] | None = None,
+    attempted_model_ids: Iterable[object] = (),
 ) -> ModelDefinition | None:
-    """Return the configured one-shot error fallback, or None if already active."""
-    if _clean(current_model_id) == ERROR_FALLBACK_MODEL_ID:
-        return None
-    return resolve_model(ERROR_FALLBACK_MODEL_ID, runtime, environ)
+    """Return the next available model in the bounded automatic fallback chain."""
+    attempted = {_clean(model_id) for model_id in attempted_model_ids}
+    attempted.add(_clean(current_model_id))
+    for fallback_id in ERROR_FALLBACK_MODEL_IDS:
+        if fallback_id in attempted:
+            continue
+        try:
+            return resolve_model(fallback_id, runtime, environ)
+        except (MissingProviderConfiguration, UnsupportedModelError):
+            continue
+    return None
 
 
 def session_for_model(
@@ -891,8 +1011,19 @@ def _iter_sse_json(response: requests.Response, provider: str) -> Iterator[dict[
         return None
 
     try:
-        for raw in response.iter_lines(decode_unicode=True):
-            line = str(raw or "").rstrip("\r")
+        # Provider SSE is UTF-8 JSON. Do not use requests' inferred response
+        # encoding here: text/event-stream endpoints often omit a charset and
+        # UTF-8 symbols then become mojibake such as ``₹`` -> ``â‚¹``.
+        for raw in response.iter_lines(decode_unicode=False):
+            if isinstance(raw, bytes):
+                try:
+                    line = raw.decode("utf-8")
+                except UnicodeDecodeError:
+                    malformed_event = True
+                    continue
+            else:
+                line = str(raw or "")
+            line = line.rstrip("\r")
             if not line:
                 if pending_data:
                     payload = parse_event("\n".join(pending_data))
@@ -1279,9 +1410,21 @@ def _remote_chat(
             timeout=operation_timeout,
             stream=streaming,
         )
+        release_response = token.add_cancel_callback(response.close)
+        try:
+            token.raise_if_cancelled()
+        except Exception:
+            release_response()
+            response.close()
+            raise
         if not streaming:
-            return _gemini_chunk(_response_json(response, definition.provider))
-        return _cancellable(_gemini_stream(response, definition), token)
+            try:
+                return _gemini_chunk(_response_json(response, definition.provider))
+            finally:
+                release_response()
+        return _cancellable(
+            _gemini_stream(response, definition), token, cleanup=release_response
+        )
 
     response = _post(
         definition,
@@ -1291,15 +1434,36 @@ def _remote_chat(
         timeout=operation_timeout,
         stream=streaming,
     )
-    if not streaming:
-        return _openai_chunk(_response_json(response, definition.provider), definition.provider)
-    return _cancellable(_openai_stream(response, definition), token)
-
-
-def _cancellable(chunks: Iterable[NormalizedChunk], token: CancellationToken) -> Iterator[NormalizedChunk]:
-    for chunk in chunks:
+    release_response = token.add_cancel_callback(response.close)
+    try:
         token.raise_if_cancelled()
-        yield chunk
+    except Exception:
+        release_response()
+        response.close()
+        raise
+    if not streaming:
+        try:
+            return _openai_chunk(_response_json(response, definition.provider), definition.provider)
+        finally:
+            release_response()
+    return _cancellable(
+        _openai_stream(response, definition), token, cleanup=release_response
+    )
+
+
+def _cancellable(
+    chunks: Iterable[NormalizedChunk],
+    token: CancellationToken,
+    *,
+    cleanup: Callable[[], None] | None = None,
+) -> Iterator[NormalizedChunk]:
+    try:
+        for chunk in chunks:
+            token.raise_if_cancelled()
+            yield chunk
+    finally:
+        if cleanup is not None:
+            cleanup()
 
 
 def chat_with_model(
