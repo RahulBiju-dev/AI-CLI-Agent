@@ -1201,15 +1201,21 @@ def _check_and_compact_history(history: list[dict], session: dict) -> None:
 def _activate_terminal_error_fallback(
     request_session: dict,
     persistent_session: dict | None,
+    attempted_model_ids: set[str],
 ) -> str:
-    """Switch CLI/TUI state to the configured one-shot fallback model."""
+    """Switch CLI/TUI state to the next model in the fallback chain."""
     runtime = get_runtime_config(request_session)
-    fallback = resolve_error_fallback(request_session.get("model_id"), runtime)
+    fallback = resolve_error_fallback(
+        request_session.get("model_id"),
+        runtime,
+        attempted_model_ids=attempted_model_ids,
+    )
     if fallback is None:
         raise ModelProviderError(
-            "Gemma 4 31B IT is already active.",
+            "No automatic fallback models remain.",
             code="fallback_failed",
         )
+    attempted_model_ids.add(fallback.id)
     request_session["model_id"] = fallback.id
     refreshed = session_for_model(request_session, runtime)
     request_session.clear()
@@ -1217,7 +1223,7 @@ def _activate_terminal_error_fallback(
     if persistent_session is not None:
         persistent_session["model_id"] = fallback.id
     print_warn(
-        "Model error · switched to Gemma 4 31B IT and continuing automatically"
+        f"Model error · switched to {fallback.display_name} and continuing automatically"
     )
     _refresh_tui_runtime_meta()
     if not display_is_tui():
@@ -1228,18 +1234,19 @@ def _activate_terminal_error_fallback(
 def _terminal_model_error(
     exc: Exception,
     *,
-    fallback_attempted: bool,
+    fallback_models: tuple[str, ...] = (),
     fallback_unavailable: str = "",
 ) -> str:
-    if fallback_attempted:
+    if fallback_models:
+        chain = " → ".join(fallback_models)
         return (
-            "Model request failed. Selene automatically switched to Gemma 4 31B IT "
-            f"and continued, but the fallback model also failed: {exc}"
+            f"Model request failed. Selene automatically continued through {chain}, "
+            f"but the final fallback also failed: {exc}"
         )
     if fallback_unavailable:
         return (
-            f"Model request failed: {exc}. Selene tried to switch automatically to "
-            f"Gemma 4 31B IT, but the fallback could not start: {fallback_unavailable}"
+            f"Model request failed: {exc}. Selene tried to switch automatically, "
+            f"but no remaining fallback could start: {fallback_unavailable}"
         )
     return f"Model request failed: {exc}"
 
@@ -1254,7 +1261,8 @@ def _stream_thinking_response(
     fmt: str | None = None,
     extra_reserved_tokens: int = 0,
     persistent_session: dict | None = None,
-    _fallback_attempted: bool = False,
+    _attempted_model_ids: frozenset[str] | None = None,
+    _fallback_models: tuple[str, ...] = (),
 ) -> dict:
     """Stream a response from the Ollama model, displaying thinking progress and final answer.
     
@@ -1278,6 +1286,8 @@ def _stream_thinking_response(
     t_start = time.monotonic()
     session_data = dict(session or {})
     session_data.setdefault("model_id", LOCAL_MODEL_ID)
+    attempted_model_ids = set(_attempted_model_ids or ())
+    attempted_model_ids.add(str(session_data.get("model_id") or LOCAL_MODEL_ID))
     if options is not None:
         session_data["options"] = dict(options)
     runtime_tools = tool_schemas_for_model(messages, session_data, tools)
@@ -1335,31 +1345,33 @@ def _stream_thinking_response(
     except (OllamaRuntimeError, ModelProviderError) as exc:
         spinner.stop()
         fallback_unavailable = ""
-        if not _fallback_attempted:
-            try:
-                _activate_terminal_error_fallback(request_session, persistent_session)
-            except (ModelProviderError, RuntimeConfigurationError) as fallback_exc:
-                fallback_unavailable = str(fallback_exc)
-            else:
-                if isinstance(session, dict):
-                    session["model_id"] = request_session["model_id"]
-                    session["options"] = dict(request_session.get("options") or {})
-                return _stream_thinking_response(
-                    model=model,
-                    messages=messages,
-                    session=request_session,
-                    tools=tools,
-                    options=None,
-                    verbose=verbose,
-                    think=think,
-                    fmt=fmt,
-                    extra_reserved_tokens=extra_reserved_tokens,
-                    persistent_session=persistent_session,
-                    _fallback_attempted=True,
-                )
+        try:
+            fallback_name = _activate_terminal_error_fallback(
+                request_session, persistent_session, attempted_model_ids
+            )
+        except (ModelProviderError, RuntimeConfigurationError) as fallback_exc:
+            fallback_unavailable = str(fallback_exc)
+        else:
+            if isinstance(session, dict):
+                session["model_id"] = request_session["model_id"]
+                session["options"] = dict(request_session.get("options") or {})
+            return _stream_thinking_response(
+                model=model,
+                messages=messages,
+                session=request_session,
+                tools=tools,
+                options=None,
+                verbose=verbose,
+                think=think,
+                fmt=fmt,
+                extra_reserved_tokens=extra_reserved_tokens,
+                persistent_session=persistent_session,
+                _attempted_model_ids=frozenset(attempted_model_ids),
+                _fallback_models=(*_fallback_models, fallback_name),
+            )
         message = _terminal_model_error(
             exc,
-            fallback_attempted=_fallback_attempted,
+            fallback_models=_fallback_models,
             fallback_unavailable=fallback_unavailable,
         )
         print_error(message)
@@ -1547,31 +1559,33 @@ def _stream_thinking_response(
             except Exception:
                 pass
         fallback_unavailable = ""
-        if not _fallback_attempted:
-            try:
-                _activate_terminal_error_fallback(request_session, persistent_session)
-            except (ModelProviderError, RuntimeConfigurationError) as fallback_exc:
-                fallback_unavailable = str(fallback_exc)
-            else:
-                if isinstance(session, dict):
-                    session["model_id"] = request_session["model_id"]
-                    session["options"] = dict(request_session.get("options") or {})
-                return _stream_thinking_response(
-                    model=model,
-                    messages=messages,
-                    session=request_session,
-                    tools=tools,
-                    options=None,
-                    verbose=verbose,
-                    think=think,
-                    fmt=fmt,
-                    extra_reserved_tokens=extra_reserved_tokens,
-                    persistent_session=persistent_session,
-                    _fallback_attempted=True,
-                )
+        try:
+            fallback_name = _activate_terminal_error_fallback(
+                request_session, persistent_session, attempted_model_ids
+            )
+        except (ModelProviderError, RuntimeConfigurationError) as fallback_exc:
+            fallback_unavailable = str(fallback_exc)
+        else:
+            if isinstance(session, dict):
+                session["model_id"] = request_session["model_id"]
+                session["options"] = dict(request_session.get("options") or {})
+            return _stream_thinking_response(
+                model=model,
+                messages=messages,
+                session=request_session,
+                tools=tools,
+                options=None,
+                verbose=verbose,
+                think=think,
+                fmt=fmt,
+                extra_reserved_tokens=extra_reserved_tokens,
+                persistent_session=persistent_session,
+                _attempted_model_ids=frozenset(attempted_model_ids),
+                _fallback_models=(*_fallback_models, fallback_name),
+            )
         message = _terminal_model_error(
             exc,
-            fallback_attempted=_fallback_attempted,
+            fallback_models=_fallback_models,
             fallback_unavailable=fallback_unavailable,
         )
         print_error(message)
@@ -2113,6 +2127,7 @@ def _build_cli_slash_specs() -> tuple[tuple[str, str], ...]:
         # Profiles — first-class + /set form for discoverability.
         ("/profile", "Show or set profile  ·  /profile <name>"),
         ("/set profile", "Set profile  ·  manual|auto|low-vram|balanced"),
+        ("/models", "List configured models"),
         ("/model", "Show or select model  ·  /model <id|number>"),
         ("/set model", "Select configured model  ·  /set model <id|number>"),
         ("/fast", "Mode · Fast response"),
@@ -3479,6 +3494,9 @@ def _handle_command(cmd: str, session: dict, history: list[dict]) -> bool | None
         _handle_theme(rest, session)
         return True
 
+    if base == "/models":
+        _print_model_catalog(session)
+        return
     if base in AGENT_MODE_SLASH_COMMANDS:
         _apply_agent_mode(session, AGENT_MODE_SLASH_COMMANDS[base])
         return True

@@ -170,6 +170,9 @@ const state = {
     selected: 0,
     matches: []
   },
+  promptRecall: {
+    index: null
+  },
   voice: {
     recognition: null,
     active: false,
@@ -291,7 +294,14 @@ function bindElements() {
   el.modeLabel = document.getElementById("mode-label");
   el.modeIcon = document.getElementById("mode-icon");
   el.modeClear = document.getElementById("mode-clear");
-  el.modelSelect = document.getElementById("model-select");
+  el.modelPicker = document.getElementById("model-picker");
+  el.modelTrigger = document.getElementById("model-trigger");
+  el.modelMenu = document.getElementById("model-menu");
+  el.modelLabel = document.getElementById("model-label");
+  el.themeButton = document.getElementById("theme-btn");
+  el.themeBackdrop = document.getElementById("theme-backdrop");
+  el.themeDialog = document.getElementById("theme-dialog");
+  el.themeOptions = document.getElementById("theme-options");
 }
 
 function bindEvents() {
@@ -304,6 +314,7 @@ function bindEvents() {
   });
 
   el.input?.addEventListener("input", () => {
+    resetPromptRecall();
     resizeComposer();
     updateComposerState();
     updateSlashMenu();
@@ -311,6 +322,7 @@ function bindEvents() {
 
   el.input?.addEventListener("keydown", (event) => {
     if (handleSlashKeydown(event)) return;
+    if (handlePromptHistoryKeydown(event)) return;
     if (event.key === "Enter" && !event.shiftKey) {
       event.preventDefault();
       if (state.isGenerating) stopGeneration();
@@ -323,6 +335,20 @@ function bindEvents() {
       closeSlashMenu();
     }
     if (!el.modePicker?.contains(event.target)) closeModeMenu();
+    if (!el.modelPicker?.contains(event.target)) closeModelMenu();
+  });
+
+  el.modelTrigger?.addEventListener("click", (event) => {
+    event.stopPropagation();
+    if (state.isGenerating) return;
+    if (el.modelMenu?.hidden) openModelMenu();
+    else closeModelMenu();
+  });
+  el.modelTrigger?.addEventListener("keydown", handleModelTriggerKeydown);
+  el.modelMenu?.addEventListener("keydown", handleModelMenuKeydown);
+  el.modelMenu?.addEventListener("click", (event) => {
+    const option = event.target.closest("[data-model-id]");
+    if (option) selectModel(option.dataset.modelId);
   });
 
   el.modeTrigger?.addEventListener("click", (event) => {
@@ -381,8 +407,15 @@ function bindEvents() {
     if (distanceFromBottom() < 24) state.followOutput = true;
   }, { passive: true });
   el.messages?.addEventListener("click", (event) => {
-    const button = event.target.closest(".code-copy-btn");
-    if (button && el.messages.contains(button)) copyCodeBlock(button);
+    const codeButton = event.target.closest(".code-copy-btn");
+    if (codeButton && el.messages.contains(codeButton)) {
+      copyCodeBlock(codeButton);
+      return;
+    }
+    const messageButton = event.target.closest(".message-action");
+    if (!messageButton || !el.messages.contains(messageButton)) return;
+    if (messageButton.dataset.action === "edit") editPromptMessage(messageButton);
+    if (messageButton.dataset.action === "copy") copyResponseMessage(messageButton);
   });
 
   el.history?.addEventListener("change", () => {
@@ -413,18 +446,6 @@ function bindEvents() {
   el.profileSetting?.addEventListener("change", () => {
     state.settings.runtime_profile = el.profileSetting.value;
     persistSettings();
-  });
-
-  el.modelSelect?.addEventListener("change", async () => {
-    if (state.isGenerating) return;
-    const previousModel = state.settings.model_id || "local:default";
-    const selectedModel = el.modelSelect.value;
-    state.settings.model_id = selectedModel;
-    updateModelUI();
-    await persistSettings();
-    if (previousModel !== "local:default" && selectedModel === "local:default") {
-      showStartupProfileDialog();
-    }
   });
 
   const persistSystemPrompt = debounce(persistSettings, 350);
@@ -671,25 +692,122 @@ function syncSettingsUI() {
 }
 
 function updateModelUI() {
-  if (!el.modelSelect) return;
-  const selected = state.settings.model_id || "local:default";
-  el.modelSelect.replaceChildren();
-  state.models.forEach((model) => {
-    const option = document.createElement("option");
-    option.value = model.id;
-    option.textContent = model.display_name;
-    option.title = `${model.provider} · ${(model.capabilities || []).join(", ")}`;
-    el.modelSelect.appendChild(option);
-  });
-  if ([...el.modelSelect.options].some((option) => option.value === selected)) {
-    el.modelSelect.value = selected;
-  } else if (el.modelSelect.options.length) {
-    el.modelSelect.value = el.modelSelect.options[0].value;
+  if (!el.modelMenu || !el.modelLabel) return;
+  let selected = state.settings.model_id || "local:default";
+  
+  // Verify selected is valid, otherwise use first available
+  if (!state.models.some((m) => m.id === selected) && state.models.length > 0) {
+    selected = state.models[0].id;
+    state.settings.model_id = selected;
   }
-  const active = state.models.find((model) => model.id === el.modelSelect.value);
+
+  el.modelMenu.replaceChildren();
+  state.models.forEach((model) => {
+    const isSelected = model.id === selected;
+    const btn = document.createElement("button");
+    btn.className = "mode-option" + (isSelected ? " selected" : "");
+    btn.type = "button";
+    btn.setAttribute("role", "menuitemradio");
+    btn.setAttribute("aria-checked", String(isSelected));
+    btn.dataset.modelId = model.id;
+    
+    // Structure similar to mode-option but customized for models
+    const icon = document.createElement("span");
+    icon.className = "mode-option-icon";
+    icon.setAttribute("aria-hidden", "true");
+    icon.textContent = "⚙"; // generic icon for model
+    if (model.id.includes("gpt")) icon.textContent = "✧";
+    else if (model.id.includes("claude")) icon.textContent = "✺";
+    else if (model.provider.includes("local")) icon.textContent = "○";
+
+    const textWrap = document.createElement("span");
+    const nameStr = document.createElement("strong");
+    nameStr.textContent = model.display_name;
+    const descStr = document.createElement("small");
+    descStr.textContent = `${model.provider} · ${(model.capabilities || []).join(", ")}`;
+    textWrap.appendChild(nameStr);
+    textWrap.appendChild(descStr);
+
+    const check = document.createElement("span");
+    check.className = "mode-check";
+    check.setAttribute("aria-hidden", "true");
+    check.textContent = "✓";
+
+    btn.appendChild(icon);
+    btn.appendChild(textWrap);
+    btn.appendChild(check);
+    el.modelMenu.appendChild(btn);
+  });
+
+  const active = state.models.find((model) => model.id === selected);
   if (active) {
-    el.modelSelect.title = `${active.provider} · ${active.display_name}`;
+    el.modelLabel.textContent = active.display_name;
+    el.modelTrigger.title = `${active.provider} · ${active.display_name}`;
     state.modelName = active.display_name;
+  }
+}
+
+function openModelMenu(focus = false) {
+  if (!el.modelMenu || !el.modelTrigger || state.isGenerating) return;
+  el.modelMenu.hidden = false;
+  el.modelTrigger.setAttribute("aria-expanded", "true");
+  el.modelPicker.classList.add("active");
+  requestAnimationFrame(() => el.modelMenu?.classList.add("open"));
+  if (focus) {
+    const selected = el.modelMenu.querySelector(".selected") || el.modelMenu.querySelector("[data-model-id]");
+    selected?.focus();
+  }
+}
+
+function closeModelMenu({ restoreFocus = false } = {}) {
+  if (!el.modelMenu || el.modelMenu.hidden) return;
+  el.modelMenu.classList.remove("open");
+  el.modelMenu.hidden = true;
+  el.modelTrigger?.setAttribute("aria-expanded", "false");
+  el.modelPicker.classList.remove("active");
+  if (restoreFocus) el.modelTrigger?.focus();
+}
+
+async function selectModel(modelId) {
+  if (state.isGenerating) return;
+  const previousModel = state.settings.model_id || "local:default";
+  state.settings.model_id = modelId;
+  updateModelUI();
+  closeModelMenu({ restoreFocus: true });
+  await persistSettings();
+  if (previousModel !== "local:default" && modelId === "local:default") {
+    showStartupProfileDialog();
+  }
+}
+
+function handleModelTriggerKeydown(event) {
+  if (event.key === "Escape" && !el.modelMenu?.hidden) {
+    event.preventDefault();
+    closeModelMenu({ restoreFocus: true });
+    return;
+  }
+  if (!["Enter", " ", "ArrowDown", "ArrowUp"].includes(event.key)) return;
+  event.preventDefault();
+  openModelMenu(true);
+}
+
+function handleModelMenuKeydown(event) {
+  const options = [...el.modelMenu.querySelectorAll("[data-model-id]")];
+  if (!options.length) return;
+  
+  if (event.key === "Escape") {
+    event.preventDefault();
+    closeModelMenu({ restoreFocus: true });
+    return;
+  }
+  
+  if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+    event.preventDefault();
+    const current = options.indexOf(document.activeElement);
+    const next = event.key === "ArrowDown"
+      ? (current + 1) % options.length
+      : (current <= 0 ? options.length - 1 : current - 1);
+    options[next].focus();
   }
 }
 
@@ -1142,6 +1260,7 @@ function appendUserMessage(text, scroll = true) {
   el.messages.querySelector(".welcome")?.remove();
   const row = messageShell("user", "You");
   row.stack.appendChild(bubble(text, false));
+  appendMessageActions(row.stack, "edit");
   el.messages.appendChild(row.root);
   if (scroll) {
     state.followOutput = true;
@@ -1171,6 +1290,7 @@ function appendAssistantMessage(message, scroll = true) {
     const responseBubble = bubble(message.content, true);
     if (message.error) responseBubble.classList.add("error");
     row.stack.appendChild(responseBubble);
+    appendMessageActions(row.stack, "copy");
   }
   el.messages.appendChild(row.root);
   if (scroll) scrollToBottom(true);
@@ -1204,9 +1324,61 @@ function bubble(content, markdown) {
   if (markdown) {
     renderResponseInto(node, content);
   } else {
-    node.innerHTML = escapeHTML(displayText(content)).replace(/\n/g, "<br>");
+    const text = displayText(content);
+    node.dataset.messageText = text;
+    node.innerHTML = escapeHTML(text).replace(/\n/g, "<br>");
   }
   return node;
+}
+
+function appendMessageActions(stack, action) {
+  const actions = document.createElement("div");
+  actions.className = "message-actions";
+
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "message-action";
+  button.dataset.action = action;
+  button.setAttribute("aria-label", action === "edit" ? "Edit prompt" : "Copy response");
+  button.title = action === "edit" ? "Edit prompt" : "Copy response";
+  button.innerHTML = action === "edit"
+    ? '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 11.8V13h1.2l7.1-7.1-1.2-1.2L3 11.8Zm8-8 1.2-1.2 1.2 1.2L12.2 5 11 3.8Z"/></svg><span>Edit</span>'
+    : '<svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5" y="5" width="8" height="8" rx="1.4"/><path d="M3 10.5H2.8A1.8 1.8 0 0 1 1 8.7V2.8A1.8 1.8 0 0 1 2.8 1h5.9a1.8 1.8 0 0 1 1.8 1.8V3"/></svg><span>Copy</span>';
+  actions.appendChild(button);
+  stack.appendChild(actions);
+}
+
+function messageActionText(button) {
+  return button.closest(".message-actions")?.previousElementSibling?.dataset.messageText || "";
+}
+
+function editPromptMessage(button) {
+  if (!el.input) return;
+  const text = messageActionText(button);
+  if (!text) return;
+  el.input.value = text;
+  resizeComposer();
+  updateComposerState();
+  el.input.focus({ preventScroll: true });
+  el.input.setSelectionRange(text.length, text.length);
+}
+
+async function copyResponseMessage(button) {
+  const text = messageActionText(button);
+  if (!text) return;
+  try {
+    await writeClipboardText(text);
+    button.classList.add("copied");
+    const label = button.querySelector("span");
+    if (label) label.textContent = "Copied";
+    setTimeout(() => {
+      if (!button.isConnected) return;
+      button.classList.remove("copied");
+      if (label) label.textContent = "Copy";
+    }, 1400);
+  } catch {
+    toast("Could not copy that response.");
+  }
 }
 
 function detailBlock(title, label, content, running) {
@@ -1276,12 +1448,22 @@ async function sendMessage() {
   const text = el.input.value.trim();
   if (!text) return;
 
+  if (handleThemeCommand(text)) {
+    el.input.value = "";
+    resetPromptRecall();
+    closeSlashMenu();
+    resizeComposer();
+    updateComposerState();
+    return;
+  }
+
   stopVoiceInput({ abort: true, silent: true });
   closeSlashMenu();
   closeModeMenu();
   appendUserMessage(text);
   if (!text.startsWith("/")) state.history.push({ role: "user", content: text });
   el.input.value = "";
+  resetPromptRecall();
   resizeComposer();
   updateComposerState();
 
@@ -1438,7 +1620,7 @@ function handleStreamEvent(event, generation, { record = true, forceVisible = fa
         updateModelUI();
       }
       if (visible) appendStatus(
-        event.message || "Model error. Switched to Gemma 4 31B IT and continuing automatically."
+        event.message || "Model error. Switched to the next fallback model and continuing automatically."
       );
       break;
     }
@@ -1557,6 +1739,7 @@ function handleStreamEvent(event, generation, { record = true, forceVisible = fa
         state.stream.assistantBubble = document.createElement("div");
         state.stream.assistantBubble.className = "bubble";
         state.stream.assistantStack.appendChild(state.stream.assistantBubble);
+        appendMessageActions(state.stream.assistantStack, "copy");
         state.stream.thinkingBlock = null;
         state.stream.thinkingContent = null;
         state.stream.thinkingText = "";
@@ -1638,6 +1821,7 @@ function appendStreamError(detail) {
     state.stream.assistantBubble = document.createElement("div");
     state.stream.assistantBubble.className = "bubble error";
     state.stream.assistantStack.appendChild(state.stream.assistantBubble);
+    appendMessageActions(state.stream.assistantStack, "copy");
   } else {
     state.stream.assistantBubble.classList.add("error");
   }
@@ -1723,6 +1907,7 @@ function finishGeneration(generation = generationForSession(), { interrupted = f
 function resetComposer({ clear = true } = {}) {
   stopVoiceInput({ abort: true, silent: true });
   closeSlashMenu();
+  resetPromptRecall();
   if (!el.input) return;
   el.input.disabled = false;
   el.input.readOnly = false;
@@ -1733,19 +1918,52 @@ function resetComposer({ clear = true } = {}) {
 }
 
 function stopGeneration({ generation = generationForSession(), refresh = true } = {}) {
-  if (!generation) return;
-  if (generation?.id) {
-    void fetch("/api/cancel-generation", {
-      method: "POST",
-      headers: apiHeaders(true),
-      body: JSON.stringify({ generation_id: generation.id, client_id: state.clientId }),
-      keepalive: true
-    }).catch(() => {});
-  }
+  if (!generation || generation.stopping) return;
+  generation.stopping = true;
   generation.controller?.abort();
-  toast("Generation stopped.");
-  finishGeneration(generation, { interrupted: true });
-  if (refresh) refreshSessions().catch(() => {});
+  updateComposerState();
+  toast("Stopping generation…");
+  void (async () => {
+    try {
+      const response = await fetch("/api/cancel-generation", {
+        method: "POST",
+        headers: apiHeaders(true),
+        body: JSON.stringify({ generation_id: generation.id, client_id: state.clientId }),
+        keepalive: true
+      });
+      if (response.ok) await waitForGenerationRelease(generation);
+    } catch {
+      // Aborting the stream still tells the server to close the connection.
+      // The server retains its ownership guard if the cancellation request
+      // itself cannot be delivered.
+    } finally {
+      finishGeneration(generation, { interrupted: true });
+      if (refresh) refreshSessions().catch(() => {});
+    }
+  })();
+}
+
+function waitForGenerationRelease(generation) {
+  return new Promise((resolve) => {
+    const poll = async () => {
+      try {
+        const response = await fetch(
+          `/api/generations?client_id=${encodeURIComponent(state.clientId)}`,
+          { headers: apiHeaders() }
+        );
+        if (!response.ok) return resolve();
+        const payload = await response.json();
+        const active = payload.active_operations || [];
+        if (!active.some((operation) => operation.generation_id === generation.id)) {
+          return resolve();
+        }
+      } catch {
+        return resolve();
+      }
+      window.setTimeout(poll, 120);
+    };
+    poll();
+  });
 }
 
 function appendStatus(text, activityMode = "") {
@@ -2111,6 +2329,7 @@ async function loadSession(name) {
 }
 
 function updateComposerState() {
+  const stopping = Boolean(state.generation?.stopping);
   const hasText = Boolean(el.input?.value.trim());
   if (el.mic) el.mic.disabled = !state.voice.recognition || state.isGenerating;
   if (el.modeTrigger) el.modeTrigger.disabled = state.isGenerating;
@@ -2124,8 +2343,8 @@ function updateComposerState() {
   }
   if (state.isGenerating) closeModeMenu();
   if (el.send) {
-    el.send.disabled = !state.isGenerating && !hasText;
-    el.send.textContent = state.isGenerating ? "Stop" : "Send";
+    el.send.disabled = stopping || (!state.isGenerating && !hasText);
+    el.send.textContent = stopping ? "Stopping…" : (state.isGenerating ? "Stop" : "Send");
     el.send.classList.toggle("stop", state.isGenerating);
   }
   updateContextMeter();
@@ -2220,6 +2439,55 @@ function handleSlashKeydown(event) {
     return true;
   }
   return false;
+}
+
+function resetPromptRecall() {
+  state.promptRecall.index = null;
+}
+
+function promptHistory() {
+  return state.history
+    .filter((message) => message?.role === "user")
+    .map((message) => displayText(message.content).trim())
+    .filter(Boolean);
+}
+
+function handlePromptHistoryKeydown(event) {
+  if (!el.input || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) {
+    return false;
+  }
+  if (event.key !== "ArrowUp" && event.key !== "ArrowDown") return false;
+
+  const prompts = promptHistory();
+  if (!prompts.length) return false;
+
+  if (event.key === "ArrowUp") {
+    if (state.promptRecall.index === null) {
+      if (el.input.value) return false;
+      state.promptRecall.index = prompts.length;
+    }
+    state.promptRecall.index = Math.max(0, state.promptRecall.index - 1);
+  } else {
+    if (state.promptRecall.index === null) return false;
+    state.promptRecall.index += 1;
+    if (state.promptRecall.index >= prompts.length) {
+      state.promptRecall.index = null;
+      el.input.value = "";
+      event.preventDefault();
+      resizeComposer();
+      updateComposerState();
+      return true;
+    }
+  }
+
+  el.input.value = prompts[state.promptRecall.index];
+  const cursor = el.input.value.length;
+  el.input.setSelectionRange(cursor, cursor);
+  event.preventDefault();
+  resizeComposer();
+  updateComposerState();
+  closeSlashMenu();
+  return true;
 }
 
 function moveSlashSelection(delta) {
@@ -2504,20 +2772,7 @@ async function copyCodeBlock(button) {
   const code = button.closest(".code-block")?.querySelector("code")?.textContent;
   if (code == null) return;
   try {
-    if (navigator.clipboard?.writeText) {
-      await navigator.clipboard.writeText(code);
-    } else {
-      const textarea = document.createElement("textarea");
-      textarea.value = code;
-      textarea.setAttribute("readonly", "");
-      textarea.style.position = "fixed";
-      textarea.style.opacity = "0";
-      document.body.appendChild(textarea);
-      textarea.select();
-      const copied = document.execCommand("copy");
-      textarea.remove();
-      if (!copied) throw new Error("Clipboard command was rejected");
-    }
+    await writeClipboardText(code);
     button.textContent = "Copied";
     button.classList.add("copied");
     setTimeout(() => {
@@ -2528,6 +2783,23 @@ async function copyCodeBlock(button) {
   } catch {
     toast("Could not copy that code block.");
   }
+}
+
+async function writeClipboardText(text) {
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(text);
+    return;
+  }
+  const textarea = document.createElement("textarea");
+  textarea.value = text;
+  textarea.setAttribute("readonly", "");
+  textarea.style.position = "fixed";
+  textarea.style.opacity = "0";
+  document.body.appendChild(textarea);
+  textarea.select();
+  const copied = document.execCommand("copy");
+  textarea.remove();
+  if (!copied) throw new Error("Clipboard command was rejected");
 }
 
 function renderMarkdown(text) {
@@ -2601,7 +2873,7 @@ function renderMarkdown(text) {
 
 function displayText(value) {
   if (value == null) return "";
-  if (typeof value === "string") return value;
+  if (typeof value === "string") return repairTextEncoding(value);
   if (["number", "boolean", "bigint"].includes(typeof value)) return String(value);
   if (Array.isArray(value)) {
     return value.map(displayText).filter(Boolean).join("\n");
@@ -2619,6 +2891,45 @@ function displayText(value) {
   return String(value);
 }
 
+const WINDOWS_1252_BYTES = Object.freeze({
+  "€": 0x80, "‚": 0x82, "ƒ": 0x83, "„": 0x84, "…": 0x85,
+  "†": 0x86, "‡": 0x87, "ˆ": 0x88, "‰": 0x89, "Š": 0x8a,
+  "‹": 0x8b, "Œ": 0x8c, "Ž": 0x8e, "‘": 0x91, "’": 0x92,
+  "“": 0x93, "”": 0x94, "•": 0x95, "–": 0x96, "—": 0x97,
+  "˜": 0x98, "™": 0x99, "š": 0x9a, "›": 0x9b, "œ": 0x9c,
+  "ž": 0x9e, "Ÿ": 0x9f
+});
+
+function decodeMojibakeRun(fragment) {
+  const bytes = [];
+  for (const character of fragment) {
+    const code = character.codePointAt(0);
+    if (code <= 0xff) {
+      bytes.push(code);
+    } else if (Object.prototype.hasOwnProperty.call(WINDOWS_1252_BYTES, character)) {
+      bytes.push(WINDOWS_1252_BYTES[character]);
+    } else {
+      return fragment;
+    }
+  }
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(new Uint8Array(bytes));
+  } catch {
+    return fragment;
+  }
+}
+
+function repairTextEncoding(value) {
+  let text = String(value || "");
+  if (!/[ÃÂâðï]/u.test(text)) return text;
+  for (let pass = 0; pass < 2; pass += 1) {
+    const repaired = text.replace(/(?:Ã.|Â.|â..|ð...|ï..)/gsu, decodeMojibakeRun);
+    if (repaired === text) break;
+    text = repaired;
+  }
+  return text;
+}
+
 function renderResponseHTML(value) {
   const text = displayText(value);
   try {
@@ -2631,6 +2942,7 @@ function renderResponseHTML(value) {
 
 function renderResponseInto(node, value) {
   const text = displayText(value);
+  node.dataset.messageText = text;
   try {
     node.innerHTML = renderResponseHTML(text);
   } catch {

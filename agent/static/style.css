@@ -980,6 +980,53 @@ input:focus-visible {
   color: var(--text);
 }
 
+.message-actions {
+  display: flex;
+  align-items: center;
+  min-height: 26px;
+  padding: 5px 3px 0;
+}
+
+.message.user .message-actions {
+  justify-content: flex-end;
+}
+
+.message-action {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-height: 22px;
+  padding: 2px 5px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--faint);
+  font-family: var(--mono);
+  font-size: 0.68rem;
+  line-height: 1;
+  transition: color 100ms ease, background 100ms ease;
+}
+
+.message-action:hover,
+.message-action:focus-visible {
+  background: var(--elevated);
+  color: var(--text-soft);
+}
+
+.message-action.copied {
+  color: var(--success);
+}
+
+.message-action svg {
+  width: 12px;
+  height: 12px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.25;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
 .bubble :first-child {
   margin-top: 0;
 }
@@ -1450,12 +1497,10 @@ textarea::placeholder {
 }
 
 .model-picker {
-  display: flex;
-  align-items: center;
+  position: relative;
   flex: 0 1 250px;
   min-width: 0;
   height: 34px;
-  padding-left: 9px;
   border: 1px solid var(--line);
   border-radius: 10px;
   background: var(--surface-low);
@@ -1463,15 +1508,31 @@ textarea::placeholder {
   transition: border-color 140ms ease, color 140ms ease;
 }
 
-.model-picker:hover {
+.model-picker:hover,
+.model-picker.active {
   border-color: var(--line-strong);
   color: var(--text);
 }
 
-.model-picker:focus-within {
-  border-color: var(--line-focus);
+.model-trigger {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  height: 100%;
+  padding: 0 9px;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  border-radius: inherit;
+}
+
+.model-trigger:focus-visible {
   outline: 2px solid color-mix(in srgb, var(--accent) 35%, transparent);
   outline-offset: 1px;
+}
+
+.model-trigger[aria-expanded="true"] .mode-chevron {
+  transform: rotate(180deg);
 }
 
 .model-picker-label {
@@ -1484,30 +1545,16 @@ textarea::placeholder {
   text-transform: uppercase;
 }
 
-#model-select {
+#model-label {
+  flex: 1;
   min-width: 0;
-  width: 100%;
-  height: 32px;
-  padding: 0 25px 0 7px;
-  border: 0;
-  outline: 0;
-  overflow: hidden;
-  background: transparent;
-  color: inherit;
-  cursor: pointer;
-  font: 650 0.75rem/1 var(--sans);
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-#model-select option {
-  background: var(--elevated);
+  margin: 0 6px 0 8px;
   color: var(--text);
-}
-
-#model-select:disabled {
-  cursor: not-allowed;
-  opacity: 0.45;
+  font: 650 0.75rem/1 var(--sans);
+  text-align: left;
+  text-overflow: ellipsis;
+  overflow: hidden;
+  white-space: nowrap;
 }
 
 .mode-picker {
